@@ -1423,6 +1423,13 @@ class Lab:
             )
             if corpus.content_sha256!=self._llm_workspace.get("article_corpus_content_sha256"):
                 raise ValueError("LLM workspace article content does not match its frozen corpus")
+        # Keep presentation metadata outside the scoring workspace.  These
+        # labels make the real MIND/LLM corpus useful to a reader-facing UI,
+        # but never become hidden ranking inputs.
+        self._article_presentation={
+            str(article_id):self._presentation_from_annotation(annotation)
+            for article_id,annotation in self._llm_article_annotations.items()
+        }
         if self._relational_workspace:
             if self._relational_workspace.get("schema")!=RELATIONAL_WORKSPACE_SCHEMA:
                 raise ValueError("unsupported relational workspace schema")
@@ -1786,6 +1793,57 @@ class Lab:
     def article(self, aid):
         try: return self._articles[str(aid)]
         except KeyError as exc: raise ValueError(f"unknown article: {aid}") from exc
+
+    @staticmethod
+    def _presentation_from_annotation(annotation):
+        """Return bounded, human-readable semantic labels for feed cards."""
+        if not isinstance(annotation,dict):
+            return {}
+        canonical=(annotation.get("provenance",{}).get("canonicalization",{})
+                   .get("mappings",{}))
+
+        def labels(field,limit):
+            result=[]
+            for item in canonical.get(field,[]) or []:
+                value=(item.get("lexical") if isinstance(item,dict) else None)
+                if value and value not in result:
+                    result.append(str(value))
+                if len(result)>=limit:
+                    break
+            if result:
+                return result
+            raw_values=annotation.get(field,[]) or []
+            if isinstance(raw_values,str):
+                raw_values=[raw_values]
+            for value in raw_values:
+                # Portable IDs retain a readable slug before the content hash.
+                text=str(value).split(":",1)[-1].split("~",1)[0]
+                text=text.replace("-"," ").strip()
+                if text and text not in result:
+                    result.append(text)
+                if len(result)>=limit:
+                    break
+            return result
+
+        formats=labels("format",1)
+        if not formats and annotation.get("format"):
+            value=str(annotation["format"]).split(":",1)[-1].split("~",1)[0]
+            formats=[value.replace("-"," ")]
+        return {
+            "concepts":labels("concepts",5),
+            "audiences":labels("audiences",3),
+            "events":labels("event_types",2),
+            "intents":labels("intents",2),
+            "semantic_format":formats[0] if formats else None,
+        }
+
+    def public_article(self, aid):
+        """Article content plus non-ranking metadata safe for the browser."""
+        article=dict(self.article(aid))
+        presentation=self._article_presentation.get(str(aid))
+        if presentation:
+            article["presentation"]=presentation
+        return article
 
     def preview_semantics(self, article):
         """Parse immutable content through one bounded, versioned preview slot."""
@@ -7169,7 +7227,7 @@ class Lab:
                 field:_raw_attrs[field] for field in RELATIONAL_PROOF_FIELDS
                 if _raw_attrs.get(field) in {"none","older","recent"}
             }
-            row={"article":self.article(aid),"score":round(score,8),"stv":{"strength":tv[0],"confidence":tv[1]},
+            row={"article":self.public_article(aid),"score":round(score,8),"stv":{"strength":tv[0],"confidence":tv[1]},
                          "inference_stv":{"strength":inference_tv[0],"confidence":inference_tv[1]},
                          "baseline":popularity[aid],"rules":fired,"proofs":proofs,"engine":"PeTTaChainer",
                          "aggregation":self.config["aggregation"],"score_method":score_method,
