@@ -3646,10 +3646,9 @@ class Lab:
 
     def _bounded_pair_features(self,attrs):
         bounded={}
-        categorical=set()
+        categorical=PAIR_CATEGORICAL_SIDE_PREDICATES
         for _family,(left_predicate,right_predicate) in (
                 PAIR_CATEGORICAL_SIDE_FAMILIES.items()):
-            categorical.update((left_predicate,right_predicate))
             if left_predicate not in attrs and right_predicate not in attrs:
                 continue
             left_allowed=self._pair_feature_vocabulary.get(left_predicate)
@@ -5714,6 +5713,53 @@ class Lab:
         digest=hashlib.blake2s(signature.encode("utf-8"),digest_size=10).hexdigest()
         return f"pair_candidate_{digest}"
 
+    def _compile_pair_rule_matcher(self):
+        """Compile an exact inverted join for the active pair-rule premises.
+
+        Pair-rule applicability used to rescan every premise of every rule for
+        both orientations of every candidate comparison.  The compiled index
+        maps each observed ``(predicate, value)`` token to the rules containing
+        it. A rule activates only when all of its indexed premises matched, so
+        this changes traversal cost without changing applicability or order.
+
+        The immutable signature also notices tests, staged promotion, or other
+        callers that replace or mutate ``pair_rules`` directly.
+        """
+        premises=tuple(
+            tuple(tuple(item) for item in rule["premises"])
+            for rule in self.pair_rules
+        )
+        if premises==getattr(self,"_pair_matcher_signature",None):
+            return
+        inverted={}; unconditional=[]
+        for rule_index,rule_premises in enumerate(premises):
+            if not rule_premises:
+                unconditional.append(rule_index)
+                continue
+            for token in rule_premises:
+                inverted.setdefault(token,[]).append(rule_index)
+        self._pair_matcher_signature=premises
+        self._pair_matcher_inverted={
+            token:tuple(rule_indices)
+            for token,rule_indices in inverted.items()
+        }
+        self._pair_matcher_unconditional=tuple(unconditional)
+
+    def _matching_pair_rule_premises(self,attrs):
+        """Return active premises in original rule order via the compiled join."""
+        match_counts={}
+        inverted=self._pair_matcher_inverted
+        for token in attrs.items():
+            for rule_index in inverted.get(token,()):
+                match_counts[rule_index]=match_counts.get(rule_index,0)+1
+        active=set(self._pair_matcher_unconditional)
+        signature=self._pair_matcher_signature
+        active.update(
+            rule_index for rule_index,count in match_counts.items()
+            if count==len(signature[rule_index])
+        )
+        return [signature[rule_index] for rule_index in sorted(active)]
+
     @staticmethod
     def _reverse_pair_features(attrs):
         """Reverse one pair projection without recomputing candidate evidence.
@@ -5762,12 +5808,8 @@ class Lab:
         reverse_attrs=self._bounded_pair_features(reverse_raw)
         bounding_seconds=time.perf_counter()-started
         started=time.perf_counter()
-        forward_activation=[rule["premises"] for rule in self.pair_rules
-                            if all(forward_attrs.get(predicate)==value
-                                   for predicate,value in rule["premises"])]
-        reverse_activation=[rule["premises"] for rule in self.pair_rules
-                            if all(reverse_attrs.get(predicate)==value
-                                   for predicate,value in rule["premises"])]
+        forward_activation=self._matching_pair_rule_premises(forward_attrs)
+        reverse_activation=self._matching_pair_rule_premises(reverse_attrs)
         activation_seconds=time.perf_counter()-started
         case_cache={} if case_cache is None else case_cache
         missing=object(); cache_seconds=0.0; serialization_seconds=0.0
@@ -5817,6 +5859,7 @@ class Lab:
         return f"pair_channel_{digest}"
 
     def _pair_spec(self,left,right):
+        self._compile_pair_rule_matcher()
         left_article,left_attrs=left
         right_article,right_attrs=right
         attrs=self._bounded_pair_features(
@@ -5829,9 +5872,7 @@ class Lab:
         # Reusing one grounded context for an identical activation vector is
         # semantically exact and bounds serving identities by 2^rule-count,
         # rather than by every irrelevant combination of raw feature values.
-        activation=[rule["premises"] for rule in self.pair_rules
-                    if all(attrs.get(predicate)==value
-                           for predicate,value in rule["premises"])]
+        activation=self._matching_pair_rule_premises(attrs)
         signature={"activation":activation}
         return self.pair_candidate_case(signature),attrs
 
@@ -6442,6 +6483,7 @@ class Lab:
 
     def _pairwise_plan(self,rows,specs):
         planning_started=time.perf_counter()
+        self._compile_pair_rule_matcher()
         raw_by_article={aid:(self.article(aid),raw_attrs)
                         for aid,_case,_attrs,raw_attrs in specs}
         comparisons=[]; pair_specs=[]
@@ -8784,8 +8826,10 @@ class Lab:
                 "outer_total_seconds":round(pair_planning_seconds,6),
                 "definition":(
                     "Each unordered pair derives forward categorical relations "
-                    "once; the reverse is an exact antisymmetric transform. Pair "
-                    "case serialization hashes only active-rule vectors."
+                    "once; the reverse is an exact antisymmetric transform. An "
+                    "inverted premise join identifies active rules without "
+                    "rescanning the rule table. Pair case serialization hashes "
+                    "only active-rule vectors."
                 ),
             },
             "candidate_pair_materialization":{

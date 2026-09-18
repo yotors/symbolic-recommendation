@@ -217,6 +217,45 @@ class PairPreparationTest(unittest.TestCase):
         self.assertIn("unique_activation_cases_in_slate",profile)
         self.assertNotIn("unique_activation_cases",profile)
 
+    def test_inverted_pair_rule_matcher_is_exact_and_ordered(self):
+        self.lab.pair_rules=[
+            {"premises":[("topic","news"),("affinity","left")]},
+            {"premises":[("topic","sports")]},
+            {"premises":[]},
+            {"premises":[("affinity","left")]},
+            {"premises":[("topic","news"),("missing","value")]},
+        ]
+        attrs={"topic":"news","affinity":"left","unused":"value"}
+        expected=[
+            tuple(tuple(item) for item in rule["premises"])
+            for rule in self.lab.pair_rules
+            if all(attrs.get(predicate)==value
+                   for predicate,value in rule["premises"])
+        ]
+
+        self.lab._compile_pair_rule_matcher()
+
+        self.assertEqual(
+            self.lab._matching_pair_rule_premises(attrs),expected
+        )
+
+    def test_pair_rule_matcher_recompiles_after_in_place_mutation(self):
+        self.lab.pair_rules=[{"premises":[("topic","news")]}]
+        self.lab._compile_pair_rule_matcher()
+        self.assertTrue(
+            self.lab._matching_pair_rule_premises({"topic":"news"})
+        )
+
+        self.lab.pair_rules[0]["premises"]=[("topic","sports")]
+        self.lab._compile_pair_rule_matcher()
+
+        self.assertFalse(
+            self.lab._matching_pair_rule_premises({"topic":"news"})
+        )
+        self.assertTrue(
+            self.lab._matching_pair_rule_premises({"topic":"sports"})
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
