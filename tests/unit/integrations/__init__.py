@@ -1,0 +1,1 @@
+"""External-boundary adapter tests."""
