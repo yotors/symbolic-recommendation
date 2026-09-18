@@ -1,0 +1,11 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".."]
+addopts = ["-ra", "--strict-markers"]
+markers = [
+  "unit: isolated deterministic tests",
+  "integration: tests spanning recommendation components",
+  "pettachainer: tests requiring the PeTTaChainer runtime",
+  "nl2pln: tests requiring the NL2PLN integration stack",
+  "slow: tests unsuitable for the fast local test loop",
+]
