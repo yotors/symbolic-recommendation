@@ -226,12 +226,12 @@ class PairPreparationTest(unittest.TestCase):
             {"premises":[("topic","news"),("missing","value")]},
         ]
         attrs={"topic":"news","affinity":"left","unused":"value"}
-        expected=[
+        expected=tuple(
             tuple(tuple(item) for item in rule["premises"])
             for rule in self.lab.pair_rules
             if all(attrs.get(predicate)==value
                    for predicate,value in rule["premises"])
-        ]
+        )
 
         self.lab._compile_pair_rule_matcher()
 

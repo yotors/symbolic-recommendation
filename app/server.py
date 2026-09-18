@@ -5731,11 +5731,8 @@ class Lab:
         )
         if premises==getattr(self,"_pair_matcher_signature",None):
             return
-        inverted={}; unconditional=[]
+        inverted={}
         for rule_index,rule_premises in enumerate(premises):
-            if not rule_premises:
-                unconditional.append(rule_index)
-                continue
             for token in rule_premises:
                 inverted.setdefault(token,[]).append(rule_index)
         self._pair_matcher_signature=premises
@@ -5743,22 +5740,21 @@ class Lab:
             token:tuple(rule_indices)
             for token,rule_indices in inverted.items()
         }
-        self._pair_matcher_unconditional=tuple(unconditional)
+        self._pair_matcher_required=tuple(map(len,premises))
 
     def _matching_pair_rule_premises(self,attrs):
         """Return active premises in original rule order via the compiled join."""
-        match_counts={}
+        match_counts=[0]*len(self._pair_matcher_signature)
         inverted=self._pair_matcher_inverted
         for token in attrs.items():
             for rule_index in inverted.get(token,()):
-                match_counts[rule_index]=match_counts.get(rule_index,0)+1
-        active=set(self._pair_matcher_unconditional)
+                match_counts[rule_index]+=1
         signature=self._pair_matcher_signature
-        active.update(
-            rule_index for rule_index,count in match_counts.items()
-            if count==len(signature[rule_index])
+        return tuple(
+            signature[rule_index]
+            for rule_index,required in enumerate(self._pair_matcher_required)
+            if match_counts[rule_index]==required
         )
-        return [signature[rule_index] for rule_index in sorted(active)]
 
     @staticmethod
     def _reverse_pair_features(attrs):
@@ -5816,8 +5812,10 @@ class Lab:
         def activation_case(activation):
             nonlocal cache_seconds,serialization_seconds
             started=time.perf_counter()
-            key=tuple(tuple(tuple(item) for item in premises)
-                      for premises in activation)
+            # The compiled matcher already returns a canonical immutable tuple
+            # in model rule order. Re-normalizing it for every orientation was
+            # pure allocation in the serving hot path.
+            key=activation
             case=case_cache.get(key,missing)
             cache_seconds+=time.perf_counter()-started
             if case is missing:
