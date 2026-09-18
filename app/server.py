@@ -2342,19 +2342,29 @@ class Lab:
                 arriving=state["items"][source_start:source_end]
                 candidates=[aid for aid,_context in arriving]
                 contexts={aid:context for aid,context in arriving}
-                rows=self.score(user,candidates,contexts,limit=0) if candidates else []
+                rows=(self.score(
+                    user,candidates,contexts,limit=0,include_context=True
+                ) if candidates else [])
                 impression=f"live_{session}_{source_start}_{source_end}"
                 queued=[]
                 for row in rows:
                     aid=row["article"]["id"]
-                    served_context=self.contextual_features(user,row["article"],contexts.get(aid))
+                    prepared_context=row.get("_prepared_context")
+                    served_context=(dict(prepared_context)
+                                    if prepared_context is not None else
+                                    self.contextual_features(
+                                        user,row["article"],contexts.get(aid)
+                                    ))
                     relation=row.get("relational_evidence",{})
                     served_context.update(relation.get("scopes",{}))
                     served_context.update({
                         key:list(value) for key,value
                         in relation.get("proof_ids",{}).items()
                     })
-                    queued.append({**row,"context":served_context,"impression":impression,
+                    public_row={key:value for key,value in row.items()
+                                if key!="_prepared_context"}
+                    queued.append({**public_row,"context":served_context,
+                                   "impression":impression,
                                    "queue_revision":state["queue_revision"]})
                 state["queue"].extend(queued)
                 state["source_position"]=source_end
@@ -7079,7 +7089,7 @@ class Lab:
         return rows
 
     def _rank(self,specs,groups,limit,apply_pairwise=True,
-              reasoner_timeout_sec=None):
+              reasoner_timeout_sec=None,include_context=False):
         popularity=self._popularity; rows=[]; prior=float(self._click_base_rate)
         for (aid,_case,_attrs,_raw_attrs),proofs in zip(specs,groups):
             scored=[(proof_tv(proof),proof) for proof in proofs]
@@ -7159,7 +7169,7 @@ class Lab:
                 field:_raw_attrs[field] for field in RELATIONAL_PROOF_FIELDS
                 if _raw_attrs.get(field) in {"none","older","recent"}
             }
-            rows.append({"article":self.article(aid),"score":round(score,8),"stv":{"strength":tv[0],"confidence":tv[1]},
+            row={"article":self.article(aid),"score":round(score,8),"stv":{"strength":tv[0],"confidence":tv[1]},
                          "inference_stv":{"strength":inference_tv[0],"confidence":inference_tv[1]},
                          "baseline":popularity[aid],"rules":fired,"proofs":proofs,"engine":"PeTTaChainer",
                          "aggregation":self.config["aggregation"],"score_method":score_method,
@@ -7178,7 +7188,10 @@ class Lab:
                              "rule_ids":feedback_rule_ids,
                              "proof_stv":{"strength":tv[0],"confidence":tv[1]}
                                  if feedback_rule_ids else None,
-                         }})
+                         }}
+            if include_context:
+                row["_prepared_context"]=_raw_attrs
+            rows.append(row)
         # Popularity is diagnostic metadata only. Ranking is proof-gated, with
         # the training-only editorial priors used only when proof values tie.
         # Article id remains the final deterministic tie-break.
@@ -7192,7 +7205,9 @@ class Lab:
             )
         return rows if limit==0 else rows[:limit]
 
-    def score(self,user,candidates=None,contexts=None,limit=None):
+    def score(self,user,candidates=None,contexts=None,limit=None,
+              include_context=False):
+        score_started=time.perf_counter()
         if user not in self.data["users"]: raise ValueError(f"unknown user: {user}")
         if candidates is None:
             candidates=self.default_candidates(user)
@@ -7205,7 +7220,7 @@ class Lab:
         # scopes from different history origins could reuse a cached row that
         # cites the wrong proof ledger records.
         proof_fields=tuple(RELATIONAL_PROOF_FIELDS.values())
-        context_key=[]
+        context_key_started=time.perf_counter(); context_key=[]
         for aid in candidates:
             candidate_context=contexts.get(aid) or {}
             references=self._relational_proof_references(candidate_context)
@@ -7217,7 +7232,9 @@ class Lab:
                       for proof_field in proof_fields),
             ))
         context_key=tuple(context_key)
-        key=(self.version,user,tuple(candidates),context_key,limit)
+        context_key_seconds=time.perf_counter()-context_key_started
+        key=(self.version,user,tuple(candidates),context_key,limit,
+             bool(include_context))
         if key in self.feed_cache:
             self._feed_rank_cache_hits=(
                 getattr(self,"_feed_rank_cache_hits",0)+1
@@ -7227,13 +7244,35 @@ class Lab:
             getattr(self,"_feed_rank_cache_misses",0)+1
         )
         timeout_sec=self._serving_reasoner_timeout()
+        candidate_started=time.perf_counter()
         specs=self._candidate_specs(user,candidates,contexts)
+        candidate_seconds=time.perf_counter()-candidate_started
+        point_started=time.perf_counter()
         self._ensure_candidate_specs(specs,timeout_sec=timeout_sec)
         groups,_calls=self._proofs_for_specs(specs,timeout_sec=timeout_sec)
+        point_seconds=time.perf_counter()-point_started
+        rank_started=time.perf_counter()
         self.feed_cache[key]=self._rank(
-            specs,groups,limit,reasoner_timeout_sec=timeout_sec
+            specs,groups,limit,reasoner_timeout_sec=timeout_sec,
+            include_context=include_context,
         )
+        rank_seconds=time.perf_counter()-rank_started
         while len(self.feed_cache)>256: self.feed_cache.popitem(last=False)
+        self._last_live_score_profile={
+            "candidates":len(candidates),
+            "context_key_seconds":round(context_key_seconds,6),
+            "candidate_preparation_seconds":round(candidate_seconds,6),
+            "point_reasoning_seconds":round(point_seconds,6),
+            "pair_ranking_seconds":round(rank_seconds,6),
+            "total_seconds":round(time.perf_counter()-score_started,6),
+            "point_reasoner_query_calls":_calls,
+            "pair_plan":{
+                key:(round(value,6) if isinstance(value,float) else value)
+                for key,value in getattr(
+                    self,"_last_pair_plan_profile",{}
+                ).items()
+            },
+        }
         return self.feed_cache[key]
 
     def event(self,user,article,action,context=None,impression=None,*,

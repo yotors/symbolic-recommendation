@@ -350,7 +350,7 @@ def test_served_proof_ids_reach_accepted_event_and_resolve():
     references = projected[REL_CONCEPT_CONTINUITY_PROOF_IDS]
     lab.data["candidate_sets"] = {"u": ["C"]}
 
-    def scored(_user, candidates, _contexts, limit=0):
+    def scored(_user, candidates, _contexts, limit=0, **_options):
         return [{
             "article": lab._articles[aid],
             "relational_evidence": {
