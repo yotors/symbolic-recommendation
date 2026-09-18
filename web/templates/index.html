@@ -1,0 +1,846 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Recommendation Lab</title>
+<style>
+  :root{color-scheme:light;--ink:#18212b;--muted:#637083;--line:#dbe2ea;--brand:#096b55;--soft:#eef8f4;--proof:#fff8e8;--error:#a52a2a}
+  *{box-sizing:border-box}body{font:15px system-ui;max-width:1180px;margin:auto;padding:24px;background:#f5f7fa;color:var(--ink)}
+  main{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:18px}.card{background:white;border:1px solid var(--line);border-radius:10px;padding:16px;margin:10px 0;box-shadow:0 2px 7px #0000000b}
+  button,select,input{font:inherit;padding:8px;margin:3px;border:1px solid #bbc7d4;border-radius:6px;background:white}button{cursor:pointer}button:disabled{cursor:wait;opacity:.65}
+  input[type=number]{width:110px}input[type=text]{width:100%}.muted{color:var(--muted);font-size:13px}.score{float:right;font-weight:700;color:var(--brand)}
+  .rule{background:var(--soft);padding:7px;border-radius:6px;margin-top:6px;font-size:13px}.proof{background:var(--proof);padding:7px;border-radius:6px;margin-top:6px;font-size:12px;overflow-wrap:anywhere}
+  .semantic-output{background:#f1f5ff;padding:7px;border-radius:6px;margin-top:6px;font-size:12px;overflow-wrap:anywhere}.semantic-output:empty{display:none}
+  .form-grid{display:grid;grid-template-columns:minmax(260px,2fr) repeat(2,minmax(150px,1fr)) auto;align-items:end;gap:10px}.form-grid label,.controls label{display:flex;flex-direction:column;gap:3px}.form-grid input{margin:0;width:100%}
+  .dataset-details{display:flex;flex-wrap:wrap;gap:8px 18px;margin-top:10px}.dataset-details span{white-space:nowrap}.status-ok{color:var(--brand)}.status-error{color:var(--error)}
+  .controls{display:grid;grid-template-columns:1fr 1fr;gap:7px}.controls input,.controls select{width:100%;margin:0}.actions{display:flex;flex-wrap:wrap;gap:5px;margin-top:12px}
+  h1{margin-bottom:3px}h2{margin-top:0}.run{padding:7px 0;border-bottom:1px solid #edf0f3}.run:last-child{border-bottom:0}
+  .feed-sentinel{min-height:48px;display:flex;align-items:center;justify-content:center;padding:10px;color:var(--muted)}
+  .feed-sentinel.status-error{color:var(--error)}
+  .feedback-trace{display:none;background:#eaf4ff;border:1px solid #b9d8f5;border-radius:8px;padding:10px;margin:8px 0;font-size:13px}
+  .feedback-trace.visible{display:block}.feedback-proof{background:#fff0f0;border-left:3px solid #b64b4b;padding:7px;margin-top:6px;font-size:12px}
+  .mining-trace{background:#f6f8fb;border:1px solid var(--line);border-radius:8px;padding:9px;margin:8px 0;font-size:13px}
+  .mining-trace.running{background:#fff8e8;border-color:#ead49a}.mining-trace.failed{background:#fff0f0;border-color:#e1b3b3;color:var(--error)}
+  @media(max-width:820px){main{grid-template-columns:1fr}.form-grid{grid-template-columns:1fr 1fr}.form-grid .wide{grid-column:1/-1}}
+  @media(max-width:520px){body{padding:14px}.form-grid,.controls{grid-template-columns:1fr}}
+</style>
+
+<h1>Recommendation Lab</h1>
+<div class="muted">MIND transitions + semantic evidence → MeTTa mining → PeTTaChainer STV ProofRank</div>
+
+<section class="card" aria-labelledby="dataset-heading">
+  <h2 id="dataset-heading">Dataset</h2>
+  <div class="form-grid">
+    <label class="wide">Extracted MIND directory
+      <input id="datasetPath" type="text" placeholder=".../MIND_small_x1.zip or raw MIND root with train/ and dev/" autocomplete="off">
+    </label>
+    <label>Max training cases
+      <input id="trainCases" type="number" value="20000" min="100" step="100">
+    </label>
+    <label>Evaluation impressions
+      <input id="evalImpressions" type="number" value="500" min="1" step="1">
+    </label>
+    <button id="loadDataset" type="button">Load MIND</button>
+  </div>
+  <div id="datasetStatus" class="muted" role="status" aria-live="polite">Using the built-in fixture.</div>
+  <div class="muted">Research data: <a href="https://msnews.github.io/" target="_blank" rel="noreferrer">Microsoft MIND source and license</a>.</div>
+  <div id="datasetDetails" class="dataset-details muted"></div>
+</section>
+
+<p>User: <select id="user"></select> <button id="refreshFeed" type="button">Restart feed</button> <span id="status" class="muted"></span></p>
+
+<main>
+  <section>
+    <h2>Live feed</h2>
+    <div id="miningTrace" class="mining-trace muted" role="status" aria-live="polite"></div>
+    <div id="feedbackTrace" class="feedback-trace" role="status" aria-live="polite"></div>
+    <div id="feed"></div>
+    <div id="feedSentinel" class="feed-sentinel" role="status" aria-live="polite">Scroll to load recommendations.</div>
+  </section>
+  <aside class="card">
+    <h2>Experiment controls</h2>
+    <div class="controls">
+      <label>Mining strategy
+        <select id="minerStrategy">
+          <option value="fixed_combinations" selected>Fixed combinations (champion)</option>
+          <option value="target_aware">Target-aware expansion (experimental)</option>
+          <option value="conditional_llm">LLM-seeded conditional expansion</option>
+          <option value="conditional_llm_seed_only">LLM conditional children (seed-only)</option>
+        </select>
+      </label>
+      <label>Min support <input id="min" type="number" value="16" min="1"></label>
+      <label>Max rules <input id="max" type="number" value="30" min="1"></label>
+      <label title="Miner depth includes the engagement outcome: depth 3 mines two-premise interactions while retaining one-premise rules.">Max rule atoms <input id="conjunctions" type="number" value="2" min="2" max="4"></label>
+      <label>Chain steps/context <input id="chainSteps" type="number" value="10" min="1"></label>
+      <label>Decision scorer
+        <select id="aggregation">
+        <option value="weighted" selected>Proof-gated weighted (best)</option>
+          <option value="hybrid">PeTTaChainer hybrid STV + evidence</option>
+          <option value="max">PeTTaChainer canonical STV</option>
+        </select>
+      </label>
+      <label title="This controls pointwise evidence. With pairwise weight 1, final ordering comes from the separate Pair evidence profile below.">Point evidence profile
+        <select id="featureProfile">
+          <option value="symbolic_only">Structured point facts (no neural predicates)</option>
+          <option value="core">Core (fast)</option>
+          <option value="accuracy">Accuracy (fast)</option>
+          <option value="accuracy_plus">Accuracy + format (experimental)</option>
+          <option value="accuracy_detail" selected>Accuracy detail (recommended for AUC)</option>
+          <option value="accuracy_sequence">Accuracy + ordered-history recency</option>
+          <option value="accuracy_content">Accuracy + title overlap (experimental)</option>
+          <option value="accuracy_rich">Accuracy rich (slow/experimental)</option>
+          <option value="all">All (slow/experimental)</option>
+        </select>
+      </label>
+      <label title="Number of skipped impression candidates sampled for each clicked article during mining; 0 keeps all skips.">Negatives per positive <input id="negativeRatio" type="number" value="4" min="0" step="1"></label>
+      <label>Ranking layer
+        <select id="rankingMode">
+          <option value="pairwise" selected>Pairwise ProofRank</option>
+          <option value="pointwise">Pointwise proof score</option>
+        </select>
+      </label>
+      <label title="Blend between PeTTaChainer pairwise tournament score and the pointwise proof order.">Pairwise weight <input id="pairwiseWeight" type="number" value="1" min="0" max="1" step="0.05"></label>
+      <label>Pair fusion
+        <select id="pairwiseFusion"><option value="rank" selected>Borda rank (scale stable)</option><option value="probability">Raw proof probability</option></select>
+      </label>
+      <label>Pair proof aggregation
+        <select id="pairAggregation"><option value="proof_margin" selected>PeTTa STV proof margin</option><option value="posterior">Merged root posterior</option></select>
+      </label>
+      <label>Proof family weighting
+        <select id="pairFamilyFusion"><option value="flat_margin">Calibrated margins</option><option value="balanced_margin">Confidence-aware family margins</option><option value="symbolic_balanced">Balance words, interests and transitions</option><option value="balanced_rank">Legacy text/structured balance</option></select>
+      </label>
+      <label>Pair proof margin
+        <select id="pairMarginTransform"><option value="log_odds" selected>Confidence-shrunk log odds</option><option value="linear">Linear STV margin</option></select>
+      </label>
+      <label title="Positive power applied to each dependency's signed PeTTa proof margin. 1 keeps the proof margin unchanged; values below 1 temper differences between evidence families.">Pair margin power <input id="pairMarginPower" type="number" value="1" min="0.05" max="4" step="0.05"></label>
+      <label title="PeTTa input-evidence scale K in confidence n/(n+K). Changing it requires re-mining and must be compared on a held-out gate.">CTV evidence K <input id="ctvEvidenceK" type="number" value="800" min="0.000001" max="1000000000" step="50"></label>
+      <label>Pair evidence profile
+        <select id="pairFeatureProfile"><option value="symbolic_baseline">Symbolic baseline</option><option value="symbolic_precision">Symbolic precise interests</option><option value="symbolic_lexical">Symbolic lexical match</option><option value="symbolic_coverage">Symbolic word coverage</option><option value="symbolic_rich">Symbolic rich workspace</option><option value="stable_multi_interest" selected>Stable multi-interest (legacy embeddings)</option><option value="sequence_multi_interest">Ordered-history multi-interest (challenger)</option><option value="semantic_consensus">Semantic consensus (experimental)</option><option value="text_semantic_attention_t8">T8 semantic comparator</option><option value="text_semantic_attention_t8_quantile">T8 magnitude comparator</option><option value="text_semantic_attention_t8_magnitude_backoff">T8 + strong-magnitude backoff</option><option value="scoped_taxonomy">T8 + scoped taxonomy</option><option value="llm_content">T8 + LLM content facts</option><option value="llm_content_quantile">T8 + LLM magnitude facts</option><option value="llm_conditional">T8 + LLM conditional facts</option><option value="llm_conditional_quantile">T8 + conditional LLM magnitudes</option><option value="llm_conditional_magnitude_backoff">T8/LLM magnitude backoff</option><option value="llm_conditional_scoped_taxonomy">LLM + scoped taxonomy</option><option value="normalized_interest">Normalized-interest quantiles</option><option value="full_quantile">All numeric quantiles</option><option value="all">All predicates (ablation)</option></select>
+      </label>
+      <label>Pair min support <input id="pairMinSupport" type="number" value="12" min="1"></label>
+      <label title="Minimum click-preference lift required in every usable temporal fold.">Pair min stable effect <input id="pairMinEffect" type="number" value="0.03" min="0" max="1" step="0.01"></label>
+      <label>Pair rule cap <input id="pairMaxRules" type="number" value="40" min="1"></label>
+      <label title="Same-impression skips paired with each click; 0 keeps every pair.">Pair negatives/click <input id="pairNegativeRatio" type="number" value="8" min="0"></label>
+      <label title="3 enables two-predicate rules; 4 permits a semantic seed plus two stable context gates.">Pair max rule atoms <input id="pairConjunctions" type="number" value="2" min="2" max="4"></label>
+      <label title="Training-only quantile resolution for continuous pair evidence.">Numeric evidence bins <input id="pairNumericBins" type="number" value="4" min="1" max="8"></label>
+      <label title="Proof-ranked opponents per candidate; 0 runs the full quadratic tournament.">Pair opponents <input id="pairwiseOpponents" type="number" value="0" min="0"></label>
+      <label>Pair chain steps/context <input id="pairChainSteps" type="number" value="12" min="2"></label>
+      <label>Top K <input id="top" type="number" value="5" min="1"></label>
+      <label>Feed arrival window <input id="feedWindow" type="number" value="40" min="1"></label>
+      <label>Mine every <input id="interval" type="number" value="8" min="1"></label>
+      <label>Candidate cap <input id="candidateLimit" type="number" value="0" min="0" title="0 keeps every candidate in the original impression"></label>
+      <label title="0 uses all loaded impressions; otherwise selects a seed-stable, label-blind subset.">Benchmark impression cap <input id="evalCaseLimit" type="number" value="0" min="0"></label>
+      <label>Random seed <input id="seed" type="number" value="7" min="0"></label>
+      <label title="Metric selected by the held-out tuner; AUC evaluates the pairwise ranking signal.">Tune objective
+        <select id="tuneObjective">
+          <option value="auc" selected>AUC (recommended)</option>
+          <option value="ndcg_at_10">nDCG@10</option>
+          <option value="mrr">MRR</option>
+        </select>
+      </label>
+      <label title="During auto-tuning, models this close to the best selected objective are treated as tied and the simpler rule set wins.">Tune objective tolerance <input id="ndcgTolerance" type="number" value="0.0025" min="0" step="0.0005"></label>
+    </div>
+    <div class="muted">Pairwise ProofRank mines click-vs-exposure preferences—including entity and recent-subcategory transitions—and asks PeTTaChainer to prove predicates → MinedPairPreference → PairSignal. Pair opponents 0 runs all pairs; a positive value uses a balanced cyclic graph.</div>
+    <div id="featureWarning" class="muted">Accuracy uses the bounded semantic and temporal features most useful for ranking.</div>
+    <label><input id="remineBenchmark" type="checkbox" checked> Re-mine the selected training cases before benchmark</label>
+    <div class="actions">
+      <button id="applyConfig" type="button">Apply</button>
+      <button id="mineNow" type="button">Mine now</button>
+      <button id="runBenchmark" type="button">Run replay benchmark</button>
+      <button id="autoTune" type="button">Auto-tune held-out</button>
+    </div>
+    <h3>Latest result</h3>
+    <pre id="result" class="muted"></pre>
+    <div class="muted">Metric guide: AUC 0.5 is random ordering. Proof coverage measures reasoner execution, not recommendation accuracy.</div>
+  </aside>
+</main>
+
+<section class="card"><h2>Mined rules</h2><div id="rules" class="muted"></div></section>
+<section class="card"><h2>Benchmark runs</h2><div id="runs" class="muted"></div></section>
+
+<script>
+const $ = id => document.getElementById(id);
+let state = {};
+let loadedDataset = null;
+let feedCursor = null;
+let feedHasMore = true;
+let feedLoading = false;
+let feedGeneration = 0;
+let feedRequestController = null;
+let feedSession = null;
+let feedbackPending = false;
+let feedSeen = new Set();
+let feedContext = new Map();
+let feedObserver = null;
+let feedPollTimer = null;
+let feedError = null;
+let feedTotal = null;
+let feedRuleVersion = null;
+let feedQueueRevision = 0;
+let feedAcceptedPosition = 0;
+let miningPollBusy = false;
+let observedRuleVersion = null;
+
+const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+const finite = (value, fallback = 0) => Number.isFinite(Number(value)) ? Number(value) : fallback;
+const metric = value => value === undefined || value === null ? null : finite(value).toFixed(4);
+
+async function api(url, options = {}) {
+  const response = await fetch(url, options);
+  let payload;
+  try { payload = await response.json(); }
+  catch { payload = {}; }
+  if (!response.ok) {
+    const detail = typeof payload.error === 'object' ? payload.error.message : payload.error;
+    throw new Error(detail || `Request failed (${response.status})`);
+  }
+  return payload;
+}
+
+function setButtonBusy(id, busy, busyText) {
+  const button = $(id);
+  if (!button.dataset.label) button.dataset.label = button.textContent;
+  button.disabled = busy;
+  button.textContent = busy ? busyText : button.dataset.label;
+}
+
+function showMessage(message, error = false) {
+  $('datasetStatus').textContent = message;
+  $('datasetStatus').className = error ? 'muted status-error' : 'muted status-ok';
+}
+
+function ensureTargetAwareDepths() {
+  if ($('minerStrategy').value !== 'target_aware') return;
+  if (finite($('conjunctions').value, 2) < 3) $('conjunctions').value = 3;
+  if (finite($('pairConjunctions').value, 2) < 3) $('pairConjunctions').value = 3;
+}
+
+function configPayload() {
+  ensureTargetAwareDepths();
+  return {
+    miner_strategy: $('minerStrategy').value || 'fixed_combinations',
+    min_support: finite($('min').value, 16),
+    max_rules: finite($('max').value, 30),
+    conjunctions: finite($('conjunctions').value, 2),
+    chain_steps: finite($('chainSteps').value, 10),
+    aggregation: $('aggregation').value || 'weighted',
+    feature_profile: $('featureProfile').value || 'accuracy_detail',
+    negative_ratio: finite($('negativeRatio').value, 4),
+    ranking_mode: $('rankingMode').value || 'pairwise',
+    pairwise_weight: finite($('pairwiseWeight').value, 1),
+    pairwise_fusion: $('pairwiseFusion').value || 'rank',
+    pair_aggregation: $('pairAggregation').value || 'proof_margin',
+    pair_margin_transform: $('pairMarginTransform').value || 'log_odds',
+    pair_margin_power: finite($('pairMarginPower').value, 1),
+    ctv_evidence_k: finite($('ctvEvidenceK').value, 800),
+    pair_feature_profile: $('pairFeatureProfile').value || 'stable_multi_interest',
+    pair_family_fusion: $('pairFamilyFusion').value || 'flat_margin',
+    pair_min_support: finite($('pairMinSupport').value, 12),
+    pair_min_effect: finite($('pairMinEffect').value, 0.03),
+    pair_max_rules: finite($('pairMaxRules').value, 40),
+    pair_negative_ratio: finite($('pairNegativeRatio').value, 8),
+    pair_conjunctions: finite($('pairConjunctions').value, 2),
+    pair_numeric_bins: finite($('pairNumericBins').value, 4),
+    pairwise_opponents: finite($('pairwiseOpponents').value, 0),
+    pair_chain_steps: finite($('pairChainSteps').value, 12),
+    top_k: finite($('top').value, 5),
+    feed_window: finite($('feedWindow').value, 40),
+    mine_interval: finite($('interval').value, 8),
+    max_train_cases: finite($('trainCases').value, 20000),
+    max_eval_impressions: finite($('evalImpressions').value, 500),
+    max_candidates: finite($('candidateLimit').value, 0),
+    eval_case_limit: finite($('evalCaseLimit').value, 0),
+    random_seed: finite($('seed').value, 7),
+    objective: $('tuneObjective').value || 'auc',
+    objective_tolerance: finite($('ndcgTolerance').value, 0.0025),
+    ndcg_tolerance: finite($('ndcgTolerance').value, 0.0025),
+    remine: $('remineBenchmark').checked
+  };
+}
+
+function syncControls() {
+  const config = state.config || {};
+  for (const [value, label] of Object.entries({workspace_attention:'Frozen embedding evidence', workspace_centered:'Background-corrected embedding evidence', workspace_contextual:'Semantic support + context (experimental)'})) {
+    if (!Array.from($('pairFeatureProfile').options).some(option => option.value === value)) {
+      $('pairFeatureProfile').add(new Option(label, value));
+    }
+  }
+  const map = {miner_strategy:'minerStrategy', min_support:'min', max_rules:'max', conjunctions:'conjunctions', chain_steps:'chainSteps', aggregation:'aggregation', feature_profile:'featureProfile', negative_ratio:'negativeRatio', ranking_mode:'rankingMode', pairwise_weight:'pairwiseWeight', pairwise_fusion:'pairwiseFusion', pair_aggregation:'pairAggregation', pair_margin_transform:'pairMarginTransform', pair_margin_power:'pairMarginPower', ctv_evidence_k:'ctvEvidenceK', pair_feature_profile:'pairFeatureProfile', pair_min_support:'pairMinSupport', pair_min_effect:'pairMinEffect', pair_max_rules:'pairMaxRules', pair_negative_ratio:'pairNegativeRatio', pair_conjunctions:'pairConjunctions', pair_numeric_bins:'pairNumericBins', pairwise_opponents:'pairwiseOpponents', pair_chain_steps:'pairChainSteps', top_k:'top', feed_window:'feedWindow', mine_interval:'interval', max_train_cases:'trainCases', max_eval_impressions:'evalImpressions', max_candidates:'candidateLimit', random_seed:'seed'};
+  for (const [key, id] of Object.entries(map)) if (config[key] !== undefined) {
+    const control = $(id);
+    if (control.tagName === 'SELECT' && !Array.from(control.options).some(option => option.value === String(config[key]))) {
+      control.add(new Option(String(config[key]).replaceAll('_', ' '), String(config[key])));
+    }
+    control.value = config[key];
+  }
+  $('pairFamilyFusion').value = config.pair_family_fusion || 'flat_margin';
+  for (const id of ['featureProfile', 'pairFeatureProfile']) {
+    for (const option of $(id).options) {
+      option.disabled = Boolean(state.engine?.symbolic_only) && !option.value.startsWith('symbolic_');
+      if (option.value.startsWith('workspace_') && !state.engine?.semantic_workspace) option.disabled = true;
+      if (option.value.startsWith('llm_') && !state.engine?.llm_workspace) option.disabled = true;
+    }
+  }
+  updateFeatureWarning();
+  const dataset = state.dataset || loadedDataset || {};
+  if (dataset.path || dataset.directory) $('datasetPath').value = dataset.path || dataset.directory;
+}
+
+function populateUsers(selected) {
+  const users = state.users || [];
+  $('user').innerHTML = users.map(user => {
+    const topics = (user.topics || []).join(', ');
+    const suffix = topics ? ` · ${topics}` : '';
+    return `<option value="${escapeHtml(user.id)}">${escapeHtml(user.id)}${escapeHtml(suffix)}</option>`;
+  }).join('');
+  if (selected && users.some(user => String(user.id) === String(selected))) $('user').value = selected;
+}
+
+function datasetValue(dataset, names, fallback = '—') {
+  for (const name of names) if (dataset[name] !== undefined && dataset[name] !== null) return dataset[name];
+  return fallback;
+}
+
+function renderDataset() {
+  const dataset = state.dataset || loadedDataset;
+  if (!dataset) {
+    $('datasetDetails').innerHTML = `<span><b>Source:</b> built-in fixture</span><span><b>Users:</b> ${(state.users || []).length}</span>`;
+    return;
+  }
+  const source = datasetValue(dataset, ['name','source','kind'], 'MIND');
+  const path = datasetValue(dataset, ['path','directory']);
+  const cases = datasetValue(dataset, ['train_cases','training_cases','case_count','events']);
+  const impressions = datasetValue(dataset, ['eval_impressions','evaluation_impressions','test_impressions']);
+  const articles = datasetValue(dataset, ['articles','article_count','news_count']);
+  const users = datasetValue(dataset, ['users','user_count'], (state.users || []).length);
+  $('datasetDetails').innerHTML = [
+    ['Source', source], ['Path', path], ['Training cases', cases], ['Eval impressions', impressions], ['Articles', articles], ['Users', users]
+  ].map(([label,value]) => `<span><b>${label}:</b> ${escapeHtml(value)}</span>`).join('');
+}
+
+function premiseText(premise) {
+  const labels = {pair_entity_recent_top1_similarity: 'recent-entity semantic similarity'};
+  if (Array.isArray(premise)) return `${labels[premise[0]] || premise[0]}=${premise[1]}`;
+  if (premise && typeof premise === 'object') {
+    const name = premise.predicate || premise.name;
+    return `${labels[name] || name}=${premise.value}`;
+  }
+  return String(premise);
+}
+
+function renderState() {
+  const rules = state.rules || [];
+  const pairRules = state.pair_rules || [];
+  const version = state.version ?? 0;
+  const pending = state.pending_events ?? 0;
+  const engine = state.engine?.status || state.engine || 'PeTTaChainer';
+  const semantic = state.semantic_parser?.status || 'semantic parser unavailable';
+  const mining = state.last_mining || {};
+  const depths = (mining.depths || []).join(',') || state.config?.conjunctions || '—';
+  const features = Object.keys(mining.feature_vocabulary || {});
+  const optimization = state.config || {};
+  $('status').textContent = `rule set v${version} · ${rules.length} click rules + ${pairRules.length} pair rules · ${optimization.miner_strategy || 'fixed_combinations'} · ${optimization.ranking_mode || 'pointwise'} · ${pending} pending · ${engine} · ${semantic}`;
+  renderMiningTrace();
+  const sourceName = rule => String(rule.source || '').split('/').pop() || 'unknown';
+  const targetSearchText = rule => rule.target_wracc === undefined ? '' : ` · target WRAcc ${finite(rule.target_wracc).toFixed(6)} · weighted support ${finite(rule.target_weighted_support).toFixed(3)}`;
+  const pointwiseHtml = rules.map(rule => `<div>${escapeHtml(rule.id)}: ${(rule.premises || []).map(p => escapeHtml(premiseText(p))).join(' &amp; ')} → ${escapeHtml(rule.target)} · source ${escapeHtml(sourceName(rule))} · s=${finite(rule.strength).toFixed(3)} c=${finite(rule.confidence).toFixed(3)} · support ${escapeHtml(rule.support ?? '—')}${targetSearchText(rule)}</div>`).join('');
+  const pairHtml = pairRules.map(rule => {
+    const support = rule.ctv_support ?? rule.calibrated_support ?? rule.antecedent_support ?? '—';
+    const supportUnit = rule.ctv_support_unit || rule.calibrated_support_unit || 'raw_oriented_pair_case';
+    return `<div>${escapeHtml(rule.variant_id || rule.id)}: ${(rule.premises || []).map(p => escapeHtml(premiseText(p))).join(' &amp; ')} → Preferred(left,right) · source ${escapeHtml(sourceName(rule))} · dependency ${escapeHtml(rule.dependency_id || rule.id)} · s=${finite(rule.strength).toFixed(3)} c=${finite(rule.confidence).toFixed(3)} · margin w=${finite(rule.vote_weight).toFixed(3)} · CTV support ${escapeHtml(support)} ${escapeHtml(supportUnit)}${targetSearchText(rule)}</div>`;
+  }).join('');
+  $('rules').innerHTML = `${pointwiseHtml}${pairHtml}` || 'No rules mined.';
+  renderDataset();
+  renderRuns();
+}
+
+function renderMiningTrace() {
+  const mining = state.background_mining || {};
+  const trace = $('miningTrace');
+  const active = mining.active_event_sequence;
+  const modelSequence = mining.model_event_sequence ?? 0;
+  const pending = mining.pending_events ?? state.pending_events ?? 0;
+  if (mining.state === 'failed') {
+    trace.className = 'mining-trace failed';
+    trace.textContent = `Background fpMiner failed; rule set v${state.version ?? 0} is still serving safely. ${mining.last_error || ''}`;
+  } else if (mining.running) {
+    trace.className = 'mining-trace running';
+    trace.textContent = `Serving rule set v${state.version ?? 0} while fpMiner builds from event snapshot ${active ?? '…'} in a staged PeTTa workspace · ${pending} event(s) newer than served model ${modelSequence}.`;
+  } else {
+    trace.className = 'mining-trace muted';
+    const duration = mining.last_duration_seconds == null ? '' : ` · last build ${finite(mining.last_duration_seconds).toFixed(3)} s`;
+    trace.textContent = `fpMiner idle · serving rule set v${state.version ?? 0} through PeTTaChainer · ${pending} event(s) until next threshold${duration}`;
+  }
+}
+
+async function pollMiningState() {
+  if (miningPollBusy) return;
+  miningPollBusy = true;
+  try {
+    const latest = await api('/api/state');
+    const previousVersion = observedRuleVersion;
+    state = latest;
+    renderState();
+    observedRuleVersion = state.version ?? previousVersion;
+    if (previousVersion !== null && observedRuleVersion !== previousVersion) {
+      await refresh();
+      const trace = $('feedbackTrace');
+      trace.className = 'feedback-trace visible';
+      trace.textContent = `Background fpMiner promoted rule set v${observedRuleVersion}; the visible feed was proof-ranked again by the new PeTTaChainer worker.`;
+    }
+  } catch (error) {
+    const trace = $('miningTrace');
+    trace.className = 'mining-trace failed';
+    trace.textContent = `Could not read mining state: ${error.message}`;
+  } finally { miningPollBusy = false; }
+}
+
+function updateFeatureWarning() {
+  const profile = $('featureProfile').value;
+  const messages = {
+    symbolic_only: 'Point rules use editorial metadata and preceding interactions. The pair-rule profile determines additional semantic evidence; strict no-NN mode is a separate policy.',
+    core: 'Core uses topic, format and coarse affinity for the fastest mining pass.',
+    accuracy: 'Accuracy uses the bounded semantic and temporal features most useful for ranking.',
+    accuracy_plus: 'Accuracy + format adds title-length format to improve candidate resolution; validate its latency and replay metrics.',
+    accuracy_detail: 'Accuracy detail is the recommended AUC profile: absolute/recent topic counts plus fine entity overlap (slower replay).',
+    accuracy_sequence: 'Accuracy + ordered-history recency lets the miner test whether the most recently matched topic or subcategory predicts engagement.',
+    accuracy_content: 'Accuracy + title overlap is a content-similarity experiment; validate on the full replay because it can overfit a small slice.',
+    accuracy_rich: 'Accuracy rich adds subcategory, absolute topic-history count, and fine entity overlap; it is intended for accuracy experiments.',
+    all: 'Performance warning: All mines every available content and temporal feature, increasing mining and proof latency substantially.'
+  };
+  $('featureWarning').textContent = messages[profile] || messages.accuracy;
+  $('featureWarning').className = profile === 'all' ? 'muted status-error' : 'muted';
+}
+
+function optimizationSummary(result = {}) {
+  const config = result.config || state.config || configPayload();
+  const mining = result.mining || state.last_mining || {};
+  return {
+    miner_strategy: config.miner_strategy,
+    configured_max_rule_atoms: config.conjunctions,
+    mined_depths: mining.depths || [],
+    feature_profile: config.feature_profile,
+    mined_features: Object.keys(mining.feature_vocabulary || {}),
+    negative_ratio: config.negative_ratio,
+    aggregation: config.aggregation,
+    ranking_mode: config.ranking_mode,
+    pairwise_weight: config.pairwise_weight,
+    pair_aggregation: config.pair_aggregation,
+    pair_margin_transform: config.pair_margin_transform,
+    pair_margin_power: config.pair_margin_power,
+    ctv_evidence_k: config.ctv_evidence_k,
+    pair_feature_profile: config.pair_feature_profile,
+    pair_numeric_bins: config.pair_numeric_bins,
+    pair_rules: result.pair_rules ?? state.pair_rules?.length ?? 0,
+    pairwise_opponents: config.pairwise_opponents
+  };
+}
+
+function feedRowHtml(row) {
+    const article = row.article || {};
+    const stv = row.stv || {};
+    const inference = row.inference_stv || stv;
+    const tie = row.tie_break || {};
+    const details = [article.topic, article.format, article.subcategory].filter(Boolean).map(escapeHtml).join(' · ');
+    const rules = (row.rules || []).map(rule => `<div class="rule">${escapeHtml(rule.id)}: ${(rule.premises || []).map(p => escapeHtml(premiseText(p))).join(' &amp; ')} → ${escapeHtml(rule.target || 'click')}</div>`).join('');
+    const proofs = (row.proofs || []).map(proof => `<div class="proof">${escapeHtml(typeof proof === 'string' ? proof : JSON.stringify(proof))}</div>`).join('');
+    const tieText = tie.format_prior !== undefined ? ` · exact-tie prior ${finite(tie.format_prior).toFixed(4)}` : '';
+    const rankScore = row.ranking_score ?? row.score;
+    const pairText = row.pairwise_score === undefined || row.pairwise_score === null ? '' : ` · pair ${finite(row.pairwise_score).toFixed(4)} · margin ${finite(row.pairwise_margin_score).toFixed(4)} · pair proof coverage ${finite(row.pairwise_directional_coverage).toFixed(2)}`;
+    const feedback = row.feedback_evidence || {};
+    const feedbackRules = feedback.rule_ids || [];
+    const feedbackProof = feedbackRules.length
+      ? `<div class="feedback-proof"><b>Live PeTTa feedback proof:</b> recent skip match=${escapeHtml(feedback.match)} · ${feedbackRules.map(escapeHtml).join(', ')} · revised STV ${finite(feedback.proof_stv?.strength).toFixed(3)}/${finite(feedback.proof_stv?.confidence).toFixed(3)}</div>`
+      : '';
+    const revisionText = row.queue_revision ? ` · live queue revision ${escapeHtml(row.queue_revision)}` : '';
+    return `<article class="card" data-article="${escapeHtml(article.id)}" data-ranking-score="${escapeHtml(rankScore)}" data-score-method="${escapeHtml(row.score_method || '')}" data-feedback-rules="${escapeHtml(feedbackRules.join(','))}" data-queue-revision="${escapeHtml(row.queue_revision ?? '')}"><span class="score">${finite(rankScore).toFixed(6)}</span><b>${escapeHtml(article.title || article.id)}</b><div class="muted">${details} · ranking score ${finite(rankScore).toFixed(4)}${pairText} · pointwise ${finite(row.score).toFixed(6)} · ${escapeHtml(row.score_method || row.aggregation || 'proof score')} · decision STV ${finite(stv.strength).toFixed(3)}/${finite(stv.confidence).toFixed(3)} · PeTTa proof STV ${finite(inference.strength).toFixed(3)}/${finite(inference.confidence).toFixed(3)}${tieText}${revisionText}</div><button class="feedback" data-article="${escapeHtml(article.id)}" data-action="click">Click</button><button class="feedback" data-article="${escapeHtml(article.id)}" data-action="skip">Skip</button><button class="semantic" data-article="${escapeHtml(article.id)}">Parse semantics</button>${feedbackProof}${rules || '<div class="muted">No mined pointwise rule fired.</div>'}${proofs}<div class="semantic-output" data-semantic-for="${escapeHtml(article.id)}"></div></article>`;
+}
+
+function bindFeedActions() {
+  $('feed').querySelectorAll('.feedback:not([data-bound])').forEach(button => {
+    button.dataset.bound = 'true';
+    button.addEventListener('click', () => eventOf(button.dataset.article, button.dataset.action,
+                                                    feedContext.get(String(button.dataset.article))));
+  });
+  $('feed').querySelectorAll('.semantic:not([data-bound])').forEach(button => {
+    button.dataset.bound = 'true';
+    button.addEventListener('click', () => previewSemantics(button));
+  });
+}
+
+async function previewSemantics(button) {
+  const article = button.dataset.article;
+  const requestedGeneration = feedGeneration;
+  const requestedLabInstance = state.instance_id;
+  const output = button.closest('article').querySelector('.semantic-output');
+  const controller = new AbortController();
+  const serverTimeout = finite(state.semantic_parser?.timeout_seconds, 60);
+  const timeout = setTimeout(() => controller.abort(), (serverTimeout + 5) * 1000);
+  button.disabled = true;
+  button.textContent = 'Parsing through NL2PLN…';
+  output.textContent = 'Calling the configured PeTTaChainer HTTP stack.';
+  try {
+    const result = await api('/api/semantic/preview', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({article}), signal:controller.signal
+    });
+    if (requestedGeneration !== feedGeneration
+        || (requestedLabInstance && result.lab_instance_id !== requestedLabInstance)) {
+      output.textContent = 'Ignored a semantic preview from an older feed generation.';
+      return;
+    }
+    const statements = (result.statements || [])
+      .map(source => `<div>${escapeHtml(source)}</div>`).join('');
+    const mutation = result.committed === false ? 'not committed' : 'invalid commit status';
+    output.innerHTML = `<b>Real ${escapeHtml(result.conversion || 'NL2PLN')} preview · ${finite(result.statement_count, 0)} statements · ${result.cached ? 'content-hash cache hit' : 'fresh API call'} · ${mutation}</b>${statements || '<div>No bounded statement returned.</div>'}`;
+    button.textContent = 'Parse again';
+  } catch (error) {
+    output.textContent = error.name === 'AbortError'
+      ? 'Semantic preview timed out in the browser.' : error.message;
+    button.textContent = 'Retry semantic parse';
+  } finally { clearTimeout(timeout); button.disabled = false; }
+}
+
+function resetFeed() {
+  feedGeneration += 1;
+  if (feedRequestController) feedRequestController.abort();
+  feedRequestController = null;
+  feedSession = null;
+  feedCursor = null;
+  feedHasMore = true;
+  feedLoading = false;
+  feedSeen = new Set();
+  feedContext = new Map();
+  feedError = null;
+  feedTotal = null;
+  feedRuleVersion = null;
+  feedQueueRevision = 0;
+  feedAcceptedPosition = 0;
+  $('feed').innerHTML = '';
+  $('feedbackTrace').className = 'feedback-trace';
+  $('feedbackTrace').textContent = '';
+  delete $('feedbackTrace').dataset.revision;
+  $('feedSentinel').className = 'feed-sentinel';
+  $('feedSentinel').textContent = 'Loading recommendations…';
+}
+
+function renderFeedPage(rows, append = true) {
+  const unseen = (rows || []).filter(row => {
+    const id = row.article?.id ?? row.article_id ?? row.id;
+    if (id === undefined || id === null || feedSeen.has(String(id))) return false;
+    feedSeen.add(String(id));
+    feedContext.set(String(id), {context:row.context || {}, impression:row.impression || null});
+    return true;
+  });
+  if (!append) $('feed').innerHTML = '';
+  if (unseen.length) $('feed').insertAdjacentHTML('beforeend', unseen.map(feedRowHtml).join(''));
+  bindFeedActions();
+}
+
+function updateFeedSentinel() {
+  const sentinel = $('feedSentinel');
+  sentinel.className = 'feed-sentinel';
+  if (feedError) {
+    sentinel.className = 'feed-sentinel status-error';
+    sentinel.textContent = feedError;
+  } else if (feedLoading) sentinel.textContent = 'Reasoning over the next articles…';
+  else if (!feedHasMore) sentinel.textContent = feedSeen.size ? `All ${feedSeen.size}${feedTotal === null ? '' : ` of ${feedTotal}`} reasoning-ranked articles loaded.` : 'No candidates returned.';
+  else sentinel.textContent = 'Scroll to load more reasoning-ranked articles.';
+}
+
+function acceptFeedPage(result) {
+  const rows = Array.isArray(result) ? result : (result.feed || result.items || []);
+  const incomingVersion = Array.isArray(result) ? null : (result.rule_version ?? null);
+  const mustReset = !Array.isArray(result) && Boolean(result.reset);
+  const versionChanged = feedRuleVersion !== null && incomingVersion !== null && feedRuleVersion !== incomingVersion;
+  if ((mustReset || versionChanged) && feedCursor !== null) {
+    feedSeen = new Set();
+    $('feed').innerHTML = '';
+  }
+  renderFeedPage(rows, true);
+  feedCursor = Array.isArray(result) ? null : (result.next_cursor ?? null);
+  feedSession = Array.isArray(result) ? null : (result.session ?? feedSession);
+  feedHasMore = Array.isArray(result) ? false : Boolean(result.has_more ?? feedCursor !== null);
+  feedTotal = Array.isArray(result) ? rows.length : (result.total_candidates ?? feedTotal);
+  feedRuleVersion = incomingVersion ?? feedRuleVersion;
+  feedQueueRevision = Array.isArray(result) ? feedQueueRevision : finite(result.queue_revision, feedQueueRevision);
+  feedAcceptedPosition = Array.isArray(result)
+    ? feedAcceptedPosition : finite(result.position, feedAcceptedPosition);
+  if (!rows.length || (feedHasMore && feedCursor === null)) feedHasMore = false;
+}
+
+function showFeedbackRevision(result) {
+  const revision = result.queue_revision;
+  const trace = $('feedbackTrace');
+  if (!revision) {
+    trace.className = 'feedback-trace';
+    trace.textContent = '';
+    delete trace.dataset.revision;
+    return;
+  }
+  const moved = (revision.movements || []).slice(0, 5)
+    .map(item => `${item.article}: ${item.from}→${item.to}`).join(' · ');
+  const affected = (revision.negative_proof_candidates || []).length;
+  const demotion = revision.causal_demotion || {};
+  const demotionRules = demotion.rule_ids || [];
+  const demotionProofs = demotion.proofs || [];
+  const demotionHtml = demotion.article
+    ? `<div class="causal-demotion" data-article="${escapeHtml(demotion.article)}" data-before-rank="${escapeHtml(demotion.before_rank)}" data-after-rank="${escapeHtml(demotion.after_rank)}" data-before-score="${escapeHtml(demotion.before_score)}" data-after-score="${escapeHtml(demotion.after_score)}" data-before-ranking-score="${escapeHtml(demotion.before_ranking_score)}" data-after-ranking-score="${escapeHtml(demotion.after_ranking_score)}" data-feedback-evidence-changed="${escapeHtml(demotion.feedback_evidence_changed)}" data-before-feedback-signature="${escapeHtml(demotion.before_feedback_signature || '')}" data-after-feedback-signature="${escapeHtml(demotion.after_feedback_signature || '')}" data-score-method="${escapeHtml(demotion.score_method || '')}" data-rule-ids="${escapeHtml(demotionRules.join(','))}" data-proofs="${escapeHtml(demotionProofs.join('\n'))}"><b>Causal negative-proof check:</b> ${escapeHtml(demotion.article)} moved ${escapeHtml(demotion.before_rank)}→${escapeHtml(demotion.after_rank)} · score ${finite(demotion.before_score).toFixed(6)}→${finite(demotion.after_score).toFixed(6)} · ranking score ${finite(demotion.before_ranking_score).toFixed(6)}→${finite(demotion.after_ranking_score).toFixed(6)} · changed PeTTa evidence · ${escapeHtml(demotion.score_method || '')} · ${demotionRules.map(escapeHtml).join(', ')}</div>`
+    : '';
+  trace.className = 'feedback-trace visible';
+  trace.dataset.revision = String(revision.revision);
+  trace.innerHTML = `<b>Live reasoning update #${escapeHtml(revision.revision)}</b> · ${escapeHtml(revision.action)} on ${escapeHtml(revision.feedback_article)} · PeTTaChainer reranked ${escapeHtml(revision.reranked_candidates)} queued articles · ${escapeHtml(revision.changed_positions)} positions changed · ${escapeHtml(affected)} candidates received new/changed negative proof evidence${moved ? `<div>${escapeHtml(moved)}</div>` : ''}${demotionHtml}`;
+}
+
+function maybeLoadNearFeedEnd() {
+  const rect = $('feedSentinel').getBoundingClientRect();
+  const nearViewport = rect.top <= window.innerHeight + 500 && rect.bottom >= -500;
+  if (nearViewport && feedHasMore && !feedLoading && !feedbackPending) loadFeedPage();
+}
+
+async function loadFeedPage() {
+  if (feedLoading || !feedHasMore || feedbackPending) return;
+  const user = $('user').value || (state.users || [])[0]?.id || 'u1';
+  const generation = feedGeneration;
+  const controller = new AbortController();
+  feedRequestController = controller;
+  feedLoading = true;
+  updateFeedSentinel();
+  try {
+    const limit = Math.max(1, finite($('top').value, 5));
+    const params = new URLSearchParams({user, limit:String(limit)});
+    if (feedCursor !== null && feedCursor !== undefined && feedCursor !== '') params.set('cursor', String(feedCursor));
+    else if (feedSession) params.set('session', String(feedSession));
+    const result = await api(`/api/feed?${params}`, {signal:controller.signal});
+    if (generation !== feedGeneration) return;
+    acceptFeedPage(result);
+  } catch (error) {
+    if (generation !== feedGeneration) return;
+    if (error.name === 'AbortError') return;
+    feedHasMore = false;
+    feedError = error.message;
+    return;
+  } finally {
+    if (generation === feedGeneration) {
+      if (feedRequestController === controller) feedRequestController = null;
+      feedLoading = false;
+      updateFeedSentinel();
+      setTimeout(maybeLoadNearFeedEnd, 0);
+    }
+  }
+}
+
+async function refresh() {
+  resetFeed();
+  await loadFeedPage();
+}
+
+async function eventOf(article, action, displayed = {}) {
+  if (feedbackPending) return;
+  feedbackPending = true;
+  // A scroll request may have captured the pre-feedback cursor and queue
+  // revision. Invalidate it before recording feedback, and resume from the
+  // server-issued post-feedback cursor so an old response cannot repaint the
+  // newly reasoned ordering.
+  feedGeneration += 1;
+  if (feedRequestController) feedRequestController.abort();
+  feedRequestController = null;
+  feedLoading = false;
+  feedCursor = null;
+  try {
+    const result = await api('/api/event', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({
+      user:$('user').value, article, action,
+      context:displayed?.context || {}, impression:displayed?.impression || null,
+      session:feedSession, queue_revision:feedQueueRevision,
+      feed_position:feedAcceptedPosition
+    })});
+    state = await api('/api/state');
+    renderState();
+    $('feed').querySelectorAll('.feedback').forEach(button => {
+      if (String(button.dataset.article) === String(article)) button.disabled = true;
+    });
+    showFeedbackRevision(result);
+    // The feedback response defines the new queue revision; continuation
+    // requests from this point are no longer stale scroll work.
+    feedbackPending = false;
+    if (result.mined) await refresh();
+    else if (result.queue_revision) {
+      // Keep the server-issued cursor/session, but replace all already-seen
+      // cards with the first page of the newly proof-ranked unserved queue.
+      $('feed').innerHTML = '';
+      feedContext.clear();
+      feedError = null;
+      feedHasMore = true;
+      feedCursor = result.queue_revision.next_cursor ?? null;
+      feedSession = result.queue_revision.session ?? feedSession;
+      feedQueueRevision = finite(result.queue_revision.revision, feedQueueRevision);
+      feedAcceptedPosition = finite(
+        result.queue_revision.delivery_recovery?.accepted_position,
+        feedAcceptedPosition
+      );
+      await loadFeedPage();
+    } else if (result.profile_changed) await refresh();
+    else await loadFeedPage();
+  } catch (error) { $('result').textContent = error.message; }
+  finally {
+    feedbackPending = false;
+    updateFeedSentinel();
+    setTimeout(maybeLoadNearFeedEnd, 0);
+  }
+}
+
+async function apply() {
+  setButtonBusy('applyConfig', true, 'Applying…');
+  try {
+    const result = await api('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(configPayload())});
+    if (result.mined) $('result').textContent = JSON.stringify({...result.mined, optimization:optimizationSummary({mining:result.mined, config:result.config})}, null, 2);
+    state = await api('/api/state');
+    renderState();
+    await refresh();
+  } catch (error) { $('result').textContent = error.message; }
+  finally { setButtonBusy('applyConfig', false); }
+}
+
+async function mine() {
+  setButtonBusy('mineNow', true, 'Mining…');
+  try {
+    const configured = await api('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(configPayload())});
+    const result = configured.mined || await api('/api/mine', {method:'POST'});
+    $('result').textContent = JSON.stringify({...result, optimization:optimizationSummary({mining:result})}, null, 2);
+    state = await api('/api/state');
+    renderState();
+    await refresh();
+  } catch (error) { $('result').textContent = error.message; }
+  finally { setButtonBusy('mineNow', false); }
+}
+
+async function loadDataset() {
+  const path = $('datasetPath').value.trim();
+  if (!path) { showMessage('Enter a server-accessible extracted MIND directory.', true); return; }
+  setButtonBusy('loadDataset', true, 'Loading…');
+  showMessage('Loading MIND data and building replay cases…');
+  try {
+    const request = {path, max_train_cases:finite($('trainCases').value, 20000), max_eval_impressions:finite($('evalImpressions').value, 500), random_seed:finite($('seed').value, 7)};
+    const result = await api('/api/dataset/load', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(request)});
+    loadedDataset = result.dataset || {path, ...(result.stats || {})};
+    state = result.state || await api('/api/state');
+    if (!state.dataset) state.dataset = loadedDataset;
+    const selected = $('user').value;
+    populateUsers(selected);
+    syncControls();
+    renderState();
+    showMessage(result.message || 'MIND dataset loaded. Rules and replay cases are ready.');
+    await refresh();
+  } catch (error) { showMessage(error.message, true); }
+  finally { setButtonBusy('loadDataset', false); }
+}
+
+async function bench() {
+  setButtonBusy('runBenchmark', true, 'Running replay…');
+  try {
+    const result = await api('/api/benchmark', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(configPayload())});
+    $('result').textContent = JSON.stringify({...result, optimization:optimizationSummary(result)}, null, 2);
+    state = await api('/api/state');
+    renderState();
+    await refresh();
+  } catch (error) { $('result').textContent = error.message; }
+  finally { setButtonBusy('runBenchmark', false); }
+}
+
+async function tune() {
+  setButtonBusy('autoTune', true, 'Tuning held-out…');
+  $('result').textContent = 'Searching configurations on held-out impressions…';
+  try {
+    const result = await api('/api/tune', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(configPayload())});
+    $('result').textContent = JSON.stringify({
+      best_config: result.best_config ?? null,
+      tuning_results: result.tuning_results ?? result.results ?? [],
+      heldout_result: result.heldout_result ?? result.heldout ?? null,
+      split: result.split ?? null,
+      objective: result.objective ?? null,
+      objective_metric: result.objective_metric ?? null,
+      objective_tolerance: result.objective_tolerance ?? result.ndcg_tolerance ?? null,
+      ndcg_tolerance: result.ndcg_tolerance ?? null,
+      active_optimization: optimizationSummary(result.heldout_result ?? result.heldout ?? {})
+    }, null, 2);
+    state = result.state || await api('/api/state');
+    syncControls();
+    renderState();
+    await refresh();
+  } catch (error) {
+    $('result').textContent = `Auto-tune failed: ${error.message}`;
+    try {
+      state = await api('/api/state');
+      syncControls();
+      renderState();
+      await refresh();
+    } catch {}
+  } finally {
+    setButtonBusy('autoTune', false);
+  }
+}
+
+function renderRuns() {
+  const runs = state.runs || [];
+  $('runs').innerHTML = runs.map(run => {
+    const values = [
+      run.hit_rate !== undefined ? `hit ${(finite(run.hit_rate) * 100).toFixed(1)}%` : null,
+      metric(run.mrr) !== null ? `MRR ${metric(run.mrr)}` : null,
+      metric(run.ndcg_at_10 ?? run.ndcg) !== null ? `nDCG ${metric(run.ndcg_at_10 ?? run.ndcg)}` : null,
+      metric(run.auc) !== null ? `AUC ${metric(run.auc)}` : null,
+      metric(run.auc_proof_only) !== null ? `proof-only AUC ${metric(run.auc_proof_only)}` : null,
+      metric(run.auc_pairwise_delta) !== null ? `pair ΔAUC ${metric(run.auc_pairwise_delta)}` : null,
+      metric(run.auc_primary_score) !== null ? `primary-score AUC ${metric(run.auc_primary_score)}` : null,
+      metric(run.proof_coverage) !== null ? `proof coverage ${metric(run.proof_coverage)}` : null,
+      metric(run.pairwise_directional_coverage) !== null ? `pair coverage ${metric(run.pairwise_directional_coverage)}` : null,
+      run.score_unique !== undefined ? `unique scores ${run.score_unique}` : null,
+      run.score_tied_candidates !== undefined ? `tie rows ${run.score_tied_candidates}` : null,
+      run.config?.conjunctions !== undefined ? `max atoms ${run.config.conjunctions}` : null,
+      run.config?.feature_profile ? `features ${run.config.feature_profile}` : null,
+      run.config?.pair_feature_profile ? `pair features ${run.config.pair_feature_profile}` : null,
+      run.config?.negative_ratio !== undefined ? `negatives ${run.config.negative_ratio}:1` : null,
+      (run.config?.aggregation || run.aggregation) ? `aggregation ${run.config?.aggregation || run.aggregation}` : null,
+      run.config?.pair_aggregation ? `pair aggregation ${run.config.pair_aggregation}` : null,
+      run.config?.pair_margin_power !== undefined ? `margin power ${run.config.pair_margin_power}` : null,
+      run.config?.ctv_evidence_k !== undefined ? `CTV K ${run.config.ctv_evidence_k}` : null,
+      run.cases !== undefined ? `${run.cases} impressions` : null,
+      run.rules !== undefined ? `${run.rules} rules` : null,
+      run.pair_rules !== undefined ? `${run.pair_rules} pair rules` : null
+    ].filter(Boolean).join(' · ');
+    return `<div class="run"><b>${escapeHtml(run.id)}</b> · ${escapeHtml(values)}<div class="muted">${escapeHtml(JSON.stringify(run.config || {}))}</div></div>`;
+  }).join('') || 'No runs yet.';
+}
+
+async function init() {
+  try {
+    state = window.__INITIAL_STATE__ || await api('/api/state');
+    observedRuleVersion = state.version ?? null;
+    syncControls();
+    populateUsers();
+    renderState();
+    if (state.dataset && state.dataset.name !== 'built-in fixture') showMessage(`${state.dataset.name} is loaded and mined.`);
+    feedObserver = new IntersectionObserver(entries => {
+      if (entries.some(entry => entry.isIntersecting)) loadFeedPage();
+    }, {rootMargin:'500px 0px'});
+    feedObserver.observe($('feedSentinel'));
+    window.addEventListener('scroll', maybeLoadNearFeedEnd, {passive:true});
+    feedPollTimer = setInterval(maybeLoadNearFeedEnd, 300);
+    if (window.__INITIAL_FEED_PAGE__) {
+      resetFeed();
+      acceptFeedPage(window.__INITIAL_FEED_PAGE__);
+      updateFeedSentinel();
+    } else await refresh();
+    setInterval(pollMiningState, 750);
+  } catch (error) { $('result').textContent = error.message; }
+}
+
+$('refreshFeed').addEventListener('click', refresh);
+$('user').addEventListener('change', refresh);
+$('applyConfig').addEventListener('click', apply);
+$('mineNow').addEventListener('click', mine);
+$('runBenchmark').addEventListener('click', bench);
+$('autoTune').addEventListener('click', tune);
+$('loadDataset').addEventListener('click', loadDataset);
+$('featureProfile').addEventListener('change', updateFeatureWarning);
+$('minerStrategy').addEventListener('change', ensureTargetAwareDepths);
+init();
+</script>
