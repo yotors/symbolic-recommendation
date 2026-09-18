@@ -930,6 +930,7 @@ STV_RE = re.compile(r"\(STV\s+([0-9.eE+-]+)\s+([0-9.eE+-]+)\)")
 MINER_LOCK = threading.RLock()
 MINING_WORKSPACE_SCHEMA_VERSION = 1
 MINING_WORKSPACE_MODE = "incremental_fpminer_support_full_population_ctv_estimation"
+SERVING_MODEL_SCHEMA = "mindplex-symbolic-serving-model-v1"
 BACKGROUND_MINING_BUILD_MODE = (
     "incremental_fpminer_support_staged_snapshot"
 )
@@ -1393,7 +1394,8 @@ class IsolatedPeTTaChainer:
 
 
 class Lab:
-    def __init__(self, data=None, *, symbolic_only=False, config=None):
+    def __init__(self, data=None, *, symbolic_only=False, config=None,
+                 serving_model=None):
         self.symbolic_only=bool(symbolic_only)
         if self.symbolic_only and data is not None:
             from ..pipelines.symbolic_data import strip_neural_evidence
@@ -1610,11 +1612,27 @@ class Lab:
         self._relational_query_roots=0
         self._click_base_rate=0.5
         self._tie_break_stats={}
+        self._startup_mode="mine"
+        self._serving_model_sha256=None
+        self._startup_prewarm={"status":"not_run"}
+        self._last_live_score_profile={}
         self._feed_sessions={}
         self.mined_rules=[]; self.mined_output=[]; self.last_mining=None
+        if serving_model is not None:
+            model_config=serving_model.get("config")
+            if not isinstance(model_config,dict):
+                raise ValueError("serving model has no valid config")
+            if config and config!=model_config:
+                raise ValueError(
+                    "serving model config conflicts with requested config"
+                )
+            config=model_config
         if config:
             self.configure(config)
-        self.mine()
+        if serving_model is None:
+            self.mine()
+        else:
+            self._load_serving_model(serving_model)
         self._background_mining=AsyncMiningCoordinator(
             capture=lambda: self._capture_background_mining(),
             build=lambda snapshot: self._build_background_mining(snapshot),
@@ -1699,6 +1717,12 @@ class Lab:
                 ),
                 "llm_annotated_articles":len(self._llm_article_annotations),
                 "worker_pid":self.engine.pid,
+                "startup_mode":self._startup_mode,
+                "serving_model_sha256":self._serving_model_sha256,
+                "startup_prewarm":dict(self._startup_prewarm),
+                "last_live_score_profile":dict(
+                    self._last_live_score_profile
+                ),
                 "worker_recoveries":self.engine.recovery_count,
                 "last_worker_timeout":self.engine.last_timeout,
                 "serving_outer_deadline_seconds":self.config[
@@ -5035,6 +5059,220 @@ class Lab:
             "seconds":round(time.perf_counter()-started,3),
         }
         return self.last_pair_mining
+
+    @staticmethod
+    def _serving_model_digest(payload):
+        encoded=json.dumps(
+            payload,sort_keys=True,separators=(",",":"),ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def serving_model(self):
+        """Return a content-addressed immutable model for scorer startup.
+
+        The artifact contains learned symbolic vocabularies, calibrated rules,
+        numeric encoders and the exact MeTTa compiler output. It intentionally
+        excludes user/session state, proof caches and training events so every
+        serving replica starts clean from one auditable model version.
+        """
+        payload={
+            "schema":SERVING_MODEL_SCHEMA,
+            "source_rule_version":int(self.version),
+            "symbolic_only":bool(self.symbolic_only),
+            "config":copy.deepcopy(self.config),
+            "feature_vocabulary":{
+                predicate:sorted(values)
+                for predicate,values in self._feature_vocabulary.items()
+            },
+            "pair_feature_vocabulary":{
+                predicate:sorted(values)
+                for predicate,values in self._pair_feature_vocabulary.items()
+            },
+            "pair_categorical_labels":dict(
+                sorted(self._pair_categorical_labels.items())
+            ),
+            "numeric_pair_encoders":{
+                source:encoder.to_metadata()
+                for source,encoder in self._numeric_pair_encoders.items()
+            },
+            "point_rules":copy.deepcopy(self.mined_rules),
+            "pair_rules":copy.deepcopy(self.pair_rules),
+            "compiled_point_rules":list(self._point_rule_sources),
+            "compiled_point_channels":list(self._point_channel_sources),
+            "compiled_pair_rules":list(self._pair_rule_sources),
+            "active_point_rule_ids":sorted(self._active_rule_ids),
+            "active_pair_rule_ids":sorted(self._active_pair_rule_ids),
+            "click_base_rate":float(self._click_base_rate),
+            "tie_break_stats":copy.deepcopy(self._tie_break_stats),
+        }
+        return {
+            **payload,
+            "model_sha256":self._serving_model_digest(payload),
+        }
+
+    def _load_serving_model(self,model):
+        """Validate and install a frozen model without rerunning fpMiner."""
+        if not isinstance(model,dict) or model.get("schema")!=SERVING_MODEL_SCHEMA:
+            raise ValueError("unsupported serving model schema")
+        payload={key:value for key,value in model.items()
+                 if key!="model_sha256"}
+        expected=self._serving_model_digest(payload)
+        if not hmac.compare_digest(
+                str(model.get("model_sha256","")),expected):
+            raise ValueError("serving model digest does not match its content")
+        if bool(model.get("symbolic_only"))!=self.symbolic_only:
+            raise ValueError("serving model evidence mode does not match scorer")
+
+        def vocabulary(field):
+            raw=model.get(field)
+            if not isinstance(raw,dict):
+                raise ValueError(f"serving model has no valid {field}")
+            parsed={}
+            for predicate,values in raw.items():
+                if (not isinstance(predicate,str)
+                        or not isinstance(values,list)
+                        or any(not isinstance(value,str) for value in values)):
+                    raise ValueError(f"serving model has invalid {field}")
+                parsed[predicate]=set(values)
+            return parsed
+
+        point_rules=copy.deepcopy(model.get("point_rules"))
+        pair_rules=copy.deepcopy(model.get("pair_rules"))
+        if not isinstance(point_rules,list) or not isinstance(pair_rules,list):
+            raise ValueError("serving model rules must be lists")
+        for rule in (*point_rules,*pair_rules):
+            if not isinstance(rule,dict) or not isinstance(
+                    rule.get("premises"),list):
+                raise ValueError("serving model contains an invalid rule")
+            rule["premises"]=[tuple(item) for item in rule["premises"]]
+        source_fields=(
+            "compiled_point_rules","compiled_point_channels",
+            "compiled_pair_rules",
+        )
+        sources={field:model.get(field) for field in source_fields}
+        if any(not isinstance(value,list)
+               or any(not isinstance(item,str) for item in value)
+               for value in sources.values()):
+            raise ValueError("serving model compiled rules must be string lists")
+
+        self._feature_vocabulary=vocabulary("feature_vocabulary")
+        self._pair_feature_vocabulary=vocabulary("pair_feature_vocabulary")
+        labels=model.get("pair_categorical_labels")
+        if (not isinstance(labels,dict)
+                or any(not isinstance(key,str) or not isinstance(value,str)
+                       for key,value in labels.items())):
+            raise ValueError("serving model categorical labels are invalid")
+        self._pair_categorical_labels=dict(labels)
+        encoders=model.get("numeric_pair_encoders")
+        if not isinstance(encoders,dict):
+            raise ValueError("serving model numeric encoders are invalid")
+        self._numeric_pair_encoders={
+            source:QuantileNumericEvidence.from_metadata(metadata)
+            for source,metadata in encoders.items()
+        }
+        self.mined_rules=point_rules
+        self.mined_output=[]
+        self.pair_rules=pair_rules
+        self._point_rule_sources=list(sources["compiled_point_rules"])
+        self._point_channel_sources=list(sources["compiled_point_channels"])
+        self._pair_rule_sources=list(sources["compiled_pair_rules"])
+        self._active_rule_ids=set(model.get("active_point_rule_ids") or ())
+        self._active_pair_rule_ids=set(
+            model.get("active_pair_rule_ids") or ()
+        )
+        self._click_base_rate=float(model.get("click_base_rate"))
+        if not 0.0<=self._click_base_rate<=1.0:
+            raise ValueError("serving model click base rate is invalid")
+        tie_break_stats=model.get("tie_break_stats")
+        if not isinstance(tie_break_stats,dict):
+            raise ValueError("serving model tie-break statistics are invalid")
+        self._tie_break_stats=copy.deepcopy(tie_break_stats)
+
+        # Fail before accepting traffic if compiler metadata and rule objects
+        # disagree. PeTTa then receives exactly the validated source snapshot.
+        self._point_channel_topology()
+        self._compile_pair_rule_matcher()
+        self.engine.replace([
+            *self._point_rule_sources,*self._point_channel_sources,
+            *self._pair_rule_sources,*LIVE_NEGATIVE_RULE_SOURCES,
+            *(RELATIONAL_STRUCTURAL_RULES
+              if self.config.get("relational_evidence_mode")=="chained"
+              else ()),
+        ])
+        self.version=max(1,int(model.get("source_rule_version",1)))
+        self.pending_events=0
+        self._last_mined_event_sequence=self._event_sequence
+        self.last_mined_at=time.time()
+        self.last_pair_mining={
+            "execution":"serving_model_load",
+            "rules":len(self.pair_rules),
+            "model_sha256":expected,
+        }
+        self.last_mining={
+            "execution":"serving_model_load",
+            "rules":len(self.mined_rules),
+            "pair_rules":len(self.pair_rules),
+            "model_sha256":expected,
+            "version":self.version,
+        }
+        self._prewarm_serving_channels()
+        self._startup_mode="serving_model"
+        self._serving_model_sha256=expected
+
+    def _prewarm_serving_channels(self):
+        """Resolve model-invariant proof templates before readiness.
+
+        Isolated point/pair channel proofs depend on their compiled rule and
+        certain premise facts, not on a user's case identifier. Loading one
+        alpha-normalized template per rule removes the first request's query
+        penalty. Case-level caches are then cleared so no synthetic warm-up
+        identity can be served as user evidence.
+        """
+        started=time.perf_counter()
+        point_specs=[]
+        for index,rule in enumerate(self.mined_rules):
+            attrs=dict(rule["premises"])
+            point_specs.append((
+                f"warm_point_article_{index}",f"warm_point_case_{index}",
+                attrs,attrs,
+            ))
+        if point_specs:
+            self._proofs_for_specs(point_specs)
+
+        pair_specs=[]
+        if (self.config.get("ranking_mode")=="pairwise"
+                and self.pair_rules):
+            pair_specs=[
+                (f"warm_pair_case_{index}",dict(rule["premises"]))
+                for index,rule in enumerate(self.pair_rules)
+            ]
+            self._ensure_pair_specs(pair_specs)
+            self._proofs_for_pair_specs(pair_specs)
+
+        audit={
+            "status":"complete",
+            "seconds":round(time.perf_counter()-started,6),
+            "point_channels":len(self._point_channel_proof_cache),
+            "pair_channels":len(self._pair_channel_proof_cache),
+            "point_reasoner_query_calls":self._point_query_calls,
+            "pair_reasoner_query_calls":self._pair_query_calls,
+        }
+        self._proof_cache.clear()
+        self._pair_proof_cache.clear()
+        self._pair_case_attrs.clear()
+        self._pair_margin_cache.clear()
+        self._point_query_calls=0
+        self._point_query_roots=0
+        self._point_pruned_query_roots=0
+        self._point_channel_activations=0
+        self._point_reused_channel_activations=0
+        self._pair_query_calls=0
+        self._pair_query_roots=0
+        self._pair_pruned_query_roots=0
+        self._pair_channel_activations=0
+        self._pair_reused_channel_activations=0
+        self._startup_prewarm=audit
 
     def _rebuild_tie_break_stats(self,indexed_events=None):
         """Build safe, training-only priors used only for exact proof ties.
@@ -9760,10 +9998,43 @@ def load_semantic_snapshot(path):
     return data
 
 
+def load_serving_model(path):
+    path=Path(path)
+    if path.suffix!=".json":
+        raise ValueError("serving model must be a .json artifact")
+    with path.open(encoding="utf-8") as stream:
+        model=json.load(stream)
+    if not isinstance(model,dict):
+        raise ValueError("serving model must contain a JSON object")
+    return model
+
+
+def write_serving_model(path,model):
+    """Create, fsync and atomically publish a model without overwriting one."""
+    target=Path(path); target.parent.mkdir(parents=True,exist_ok=True)
+    temporary=target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("x",encoding="utf-8") as stream:
+            json.dump(model,stream,ensure_ascii=False,sort_keys=True,
+                      separators=(",",":"),allow_nan=False)
+            stream.write("\n"); stream.flush(); os.fsync(stream.fileno())
+        os.link(temporary,target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+class ProductionHTTPServer(ThreadingHTTPServer):
+    daemon_threads=True
+    allow_reuse_address=True
+    request_queue_size=128
+
+
 def main():
     global LAB
     local_archive=DATASET_DIR/"MIND_small_x1.zip"
-    parser=argparse.ArgumentParser(); parser.add_argument("--port",type=int,default=7070)
+    parser=argparse.ArgumentParser()
+    parser.add_argument("--host",default="127.0.0.1")
+    parser.add_argument("--port",type=int,default=7070)
     parser.add_argument("--mind",default=str(local_archive) if local_archive.is_file() else None,
                         help="Extracted raw MIND root or RecZoo MIND_small_x1.zip")
     parser.add_argument("--fixture",action="store_true",help="Use only the bundled deterministic fixture")
@@ -9773,30 +10044,57 @@ def main():
     evidence.add_argument("--replay-data",help="Prepared JSON replay snapshot; preserve its existing content/entity evidence")
     parser.add_argument("--config-file",help="JSON configuration or saved symbolic_experiment artifact")
     parser.add_argument(
+        "--serving-model",
+        help="Validated frozen serving-model JSON; skips fpMiner at startup",
+    )
+    parser.add_argument(
+        "--export-serving-model",
+        help="Write the mined/loaded serving model to a new JSON file",
+    )
+    parser.add_argument(
+        "--export-only",action="store_true",
+        help="Exit after --export-serving-model is written",
+    )
+    parser.add_argument(
         "--text-embeddings",
         help="Optional provenanced article text-embedding NPZ sidecar",
     )
     parser.add_argument("--max-train-cases",type=int,default=20000); parser.add_argument("--max-eval-impressions",type=int,default=500)
     parser.add_argument("--seed",type=int,default=7); args=parser.parse_args()
+    if args.export_only and not args.export_serving_model:
+        parser.error("--export-only requires --export-serving-model")
+    if args.config_file and args.serving_model:
+        parser.error("--config-file cannot override --serving-model")
     config={}
     if args.config_file:
         saved=json.loads(Path(args.config_file).read_text())
         config=saved.get("result",saved).get("config",saved)
+    serving_model=(load_serving_model(args.serving_model)
+                   if args.serving_model else None)
     if args.symbolic_data:
-        LAB=Lab(load_symbolic_snapshot(args.symbolic_data),symbolic_only=True,config=config)
+        LAB=Lab(load_symbolic_snapshot(args.symbolic_data),symbolic_only=True,
+                config=config,serving_model=serving_model)
     elif args.semantic_data:
-        LAB=Lab(load_semantic_snapshot(args.semantic_data),config=config)
+        LAB=Lab(load_semantic_snapshot(args.semantic_data),config=config,
+                serving_model=serving_model)
     elif args.replay_data:
-        LAB=Lab(load_symbolic_snapshot(args.replay_data),config=config)
+        LAB=Lab(load_symbolic_snapshot(args.replay_data),config=config,
+                serving_model=serving_model)
     elif args.mind and not args.fixture:
         data=load_mind(args.mind,max_train_cases=args.max_train_cases,
                        max_eval_impressions=args.max_eval_impressions,seed=args.seed,
                        text_embedding_path=args.text_embeddings)
-        LAB=Lab(data=data,config=config); print("Loaded:",json.dumps(LAB.dataset_info(),ensure_ascii=False))
+        LAB=Lab(data=data,config=config,serving_model=serving_model)
+        print("Loaded:",json.dumps(LAB.dataset_info(),ensure_ascii=False))
     else:
-        LAB=Lab(config=config)
-    print(f"Recommendation lab: http://127.0.0.1:{args.port}")
-    server=ThreadingHTTPServer(("127.0.0.1",args.port),Handler)
+        LAB=Lab(config=config,serving_model=serving_model)
+    if args.export_serving_model:
+        write_serving_model(args.export_serving_model,LAB.serving_model())
+        print(f"Serving model: {args.export_serving_model}")
+    if args.export_only:
+        LAB.close(); LAB=None; return
+    print(f"Recommendation lab: http://{args.host}:{args.port}")
+    server=ProductionHTTPServer((args.host,args.port),Handler)
     try: server.serve_forever()
     finally:
         server.server_close()
