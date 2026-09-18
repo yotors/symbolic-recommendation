@@ -9855,6 +9855,8 @@ def pinned_lab():
         lab.lock.release()
 
 class Handler(BaseHTTPRequestHandler):
+    protocol_version="HTTP/1.1"
+
     def send_json(self,value,status=200):
         body=json.dumps(value).encode(); self.send_response(status); self.send_header("Content-Type","application/json"); self.send_header("Content-Length",str(len(body))); self.end_headers()
         try: self.wfile.write(body)
@@ -9862,6 +9864,21 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         try:
             parsed=urlparse(self.path); path=parsed.path; query=parse_qs(parsed.query)
+            if path=="/health/live":
+                self.send_json({"status":"ok"}); return
+            if path=="/health/ready":
+                with pinned_lab() as lab:
+                    ready=(not lab._closed and lab.engine.pid is not None
+                           and bool(lab.mined_rules))
+                    payload={
+                        "status":"ready" if ready else "not_ready",
+                        "instance_id":lab.instance_id,
+                        "rule_version":lab.version,
+                        "worker_pid":lab.engine.pid,
+                        "point_rules":len(lab.mined_rules),
+                        "pair_rules":len(lab.pair_rules),
+                    }
+                self.send_json(payload,200 if ready else 503); return
             if path=="/":
                 with pinned_lab() as lab:
                     first_user=lab.users()[0]["id"]; state=lab.state()
