@@ -1,0 +1,40 @@
+{
+  "schema": "symbolic-recommendation-benchmark-summary-v1",
+  "accuracy": {
+    "source_sha256": "abc1c506c64571cde136542e1ca887be1b804673dce645b2f1ae91077191c429",
+    "dataset_sha256": "438f06ede49670f7677aac944168cae38aa9b05989276dda26725e692804d130",
+    "policy": "Frozen LLM observations create facts; fpMiner discovers behavioral rules and PeTTaChainer proofs rank",
+    "cases": 500,
+    "candidates": 18139,
+    "auc": 0.6891,
+    "auc_95_ci": [0.6659, 0.7148],
+    "auc_proof_only": 0.6891,
+    "auc_proof_only_95_ci": [0.6647, 0.7160],
+    "auc_pointwise": 0.6129,
+    "auc_pairwise_delta": 0.0762,
+    "auc_pairwise_delta_95_ci": [0.0541, 0.0990],
+    "mrr": 0.3416,
+    "ndcg_at_5": 0.3799,
+    "ndcg_at_10": 0.4387,
+    "proof_coverage": 1.0,
+    "pairwise_proof_coverage": 0.9993,
+    "point_rules": 30,
+    "pair_rules": 18,
+    "replay_seconds": 486.625
+  },
+  "realtime": {
+    "source_sha256": "29a33ed5d8dbb7dc648c2441783bda381bcf7344d08628beeee0fd95f447dc3c",
+    "passed": true,
+    "scope": "Uncached new-session first-page requests against one scorer process",
+    "levels": [
+      {"concurrency": 1, "requests": 10, "failures": 0, "p50_ms": 777.509, "p95_ms": 1807.910, "requests_per_second": 1.051654},
+      {"concurrency": 2, "requests": 20, "failures": 0, "p50_ms": 1015.453, "p95_ms": 2130.947, "requests_per_second": 1.238998},
+      {"concurrency": 4, "requests": 40, "failures": 0, "p50_ms": 2212.857, "p95_ms": 3893.359, "requests_per_second": 1.165167},
+      {"concurrency": 8, "requests": 80, "failures": 0, "p50_ms": 3665.174, "p95_ms": 6744.956, "requests_per_second": 1.243454}
+    ]
+  },
+  "limitations": [
+    "Development evidence on logged MIND-small slates",
+    "Not hidden-test, online-causal, transfer, capacity, or SOTA evidence"
+  ]
+}
