@@ -51,6 +51,38 @@ PeTTaChainer/.venv/bin/python -m recommendation \
 Open <http://127.0.0.1:7070>. Browser supplies infinite proof-ranked feed,
 click/skip feedback, state inspection, mining controls, and replay benchmark.
 
+## Production startup
+
+Mine and compile one immutable model artifact outside the request path:
+
+```bash
+PeTTaChainer/.venv/bin/python -m recommendation \
+  --replay-data recommendation/dataset/llm-workspace-canonical-v3.json.gz \
+  --config-file selected-model.json \
+  --export-serving-model symbolic-serving-model.json \
+  --export-only
+```
+
+Start a scorer from that artifact without rerunning fpMiner:
+
+```bash
+PeTTaChainer/.venv/bin/python -m recommendation \
+  --replay-data recommendation/dataset/llm-workspace-canonical-v3.json.gz \
+  --serving-model symbolic-serving-model.json \
+  --host 0.0.0.0 --port 7070
+```
+
+`/health/live` reports HTTP-process liveness. `/health/ready` becomes available
+only after the PeTTa worker has loaded and prewarmed every point and pair proof
+channel. Model artifacts are digest-validated, written atomically, and contain
+no user sessions, proof caches, or training events.
+
+On the current 20k-event MIND workspace, verified startup fell from about
+`318.6s` with mining to `24.6s` from the frozen model. A cold 40-candidate,
+780-comparison first page took `0.866s`; its next queued infinite-scroll page
+took `6.2ms`. These are single-machine engineering measurements, not capacity
+percentiles.
+
 ## Current measured result
 
 Retained MIND-small development replay used 19,996 training exposures and 500
