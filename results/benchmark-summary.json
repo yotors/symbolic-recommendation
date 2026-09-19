@@ -24,8 +24,8 @@
   },
   "realtime": {
     "measured_at": "2026-09-19",
-    "git_commit": "9179526",
-    "source_sha256": "92f80eda7050de3db0f0d0064168bd9be75a35a36194521576babd04fe9d0a2e",
+    "git_commit": "e15d017",
+    "source_sha256": "f84b061a96ed2425ec941c5311e5ad9dacd6b04e85026ade6df78f81a4d20255",
     "passed": true,
     "host": {
       "logical_cpus": 12,
@@ -58,33 +58,34 @@
     "single_session": {
       "first_page_ms": 624.638,
       "queued_scroll_ms": 6.819,
-      "feedback_rerank_ms": 582.191,
+      "feedback_rerank_ms": 256.849,
       "post_feedback_page_ms": 6.489,
-      "feedback_candidates_reranked": 30,
-      "feedback_positions_changed": 27,
+      "feedback_candidates_reranked": 39,
+      "feedback_candidates_recomputed": 15,
+      "feedback_pairwise_proofs_reused": true,
+      "feedback_positions_changed": 37,
       "rss_peak_mib": 1173.816
     },
     "scope": "Uncached fresh-user first-page requests against one scorer process; ten synchronized rounds per concurrency level",
     "levels": [
-      {"concurrency": 1, "requests": 10, "failures": 0, "p50_ms": 478.386, "p95_ms": 1152.965, "requests_per_second": 1.820214},
-      {"concurrency": 2, "requests": 20, "failures": 0, "p50_ms": 711.131, "p95_ms": 1317.388, "requests_per_second": 1.916489},
-      {"concurrency": 4, "requests": 40, "failures": 0, "p50_ms": 1598.362, "p95_ms": 3213.406, "requests_per_second": 1.519107},
-      {"concurrency": 8, "requests": 80, "failures": 0, "p50_ms": 2032.568, "p95_ms": 3987.370, "requests_per_second": 2.056202}
+      {"concurrency": 1, "requests": 10, "failures": 0, "p50_ms": 378.456, "p95_ms": 1199.016, "requests_per_second": 2.076153},
+      {"concurrency": 2, "requests": 20, "failures": 0, "p50_ms": 685.576, "p95_ms": 1199.123, "requests_per_second": 1.958219},
+      {"concurrency": 4, "requests": 40, "failures": 0, "p50_ms": 1382.462, "p95_ms": 2556.645, "requests_per_second": 1.776774},
+      {"concurrency": 8, "requests": 80, "failures": 0, "p50_ms": 2219.121, "p95_ms": 4972.492, "requests_per_second": 1.806626}
     ],
     "concurrent_resources": {
-      "rss_initial_mib": 1177.340,
-      "rss_peak_mib": 1501.742,
-      "cpu_mean_percent_one_core_100": 100.079,
-      "cpu_peak_percent_one_core_100": 200.821
+      "rss_initial_mib": 1204.641,
+      "rss_peak_mib": 1456.805,
+      "cpu_mean_percent_one_core_100": 100.093,
+      "cpu_peak_percent_one_core_100": 198.797
     },
-    "bounded_high_water": {
-      "requests_after_primary_probe": 344,
+    "primary_probe_high_water": {
+      "requests_after_primary_probe": 150,
       "failures": 0,
-      "exposed_users_left_unmeasured": 4,
-      "feed_cache_entries": 256,
-      "point_case_cache_entries": 520,
-      "pair_case_cache_entries": 3916,
-      "rss_peak_mib": 1595.730
+      "feed_cache_entries": 0,
+      "point_case_cache_entries": 370,
+      "pair_case_cache_entries": 2707,
+      "rss_peak_mib": 1456.805
     }
   },
   "limitations": [

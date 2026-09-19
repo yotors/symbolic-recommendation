@@ -80,7 +80,8 @@ no user sessions, proof caches, or training events.
 On the current 20k-event MIND workspace, the 2026-09-19 process-cold frozen
 model reached readiness in `22.3s`. A fresh 40-candidate, 780-comparison first
 page took `624.6ms`; its next queued infinite-scroll page took `6.8ms`.
-Proof-backed feedback reranked the remaining 30 candidates in `582.2ms`.
+Incremental proof-backed skip feedback reranked 39 remaining candidates in
+`256.8ms`, recomputing 15 point cases while replaying the existing pair proofs.
 These are single-machine engineering measurements, not capacity percentiles.
 
 ## Current measured result
@@ -106,12 +107,12 @@ of implemented proof semantics.
 
 The retained real-time probe measured 150 uncached fresh-user first-page
 requests on one scorer. At concurrency 1/2/4/8, p50 latency was
-`478 / 711 / 1,598 / 2,033 ms`; p95 was
-`1,153 / 1,317 / 3,213 / 3,987 ms`. Throughput flattened near
-`2.06 requests/s`, exposing the single active-Lab lock as the serving
-bottleneck. Ready-state RSS was about `1.17 GiB`; a near-complete sweep of the
-500 exposed users peaked at `1.60 GiB` with the ranked-feed cache capped at
-256 entries.
+`378 / 686 / 1,382 / 2,219 ms`; p95 was
+`1,199 / 1,199 / 2,557 / 4,972 ms`. Throughput flattened near
+`2.08 requests/s`, exposing the single active-Lab lock as the serving
+bottleneck. RSS grew from `1.18 GiB` to `1.42 GiB` during this probe. Live
+sessions no longer retain one-use ranked-feed results; cache entries remained
+zero across all 150 requests.
 
 Machine-readable evidence is retained in `results/benchmark-summary.json`.
 The summary records SHA-256 identities for the full local artifacts, which stay
