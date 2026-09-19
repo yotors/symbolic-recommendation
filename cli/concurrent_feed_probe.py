@@ -314,6 +314,9 @@ def probe(
             "restart the probe against a stable server"
         )
     rule_version=int(measurement_identity["rule_version"])
+    scorer_processes=int(
+        (measurement_state.get("engine") or {}).get("pool_size",1) or 1
+    )
 
     sampler = ProcessTreeSampler(server_pid, resource_interval) if server_pid else None
     if sampler:
@@ -426,8 +429,9 @@ def probe(
             "infinite_scroll_latency_claimed":False,
             "client_overlap_definition":(
                 "client-observed simultaneous outstanding HTTP requests; the "
-                "single Lab lock may serialize scorer execution, so this is "
-                "end-to-end burst/head-of-line latency, not parallel reasoner work"
+                f"{scorer_processes} isolated scorer process(es) can execute "
+                "in parallel, while each scorer serializes mutable workspace "
+                "access"
             ),
             "mutates_feedback": False,
             "warmup_requests": warmup,
@@ -437,6 +441,10 @@ def probe(
             "page_size":page_size,
             "random_seed":random_seed,
             "concurrency_levels": concurrency_levels,
+            "scorer_processes":scorer_processes,
+            "serving_mode":(
+                (measurement_state.get("pool") or {}).get("mode","single")
+            ),
             "feed_window":(
                 (measurement_state.get("config") or {}).get("feed_window")
             ),
@@ -521,7 +529,7 @@ def main(argv: list[str] | None = None) -> int:
             "client": "synchronized stdlib urllib threads",
             "engine_mocks": False,
             "latency_scope": "client-observed HTTP wall time including scorer queueing",
-            "throughput_scope": "one live scorer process on this host",
+            "throughput_scope": "configured live scorer deployment on this host",
             "request_scope":"new-session first-page live-feed ranking",
             "causal_concurrency_scaling_claim":False,
             "accuracy_claim": False,
@@ -538,6 +546,11 @@ def main(argv: list[str] | None = None) -> int:
             request_timeout=args.request_timeout,
             server_pid=args.server_pid,
             resource_interval=args.resource_interval,
+        )
+        scorer_processes=artifact["target"]["workload"]["scorer_processes"]
+        artifact["method"]["throughput_scope"]=(
+            f"{scorer_processes} live scorer process(es) behind the configured "
+            "HTTP endpoint on this host"
         )
         artifact["passed"] = bool(artifact["target"]["passed"])
     except BaseException as exc:
