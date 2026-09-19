@@ -2378,6 +2378,7 @@ class Lab:
                                               "queue":[],"position":0,"last_access":now,
                                               "version":self.version,"feedback_contexts":{},
                                               "feedback_positions":{},"deliveries":[],
+                                              "pair_replay":None,
                                               "queue_revision":0,
                                               "last_feedback_revision":None}
                 state=self._feed_sessions[session]
@@ -2401,8 +2402,10 @@ class Lab:
                 candidates=[aid for aid,_context in arriving]
                 contexts={aid:context for aid,context in arriving}
                 rows=(self.score(
-                    user,candidates,contexts,limit=0,include_context=True
+                    user,candidates,contexts,limit=0,include_context=True,
+                    cache_result=False,
                 ) if candidates else [])
+                state["pair_replay"]=getattr(self,"_last_pair_replay",None)
                 impression=f"live_{session}_{source_start}_{source_end}"
                 queued=[]
                 for row in rows:
@@ -2464,23 +2467,102 @@ class Lab:
         }
         state["queue_revision"]+=1
         revision=state["queue_revision"]
+        rerank_mode="full"
+        recomputed_candidates=len(before)
         if before:
-            reranked=self.score(state["user"],before,contexts={},limit=0)
+            can_reuse_pairwise=(
+                action=="skip"
+                and all(isinstance(row.get("pairwise_score"),(int,float))
+                        for row in before_rows)
+            )
+            replay_source=state.get("pair_replay")
+            replay_available=(self._pairwise_replay_plan(
+                before_rows,state.get("pair_replay")
+            ) if can_reuse_pairwise else None)
+            can_reuse_pairwise=(can_reuse_pairwise
+                                and replay_available is not None)
+            changed=[]
+            revised_contexts={}
+            if can_reuse_pairwise:
+                for aid in before:
+                    row=before_by_article[aid][1]
+                    revised_context=dict(row.get("context",{}))
+                    old_match=str(
+                        revised_context.get(
+                            LIVE_NEGATIVE_FEATURE,
+                            row.get("feedback_evidence",{}).get("match","none"),
+                        )
+                    )
+                    new_match=self._negative_feedback_features(
+                        state["user"],self.article(aid)
+                    )[LIVE_NEGATIVE_FEATURE]
+                    revised_context[LIVE_NEGATIVE_FEATURE]=new_match
+                    revised_contexts[aid]=revised_context
+                    if old_match!=new_match:
+                        changed.append(aid)
+            if can_reuse_pairwise:
+                changed_rows=(self.score(
+                    state["user"],changed,
+                    contexts={aid:revised_contexts[aid] for aid in changed},
+                    limit=0,
+                    include_context=True,apply_pairwise=False,
+                    cache_result=False,
+                ) if changed else [])
+                changed_by_article={
+                    str(row["article"]["id"]):row for row in changed_rows
+                }
+                reranked=[]
+                for aid in before:
+                    previous=before_by_article[aid][1]
+                    if aid not in changed_by_article:
+                        reranked.append(dict(previous))
+                        continue
+                    updated=changed_by_article[aid]
+                    reranked.append(updated)
+                reranked.sort(key=lambda row:(
+                    -row["score"],-row["stv"]["strength"],
+                    -row["stv"]["confidence"],
+                    -row["tie_break"]["topic_prior"],
+                    -row["tie_break"]["format_prior"],
+                    -row["tie_break"]["subcategory_prior"],
+                    row["article"]["id"],
+                ))
+                plan,proof_map=self._pairwise_replay_plan(
+                    reranked,replay_source
+                )
+                reranked=self._pairwise_rank(
+                    reranked,(),plan=plan,proof_map=proof_map,
+                    reasoner_timeout_sec=self._serving_reasoner_timeout(),
+                )
+                rerank_mode="incremental_point_reuse_pairwise"
+                recomputed_candidates=len(changed)
+            else:
+                reranked=self.score(
+                    state["user"],before,contexts={},limit=0,
+                    include_context=True,cache_result=False,
+                )
             impression=(f"live_{session_id}_{state['position']}_"
                         f"{state['source_position']}")
             state["queue"]=[]
             for row in reranked:
-                context=self.contextual_features(
-                    state["user"],row["article"],None
-                )
+                aid=str(row["article"]["id"])
+                prepared=row.get("_prepared_context")
+                context=(dict(prepared) if prepared is not None else
+                         dict(before_by_article[aid][1].get("context",{})))
+                if not context:
+                    context=self.contextual_features(
+                        state["user"],row["article"],None
+                    )
                 relation=row.get("relational_evidence",{})
                 context.update(relation.get("scopes",{}))
                 context.update({
                     key:list(value) for key,value
                     in relation.get("proof_ids",{}).items()
                 })
+                public_row={key:value for key,value in row.items()
+                            if key!="_prepared_context"}
                 state["queue"].append({
-                    **row,"context":context,"impression":impression,
+                    **public_row,"context":context,"impression":impression,
                     "queue_revision":revision,
                 })
         after=[str(row["article"]["id"]) for row in state["queue"]]
@@ -2553,6 +2635,10 @@ class Lab:
         summary={
             "session":session_id,"revision":revision,"action":action,
             "feedback_article":str(article),"reranked_candidates":len(after),
+            "rerank_mode":rerank_mode,
+            "recomputed_candidates":recomputed_candidates,
+            "reused_candidates":max(0,len(after)-recomputed_candidates),
+            "pairwise_reused":rerank_mode=="incremental_point_reuse_pairwise",
             "changed_positions":len(movements),
             "top_before":before[0] if before else None,
             "top_after":after[0] if after else None,
@@ -6870,6 +6956,7 @@ class Lab:
     def _pairwise_rank(self,rows,specs,plan=None,proof_map=None,
                        reasoner_timeout_sec=None):
         if self.config["ranking_mode"]!="pairwise" or not self.pair_rules or len(rows)<2:
+            self._last_pair_replay=None
             for row in rows:
                 row.update(ranking_score=row["score"],pairwise_score=None,
                            pairwise_margin_score=None,
@@ -6883,6 +6970,15 @@ class Lab:
             proof_map,_calls=self._proofs_for_pair_specs(
                 pair_specs,timeout_sec=reasoner_timeout_sec
             )
+        self._last_pair_replay={
+            "version":self.version,
+            "edges":tuple(
+                (str(rows[left]["article"]["id"]),
+                 str(rows[right]["article"]["id"]),forward,reverse)
+                for left,right,forward,reverse in comparisons
+            ),
+            "proof_map":proof_map,
+        }
         pair_totals=[0.0]*len(rows); comparison_counts=[0]*len(rows)
         covered=[0]*len(rows); directional_covered=[0]*len(rows)
         proof_margin=self.config["pair_aggregation"]=="proof_margin"
@@ -7146,6 +7242,28 @@ class Lab:
                                   row["article"]["id"]))
         return rows
 
+    def _pairwise_replay_plan(self,rows,replay):
+        """Build a sub-slate tournament from already proved pair edges."""
+        if not replay or replay.get("version")!=self.version:
+            return None
+        positions={str(row["article"]["id"]):index
+                   for index,row in enumerate(rows)}
+        comparisons=[]
+        for left_id,right_id,forward,reverse in replay.get("edges",()):
+            if left_id not in positions or right_id not in positions:
+                continue
+            comparisons.append((positions[left_id],positions[right_id],
+                                forward,reverse))
+        expected=len(rows)*(len(rows)-1)//2
+        if len(comparisons)!=expected:
+            return None
+        proof_map=replay.get("proof_map",{})
+        required={case for _left,_right,forward,reverse in comparisons
+                  for case in (forward,reverse)}
+        if not required.issubset(proof_map):
+            return None
+        return (comparisons,()),proof_map
+
     def _rank(self,specs,groups,limit,apply_pairwise=True,
               reasoner_timeout_sec=None,include_context=False):
         popularity=self._popularity; rows=[]; prior=float(self._click_base_rate)
@@ -7264,7 +7382,7 @@ class Lab:
         return rows if limit==0 else rows[:limit]
 
     def score(self,user,candidates=None,contexts=None,limit=None,
-              include_context=False):
+              include_context=False,apply_pairwise=True,cache_result=True):
         score_started=time.perf_counter()
         if user not in self.data["users"]: raise ValueError(f"unknown user: {user}")
         if candidates is None:
@@ -7292,8 +7410,8 @@ class Lab:
         context_key=tuple(context_key)
         context_key_seconds=time.perf_counter()-context_key_started
         key=(self.version,user,tuple(candidates),context_key,limit,
-             bool(include_context))
-        if key in self.feed_cache:
+             bool(include_context),bool(apply_pairwise))
+        if cache_result and key in self.feed_cache:
             self._feed_rank_cache_hits=(
                 getattr(self,"_feed_rank_cache_hits",0)+1
             )
@@ -7310,28 +7428,32 @@ class Lab:
         groups,_calls=self._proofs_for_specs(specs,timeout_sec=timeout_sec)
         point_seconds=time.perf_counter()-point_started
         rank_started=time.perf_counter()
-        self.feed_cache[key]=self._rank(
+        ranked=self._rank(
             specs,groups,limit,reasoner_timeout_sec=timeout_sec,
-            include_context=include_context,
+            include_context=include_context,apply_pairwise=apply_pairwise,
         )
         rank_seconds=time.perf_counter()-rank_started
-        while len(self.feed_cache)>256: self.feed_cache.popitem(last=False)
+        if cache_result:
+            self.feed_cache[key]=ranked
+            while len(self.feed_cache)>256:
+                self.feed_cache.popitem(last=False)
         self._last_live_score_profile={
             "candidates":len(candidates),
+            "apply_pairwise":bool(apply_pairwise),
             "context_key_seconds":round(context_key_seconds,6),
             "candidate_preparation_seconds":round(candidate_seconds,6),
             "point_reasoning_seconds":round(point_seconds,6),
             "pair_ranking_seconds":round(rank_seconds,6),
             "total_seconds":round(time.perf_counter()-score_started,6),
             "point_reasoner_query_calls":_calls,
-            "pair_plan":{
+            "pair_plan":({
                 key:(round(value,6) if isinstance(value,float) else value)
                 for key,value in getattr(
                     self,"_last_pair_plan_profile",{}
                 ).items()
-            },
+            } if apply_pairwise else {}),
         }
-        return self.feed_cache[key]
+        return ranked
 
     def event(self,user,article,action,context=None,impression=None,*,
               feed_session=None,queue_revision=None,feed_position=None):

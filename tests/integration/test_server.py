@@ -194,6 +194,15 @@ class LabTest(unittest.TestCase):
         self.assertEqual(after_miss,{"entries":1,"hits":0,"misses":1})
         self.assertEqual(after_hit,{"entries":1,"hits":1,"misses":1})
 
+    def test_live_feed_does_not_retain_one_use_rank_result(self):
+        lab=Lab(data=fixture())
+        self.addCleanup(lab.engine.close)
+        lab.feed_page("u1",limit=1)
+        cache=lab.state()["engine"]["feed_rank_cache"]
+        self.assertEqual(cache["entries"],0)
+        self.assertEqual(cache["hits"],0)
+        self.assertEqual(cache["misses"],1)
+
     def test_semantic_preview_is_content_cached_and_does_not_mutate_ranker(self):
         article=dict(LAB.article("n1"))
         before=(len(LAB.data["events"]),len(LAB._online_events),LAB.version,
@@ -440,6 +449,32 @@ class LabTest(unittest.TestCase):
             self.assertEqual(revision["session"], session)
             self.assertEqual(revision["revision"], 1)
             self.assertEqual(revision["reranked_candidates"], len(before_queue))
+            self.assertEqual(
+                revision["rerank_mode"],
+                "incremental_point_reuse_pairwise",
+            )
+            self.assertTrue(revision["pairwise_reused"])
+            self.assertLess(
+                revision["recomputed_candidates"],
+                revision["reranked_candidates"],
+            )
+            incremental_queue=lab._feed_sessions[session]["queue"]
+            revised_contexts={
+                row["article"]["id"]:row["context"]
+                for row in incremental_queue
+            }
+            full=lab.score(
+                "u1",before_queue,contexts=revised_contexts,limit=0,
+                include_context=True,cache_result=False,
+            )
+            self.assertEqual(
+                [row["article"]["id"] for row in incremental_queue],
+                [row["article"]["id"] for row in full],
+            )
+            self.assertEqual(
+                [row["ranking_score"] for row in incremental_queue],
+                [row["ranking_score"] for row in full],
+            )
             self.assertIn(skipped["article"]["id"], result["negative_profile"]["articles"])
             self.assertEqual(
                 result["negative_profile"]["provenance"],
