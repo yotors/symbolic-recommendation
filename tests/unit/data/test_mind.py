@@ -15,6 +15,7 @@ from recommendation.adapters.mind import (
     fit_title_idf_model,
     history_feature_context,
     load_mind,
+    prepare_history_feature_workspace,
     safe_metta_symbol,
     subcategory_transition_score,
     title_history_idf_jaccard,
@@ -764,6 +765,31 @@ class MindAdapterTest(unittest.TestCase):
             test["candidate_context"][n1_id]["ctr_bucket"] == "low"
             for test in first["tests"]
         ))
+
+    def test_prepared_live_history_workspace_preserves_all_facts(self):
+        articles={
+            "h1":{"id":"h1","topic":"news","subcategory":"world",
+                  "title":"World update","entities":["Q1"]},
+            "h2":{"id":"h2","topic":"sports","subcategory":"soccer",
+                  "title":"Soccer update","entities":["Q2"]},
+            "c":{"id":"c","topic":"news","subcategory":"world",
+                 "title":"Another world update","entities":["Q1"]},
+        }
+        vectors={"h1":[1.0,0.0],"h2":[0.0,1.0],"c":[0.9,0.1]}
+        history=["h1","h2"]
+        workspace=prepare_history_feature_workspace(
+            history,articles,entity_vectors=vectors,
+            text_semantic_vectors=vectors,
+        )
+        direct=history_feature_context(
+            articles["c"],history,articles,entity_vectors=vectors,
+            text_semantic_vectors=vectors,
+        )
+        prepared=history_feature_context(
+            articles["c"],history,articles,entity_vectors=vectors,
+            text_semantic_vectors=vectors,workspace=workspace,
+        )
+        self.assertEqual(direct,prepared)
 
 
 if __name__ == "__main__":

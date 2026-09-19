@@ -48,6 +48,28 @@ class MultiInterestConfig:
             raise ValueError("semantic_cluster_threshold must be between -1 and 1")
 
 
+@dataclass(frozen=True)
+class PreparedSemanticHistory:
+    """Normalized history vectors reusable across candidate comparisons."""
+
+    prior: tuple[object, ...]
+    resolved: tuple[Any, ...]
+    history_available: bool
+
+
+@dataclass(frozen=True)
+class PreparedMultiInterestHistory:
+    """History-only symbolic prototypes reusable across one candidate slate."""
+
+    config: MultiInterestConfig
+    resolved: tuple[tuple[int, Mapping[str, Any], str | None], ...]
+    topic_prototypes: tuple[Mapping[str, Any], ...]
+    subcategory_prototypes: tuple[Mapping[str, Any], ...]
+    entity_prototypes: tuple[Mapping[str, Any], ...]
+    semantic_prototypes: tuple[Mapping[str, Any], ...]
+    valid_vectors: int
+
+
 def _label(value: object) -> str:
     text = unicodedata.normalize("NFKC", str(value or ""))
     return " ".join(text.split()).casefold()
@@ -307,6 +329,42 @@ def _vector_centroid(
     ))
 
 
+def _dense_semantic_vector(
+    item: object, semantic_vectors: Mapping[object, Sequence[float]],
+):
+    key=item.get("id") if isinstance(item,Mapping) else item
+    if key is None:
+        return None
+    try:
+        raw=semantic_vectors.get(key)
+        vector=_np.asarray(raw,dtype=_np.float64)
+    except (TypeError,ValueError,OverflowError):
+        return None
+    if vector.ndim!=1 or vector.size<1 or not _np.isfinite(vector).all():
+        return None
+    norm=float(_np.linalg.norm(vector))
+    return vector/norm if math.isfinite(norm) and norm>0.0 else None
+
+
+def prepare_semantic_history(
+    history: Iterable[object],
+    semantic_vectors: Mapping[object, Sequence[float]],
+) -> PreparedSemanticHistory:
+    prior=tuple(history)
+    if _np is not None:
+        resolved=tuple(
+            _dense_semantic_vector(item,semantic_vectors) for item in prior
+        )
+    else:
+        resolved=tuple(
+            _mapped_semantic_vector(item,semantic_vectors) for item in prior
+        )
+    return PreparedSemanticHistory(
+        prior=prior,resolved=resolved,
+        history_available=any(vector is not None for vector in resolved),
+    )
+
+
 def build_semantic_match_facts(
     candidate: object,
     history: Iterable[object],
@@ -314,6 +372,7 @@ def build_semantic_match_facts(
     *,
     prefix: str = "semantic_match",
     recency_decay: float = 0.85,
+    prepared_history: PreparedSemanticHistory | None = None,
 ) -> dict[str, str | float]:
     """Build generic candidate-relative vector facts from prior history.
 
@@ -338,25 +397,14 @@ def build_semantic_match_facts(
     if not 0.0<recency_decay<=1.0:
         raise ValueError("recency_decay must be in (0, 1]")
 
-    prior=list(history)
+    prepared=(prepared_history or prepare_semantic_history(
+        history,semantic_vectors
+    ))
+    prior=prepared.prior
     if _np is not None:
-        def dense_vector(item: object):
-            key=item.get("id") if isinstance(item,Mapping) else item
-            if key is None:
-                return None
-            try:
-                raw=semantic_vectors.get(key)
-                vector=_np.asarray(raw,dtype=_np.float64)
-            except (TypeError,ValueError,OverflowError):
-                return None
-            if vector.ndim!=1 or vector.size<1 or not _np.isfinite(vector).all():
-                return None
-            norm=float(_np.linalg.norm(vector))
-            return vector/norm if math.isfinite(norm) and norm>0.0 else None
-
-        candidate_vector=dense_vector(candidate)
-        resolved=[dense_vector(item) for item in prior]
-        history_available=any(vector is not None for vector in resolved)
+        candidate_vector=_dense_semantic_vector(candidate,semantic_vectors)
+        resolved=prepared.resolved
+        history_available=prepared.history_available
         compatible=[
             vector for vector in resolved
             if (vector is not None and candidate_vector is not None
@@ -370,8 +418,8 @@ def build_semantic_match_facts(
         )
     else:
         candidate_vector=_mapped_semantic_vector(candidate,semantic_vectors)
-        resolved=[_mapped_semantic_vector(item,semantic_vectors) for item in prior]
-        history_available=any(vector is not None for vector in resolved)
+        resolved=prepared.resolved
+        history_available=prepared.history_available
         compatible=[
             vector for vector in resolved
             if (vector is not None and candidate_vector is not None
@@ -541,6 +589,40 @@ def _semantic_prototypes(
     return clusters, valid
 
 
+def prepare_multi_interest_history(
+    history: Iterable[object],
+    articles: Mapping[str, Mapping[str, Any]],
+    *,
+    semantic_vectors: Mapping[str, Sequence[float]] | None = None,
+    config: MultiInterestConfig | None = None,
+) -> PreparedMultiInterestHistory:
+    """Build candidate-independent interest prototypes once per user state."""
+    cfg=config or MultiInterestConfig()
+    history_window=list(history)[-cfg.recent_window:]
+    resolved=tuple(_resolve_history(history_window,articles))
+    topic=tuple(_metadata_prototypes(
+        resolved,lambda article:_label(
+            article.get("topic",article.get("category"))
+        ),cfg.recency_decay,
+    ))
+    subcategory=tuple(_metadata_prototypes(
+        resolved,lambda article:_label(article.get("subcategory")),
+        cfg.recency_decay,
+    ))
+    entity=tuple(_metadata_prototypes(
+        resolved,_article_entities,cfg.recency_decay,
+    ))
+    semantic,valid_vectors=_semantic_prototypes(
+        resolved,semantic_vectors,cfg.recency_decay,
+        cfg.semantic_cluster_threshold,
+    )
+    return PreparedMultiInterestHistory(
+        config=cfg,resolved=resolved,topic_prototypes=topic,
+        subcategory_prototypes=subcategory,entity_prototypes=entity,
+        semantic_prototypes=tuple(semantic),valid_vectors=valid_vectors,
+    )
+
+
 def build_multi_interest_facts(
     candidate: Mapping[str, Any],
     history: Iterable[object],
@@ -548,6 +630,7 @@ def build_multi_interest_facts(
     *,
     semantic_vectors: Mapping[str, Sequence[float]] | None = None,
     config: MultiInterestConfig | None = None,
+    prepared_history: PreparedMultiInterestHistory | None = None,
 ) -> dict[str, str | float]:
     """Return bounded candidate-relative facts derived from prior history only.
 
@@ -557,26 +640,21 @@ def build_multi_interest_facts(
     outputs come from fixed vocabularies independent of dataset labels.
     """
 
-    cfg = config or MultiInterestConfig()
-    # Apply the window to interaction positions before metadata resolution;
-    # otherwise many unknown IDs could pull stale known articles into a recent
-    # profile and silently distort both support and recency.
-    history_window = list(history)[-cfg.recent_window:]
-    resolved = _resolve_history(history_window, articles)
+    if prepared_history is not None and config is not None:
+        if config!=prepared_history.config:
+            raise ValueError("prepared history uses a different configuration")
+    prepared=(prepared_history or prepare_multi_interest_history(
+        history,articles,semantic_vectors=semantic_vectors,config=config
+    ))
+    cfg=prepared.config
+    resolved=prepared.resolved
     facts: dict[str, str | float] = {
         "mi_history_size": _count_bucket(len(resolved)),
     }
 
-    topic_prototypes = _metadata_prototypes(
-        resolved, lambda article: _label(article.get("topic", article.get("category"))),
-        cfg.recency_decay,
-    )
-    subcategory_prototypes = _metadata_prototypes(
-        resolved, lambda article: _label(article.get("subcategory")), cfg.recency_decay,
-    )
-    entity_prototypes = _metadata_prototypes(
-        resolved, _article_entities, cfg.recency_decay,
-    )
+    topic_prototypes=prepared.topic_prototypes
+    subcategory_prototypes=prepared.subcategory_prototypes
+    entity_prototypes=prepared.entity_prototypes
     _add_discrete_slots(
         facts, "mi_topic", {_label(candidate.get("topic", candidate.get("category")))},
         topic_prototypes, cfg.max_topic_prototypes, len(resolved), cfg.recency_decay,
@@ -593,9 +671,8 @@ def build_multi_interest_facts(
 
     candidate_id = str(candidate["id"]) if candidate.get("id") is not None else None
     candidate_vector = _article_vector(candidate, candidate_id, semantic_vectors)
-    semantic, valid_vectors = _semantic_prototypes(
-        resolved, semantic_vectors, cfg.recency_decay, cfg.semantic_cluster_threshold
-    )
+    semantic=prepared.semantic_prototypes
+    valid_vectors=prepared.valid_vectors
     facts["mi_semantic_available"] = "yes" if candidate_vector is not None else "no"
     facts["mi_semantic_prototype_count"] = _count_bucket(len(semantic))
     # Aggregate candidate affinity over every bounded-history prototype, not
@@ -667,7 +744,9 @@ def build_multi_interest_facts(
 
 
 __all__ = [
-    "MultiInterestConfig", "SEMANTIC_ATTENTION_TEMPERATURES",
+    "MultiInterestConfig", "PreparedMultiInterestHistory",
+    "PreparedSemanticHistory", "SEMANTIC_ATTENTION_TEMPERATURES",
     "build_multi_interest_facts",
     "build_semantic_match_facts",
+    "prepare_multi_interest_history", "prepare_semantic_history",
 ]

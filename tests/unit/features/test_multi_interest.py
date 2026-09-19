@@ -8,6 +8,8 @@ from recommendation.core.multi_interest import (
     MultiInterestConfig,
     build_multi_interest_facts,
     build_semantic_match_facts,
+    prepare_multi_interest_history,
+    prepare_semantic_history,
 )
 
 
@@ -278,6 +280,38 @@ class MultiInterestFactsTest(unittest.TestCase):
         self.assertEqual(
             accelerated["semantic_match_attention_t12_similarity"],
             portable["semantic_match_attention_t12_similarity"],
+        )
+
+    def test_prepared_history_is_exactly_equivalent(self):
+        history=["h1","h2","h3"]
+        vectors={
+            key:value["semantic_vector"]
+            for key,value in self.articles.items()
+        }
+        vectors[self.candidate["id"]]=self.candidate["semantic_vector"]
+        prepared_interest=prepare_multi_interest_history(
+            history,self.articles,semantic_vectors=vectors
+        )
+        self.assertEqual(
+            build_multi_interest_facts(
+                self.candidate,history,self.articles,
+                semantic_vectors=vectors,
+            ),
+            build_multi_interest_facts(
+                self.candidate,history,self.articles,
+                semantic_vectors=vectors,
+                prepared_history=prepared_interest,
+            ),
+        )
+        prepared_semantic=prepare_semantic_history(history,vectors)
+        self.assertEqual(
+            build_semantic_match_facts(
+                self.candidate["id"],history,vectors
+            ),
+            build_semantic_match_facts(
+                self.candidate["id"],history,vectors,
+                prepared_history=prepared_semantic,
+            ),
         )
 
 

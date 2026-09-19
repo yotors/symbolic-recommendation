@@ -44,12 +44,15 @@ import re
 import unicodedata
 import zipfile
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
 from ..core.multi_interest import (
+    PreparedMultiInterestHistory, PreparedSemanticHistory,
     build_multi_interest_facts, build_semantic_match_facts,
+    prepare_multi_interest_history, prepare_semantic_history,
 )
 from ..features.text_embeddings import load_text_embedding_sidecar
 
@@ -72,6 +75,24 @@ _TITLE_STOPWORDS = {
     "how", "in", "is", "it", "of", "on", "or", "that", "the", "this",
     "to", "was", "what", "when", "where", "who", "with",
 }
+
+
+@dataclass(frozen=True)
+class HistoryFeatureWorkspace:
+    """Candidate-independent causal history state for one scoring slate."""
+
+    history_ids: tuple[str, ...]
+    normalized_articles: dict[str, dict[str, Any]]
+    topics: Counter[str]
+    known: int
+    recent_ids: tuple[str, ...]
+    recent_topics: Counter[str]
+    recent_known: int
+    subcategories: Counter[str]
+    subcategory_known: int
+    recent_subcategories: tuple[str, ...]
+    multi_interest: PreparedMultiInterestHistory
+    text_semantic: PreparedSemanticHistory
 
 # Deliberately fixed, low-cardinality thresholds.  Keeping them here makes the
 # experiment reproducible and prevents the miner vocabulary growing with raw
@@ -1039,6 +1060,50 @@ def subcategory_transition_score(
     return round(max(scores), 8)
 
 
+def prepare_history_feature_workspace(
+    history: Iterable[str],
+    articles: dict[str, dict[str, Any]],
+    *,
+    entity_vectors: dict[str, Iterable[float]] | None = None,
+    text_semantic_vectors: dict[str, Iterable[float]] | None = None,
+) -> HistoryFeatureWorkspace:
+    """Prepare history-only evidence once for all candidates in a slate."""
+    history_ids=tuple(str(value) for value in history)
+    normalized={}
+    for item_id in dict.fromkeys(history_ids):
+        value=articles.get(item_id)
+        if value is None:
+            continue
+        normalized[item_id]={
+            **value,"source_id":item_id,
+            "topic":value.get("topic",value.get("category","unknown")),
+            "subcategory":value.get("subcategory","unknown"),
+        }
+    topics,known=_history_context(history_ids,normalized)
+    recent_ids=history_ids[-5:]
+    recent_topics,recent_known=_history_context(recent_ids,normalized)
+    subcategories,subcategory_known=_subcategory_context(
+        history_ids,normalized
+    )
+    recent_subcategories=tuple(
+        normalized[item_id].get("subcategory","unknown")
+        for item_id in recent_ids if item_id in normalized
+    )
+    return HistoryFeatureWorkspace(
+        history_ids=history_ids,normalized_articles=normalized,
+        topics=topics,known=known,recent_ids=recent_ids,
+        recent_topics=recent_topics,recent_known=recent_known,
+        subcategories=subcategories,subcategory_known=subcategory_known,
+        recent_subcategories=recent_subcategories,
+        multi_interest=prepare_multi_interest_history(
+            history_ids,normalized,semantic_vectors=entity_vectors or {}
+        ),
+        text_semantic=prepare_semantic_history(
+            history_ids,text_semantic_vectors or {}
+        ),
+    )
+
+
 def history_feature_context(
     article: dict[str, Any],
     history: Iterable[str],
@@ -1049,6 +1114,7 @@ def history_feature_context(
     title_idf_model: dict[str, Any] | None = None,
     transition_model: dict[str, Any] | None = None,
     hour: object = None,
+    workspace: HistoryFeatureWorkspace | None = None,
 ) -> dict[str, Any]:
     """Build the same causal history facts for replay and live serving.
 
@@ -1061,6 +1127,12 @@ def history_feature_context(
     # occupy their original slots in recent-window predicates; removing them
     # first would incorrectly pull older known items into the last five.
     history_ids=[str(value) for value in history]
+    prepared=(workspace or prepare_history_feature_workspace(
+        history_ids,articles,entity_vectors=entity_vectors,
+        text_semantic_vectors=text_semantic_vectors,
+    ))
+    if tuple(history_ids)!=prepared.history_ids:
+        raise ValueError("history feature workspace does not match history")
     candidate={**article}
     candidate_id=str(candidate.get("id",candidate.get("source_id","candidate")))
     candidate.setdefault("id",candidate_id)
@@ -1070,26 +1142,19 @@ def history_feature_context(
     # Only the candidate and its history can participate in these predicates.
     # Normalizing the complete corpus for every candidate turns a linear feed
     # pass into O(corpus²) work on real datasets.
-    normalized_articles={}
-    for item_id in dict.fromkeys([*history_ids,candidate_id]):
-        value=(candidate if item_id==candidate_id else articles.get(item_id))
-        if value is None:
-            continue
-        normalized_articles[item_id]={
-            **value,"source_id":item_id,
-            "topic":value.get("topic",value.get("category","unknown")),
-            "subcategory":value.get("subcategory","unknown"),
-        }
-    topics,known=_history_context(history_ids,normalized_articles)
-    recent_ids=history_ids[-5:]
-    recent_topics,recent_known=_history_context(recent_ids,normalized_articles)
-    subcategories,subcategory_known=_subcategory_context(
-        history_ids,normalized_articles
-    )
-    recent_subcategories=[
-        normalized_articles[item_id].get("subcategory","unknown")
-        for item_id in recent_ids if item_id in normalized_articles
-    ]
+    normalized_articles=dict(prepared.normalized_articles)
+    normalized_articles[candidate_id]={
+        **candidate,"source_id":candidate_id,
+        "topic":candidate.get("topic",candidate.get("category","unknown")),
+        "subcategory":candidate.get("subcategory","unknown"),
+    }
+    topics,known=prepared.topics,prepared.known
+    recent_ids=prepared.recent_ids
+    recent_topics,recent_known=(prepared.recent_topics,
+                                prepared.recent_known)
+    subcategories,subcategory_known=(prepared.subcategories,
+                                     prepared.subcategory_known)
+    recent_subcategories=list(prepared.recent_subcategories)
 
     vectors=entity_vectors or {}
     recent_entity_similarity,long_entity_similarity=(
@@ -1116,12 +1181,14 @@ def history_feature_context(
         history_ids,
         normalized_articles,
         semantic_vectors=vectors,
+        prepared_history=prepared.multi_interest,
     )
     text_semantic = build_semantic_match_facts(
         candidate_id,
         history_ids,
         text_semantic_vectors or {},
         prefix="text_semantic",
+        prepared_history=prepared.text_semantic,
     )
     return {"topic":candidate["topic"],
             "format":candidate.get("format",_format_bucket(str(candidate.get("title","")))),
@@ -2161,12 +2228,14 @@ def load_mind(
 __all__ = [
     "DEFAULT_MAX_EVAL_IMPRESSIONS",
     "DEFAULT_MAX_TRAIN_CASES",
+    "HistoryFeatureWorkspace",
     "MindDataError",
     "entity_long_mean_similarity",
     "fit_title_idf_model",
     "history_feature_context",
     "load_mind",
     "normalize_label",
+    "prepare_history_feature_workspace",
     "safe_metta_symbol",
     "subcategory_transition_score",
     "title_history_idf_jaccard",
