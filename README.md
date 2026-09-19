@@ -26,6 +26,13 @@ directly assigns recommendation scores.
 Requirements: Python 3.10 environment from `PeTTaChainer/.venv`, working PeTTa
 and SWI-Prolog runtime, and files under `dataset/`.
 
+From the workspace containing `recommendation/`, `PeTTa/`, and
+`PeTTaChainer/`:
+
+```bash
+export PYTHONPATH=PeTTa/python:PeTTaChainer
+```
+
 Fast deterministic demo:
 
 ```bash
@@ -63,19 +70,31 @@ PeTTaChainer/.venv/bin/python -m recommendation \
   --export-only
 ```
 
-Start a scorer from that artifact without rerunning fpMiner:
+Start the production gateway with two isolated scorers. Only port 7070 is
+public; scorer ports bind to loopback:
 
 ```bash
 PeTTaChainer/.venv/bin/python -m recommendation \
   --replay-data recommendation/dataset/llm-workspace-canonical-v3.json.gz \
   --serving-model symbolic-serving-model.json \
-  --host 0.0.0.0 --port 7070
+  --host 0.0.0.0 --port 7070 \
+  --workers 2 --worker-start-port 7171
 ```
 
-`/health/live` reports HTTP-process liveness. `/health/ready` becomes available
-only after the PeTTa worker has loaded and prewarmed every point and pair proof
-channel. Model artifacts are digest-validated, written atomically, and contain
-no user sessions, proof caches, or training events.
+The gateway uses deterministic user/session affinity, bounded request admission,
+body and upstream limits, readiness checks, and automatic scorer replacement.
+After a scorer restart, its old browser sessions automatically receive a new
+proof-ranked stream with `reset=true`. Serving workers are immutable: mining,
+configuration, dataset replacement, tuning, and training-confirmation routes
+are rejected. Publish a new digest-validated frozen model through the offline
+control plane instead.
+
+`/health/live` reports process liveness. `/health/ready` succeeds only when all
+scorers have loaded and prewarmed every point and pair proof channel.
+`/api/state` verifies model/config/dataset agreement across the pool and returns
+aggregate counters. Put TLS, authentication, rate limiting, and durable event
+storage in the platform ingress/data plane; the bundled gateway intentionally
+owns only local inference orchestration.
 
 On the current 20k-event MIND workspace, the 2026-09-19 process-cold frozen
 model reached readiness in `22.3s`. A fresh 40-candidate, 780-comparison first
@@ -105,14 +124,14 @@ causal, transfer, or SOTA evidence. Exact direct reconstruction matched every
 PeTTaChainer slate order and score signature, establishing faithful execution
 of implemented proof semantics.
 
-The retained real-time probe measured 150 uncached fresh-user first-page
-requests on one scorer. At concurrency 1/2/4/8, p50 latency was
-`378 / 686 / 1,382 / 2,219 ms`; p95 was
-`1,199 / 1,199 / 2,557 / 4,972 ms`. Throughput flattened near
-`2.08 requests/s`, exposing the single active-Lab lock as the serving
-bottleneck. RSS grew from `1.18 GiB` to `1.42 GiB` during this probe. Live
-sessions no longer retain one-use ranked-feed results; cache entries remained
-zero across all 150 requests.
+The retained production-pool probe measured 450 uncached fresh-user first-page
+requests across two isolated scorers. At concurrency 1/2/4/8, p50 latency was
+`344 / 439 / 565 / 939 ms`; p95 was
+`901 / 913 / 1,384 / 2,202 ms`. Peak throughput was `4.06 requests/s`, with
+zero failures. A separate full process-tree run measured `3.00 GiB` peak RSS,
+`136%` mean CPU, and `373%` peak CPU. Worker termination, automatic restart,
+readiness recovery, and browser-session reset were verified against the live
+gateway.
 
 Machine-readable evidence is retained in `results/benchmark-summary.json`.
 The summary records SHA-256 identities for the full local artifacts, which stay

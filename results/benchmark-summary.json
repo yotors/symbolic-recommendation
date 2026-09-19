@@ -24,8 +24,7 @@
   },
   "realtime": {
     "measured_at": "2026-09-19",
-    "git_commit": "e15d017",
-    "source_sha256": "f84b061a96ed2425ec941c5311e5ad9dacd6b04e85026ade6df78f81a4d20255",
+    "git_commit": "ba53525",
     "passed": true,
     "host": {
       "logical_cpus": 12,
@@ -66,31 +65,31 @@
       "feedback_positions_changed": 37,
       "rss_peak_mib": 1173.816
     },
-    "scope": "Uncached fresh-user first-page requests against one scorer process; ten synchronized rounds per concurrency level",
+    "scope": "Uncached fresh-user first-page requests through one bounded gateway and two immutable isolated scorers; 30 synchronized rounds per concurrency level",
     "levels": [
-      {"concurrency": 1, "requests": 10, "failures": 0, "p50_ms": 378.456, "p95_ms": 1199.016, "requests_per_second": 2.076153},
-      {"concurrency": 2, "requests": 20, "failures": 0, "p50_ms": 685.576, "p95_ms": 1199.123, "requests_per_second": 1.958219},
-      {"concurrency": 4, "requests": 40, "failures": 0, "p50_ms": 1382.462, "p95_ms": 2556.645, "requests_per_second": 1.776774},
-      {"concurrency": 8, "requests": 80, "failures": 0, "p50_ms": 2219.121, "p95_ms": 4972.492, "requests_per_second": 1.806626}
+      {"concurrency": 1, "requests": 30, "failures": 0, "p50_ms": 344.353, "p95_ms": 900.740, "requests_per_second": 2.327677},
+      {"concurrency": 2, "requests": 60, "failures": 0, "p50_ms": 439.360, "p95_ms": 912.729, "requests_per_second": 2.983525},
+      {"concurrency": 4, "requests": 120, "failures": 0, "p50_ms": 565.121, "p95_ms": 1384.273, "requests_per_second": 3.667075},
+      {"concurrency": 8, "requests": 240, "failures": 0, "p50_ms": 939.274, "p95_ms": 2201.658, "requests_per_second": 4.057604}
     ],
     "concurrent_resources": {
-      "rss_initial_mib": 1204.641,
-      "rss_peak_mib": 1456.805,
-      "cpu_mean_percent_one_core_100": 100.093,
-      "cpu_peak_percent_one_core_100": 198.797
+      "process_count_peak": 7,
+      "rss_initial_mib": 2989.332,
+      "rss_peak_mib": 3001.500,
+      "cpu_mean_percent_one_core_100": 136.437,
+      "cpu_peak_percent_one_core_100": 372.820
     },
-    "primary_probe_high_water": {
-      "requests_after_primary_probe": 150,
-      "failures": 0,
-      "feed_cache_entries": 0,
-      "point_case_cache_entries": 370,
-      "pair_case_cache_entries": 2707,
-      "rss_peak_mib": 1456.805
+    "failure_recovery": {
+      "scorer_termination_verified": true,
+      "automatic_restart_verified": true,
+      "readiness_recovery_verified": true,
+      "browser_session_reset_verified": true,
+      "model_divergence_guard": true
     }
   },
   "limitations": [
     "Development evidence on logged MIND-small slates",
-    "Runtime measurements are from one local scorer on one machine, not a capacity guarantee",
+    "Runtime measurements are from a two-scorer deployment on one local machine, not a capacity guarantee",
     "Cold startup is process-cold but does not flush operating-system filesystem caches",
     "Not hidden-test, online-causal, transfer, capacity, or SOTA evidence"
   ]
