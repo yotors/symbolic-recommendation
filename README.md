@@ -77,11 +77,11 @@ only after the PeTTa worker has loaded and prewarmed every point and pair proof
 channel. Model artifacts are digest-validated, written atomically, and contain
 no user sessions, proof caches, or training events.
 
-On the current 20k-event MIND workspace, verified startup fell from about
-`318.6s` with mining to `24.6s` from the frozen model. A cold 40-candidate,
-780-comparison first page took `0.866s`; its next queued infinite-scroll page
-took `6.2ms`. These are single-machine engineering measurements, not capacity
-percentiles.
+On the current 20k-event MIND workspace, the 2026-09-19 process-cold frozen
+model reached readiness in `22.3s`. A fresh 40-candidate, 780-comparison first
+page took `624.6ms`; its next queued infinite-scroll page took `6.8ms`.
+Proof-backed feedback reranked the remaining 30 candidates in `582.2ms`.
+These are single-machine engineering measurements, not capacity percentiles.
 
 ## Current measured result
 
@@ -104,10 +104,14 @@ causal, transfer, or SOTA evidence. Exact direct reconstruction matched every
 PeTTaChainer slate order and score signature, establishing faithful execution
 of implemented proof semantics.
 
-Retained real-time probe measured uncached first-page requests on one scorer.
-At concurrency 1/2/4/8, p50 latency was
-`778 / 1,015 / 2,213 / 3,665 ms`; throughput flattened near `1.24 requests/s`.
-This exposes the single active-Lab lock as serving bottleneck.
+The retained real-time probe measured 150 uncached fresh-user first-page
+requests on one scorer. At concurrency 1/2/4/8, p50 latency was
+`478 / 711 / 1,598 / 2,033 ms`; p95 was
+`1,153 / 1,317 / 3,213 / 3,987 ms`. Throughput flattened near
+`2.06 requests/s`, exposing the single active-Lab lock as the serving
+bottleneck. Ready-state RSS was about `1.17 GiB`; a near-complete sweep of the
+500 exposed users peaked at `1.60 GiB` with the ranked-feed cache capped at
+256 entries.
 
 Machine-readable evidence is retained in `results/benchmark-summary.json`.
 The summary records SHA-256 identities for the full local artifacts, which stay

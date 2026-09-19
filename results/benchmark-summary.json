@@ -23,18 +23,74 @@
     "replay_seconds": 486.625
   },
   "realtime": {
-    "source_sha256": "29a33ed5d8dbb7dc648c2441783bda381bcf7344d08628beeee0fd95f447dc3c",
+    "measured_at": "2026-09-19",
+    "git_commit": "9179526",
+    "source_sha256": "92f80eda7050de3db0f0d0064168bd9be75a35a36194521576babd04fe9d0a2e",
     "passed": true,
-    "scope": "Uncached new-session first-page requests against one scorer process",
+    "host": {
+      "logical_cpus": 12,
+      "memory_mib": 31731.152,
+      "platform": "Linux-7.1.3-arch2-2-x86_64",
+      "python": "3.10.20"
+    },
+    "model": {
+      "dataset_articles": 11142,
+      "training_events": 19996,
+      "evaluation_impressions": 500,
+      "point_rules": 30,
+      "pair_rules": 18,
+      "serving_artifact_bytes": 239882,
+      "serving_artifact_sha256": "d87484dc3920d83f8f168eb3c3489797d439e125fd26bfa5243f1e63afd55af3"
+    },
+    "offline_model_build": {
+      "wall_seconds": 327.949,
+      "rss_peak_mib": 2332.324,
+      "cpu_mean_percent_one_core_100": 99.837,
+      "cpu_peak_percent_one_core_100": 717.492
+    },
+    "process_cold_start": {
+      "ready_seconds": 22.256,
+      "rss_peak_mib": 2332.426,
+      "rss_at_ready_mib": 1169.965,
+      "cpu_mean_percent_one_core_100": 107.898,
+      "cpu_peak_percent_one_core_100": 710.912
+    },
+    "single_session": {
+      "first_page_ms": 624.638,
+      "queued_scroll_ms": 6.819,
+      "feedback_rerank_ms": 582.191,
+      "post_feedback_page_ms": 6.489,
+      "feedback_candidates_reranked": 30,
+      "feedback_positions_changed": 27,
+      "rss_peak_mib": 1173.816
+    },
+    "scope": "Uncached fresh-user first-page requests against one scorer process; ten synchronized rounds per concurrency level",
     "levels": [
-      {"concurrency": 1, "requests": 10, "failures": 0, "p50_ms": 777.509, "p95_ms": 1807.910, "requests_per_second": 1.051654},
-      {"concurrency": 2, "requests": 20, "failures": 0, "p50_ms": 1015.453, "p95_ms": 2130.947, "requests_per_second": 1.238998},
-      {"concurrency": 4, "requests": 40, "failures": 0, "p50_ms": 2212.857, "p95_ms": 3893.359, "requests_per_second": 1.165167},
-      {"concurrency": 8, "requests": 80, "failures": 0, "p50_ms": 3665.174, "p95_ms": 6744.956, "requests_per_second": 1.243454}
-    ]
+      {"concurrency": 1, "requests": 10, "failures": 0, "p50_ms": 478.386, "p95_ms": 1152.965, "requests_per_second": 1.820214},
+      {"concurrency": 2, "requests": 20, "failures": 0, "p50_ms": 711.131, "p95_ms": 1317.388, "requests_per_second": 1.916489},
+      {"concurrency": 4, "requests": 40, "failures": 0, "p50_ms": 1598.362, "p95_ms": 3213.406, "requests_per_second": 1.519107},
+      {"concurrency": 8, "requests": 80, "failures": 0, "p50_ms": 2032.568, "p95_ms": 3987.370, "requests_per_second": 2.056202}
+    ],
+    "concurrent_resources": {
+      "rss_initial_mib": 1177.340,
+      "rss_peak_mib": 1501.742,
+      "cpu_mean_percent_one_core_100": 100.079,
+      "cpu_peak_percent_one_core_100": 200.821
+    },
+    "bounded_high_water": {
+      "requests_after_primary_probe": 344,
+      "failures": 0,
+      "exposed_users_left_unmeasured": 4,
+      "feed_cache_entries": 256,
+      "point_case_cache_entries": 520,
+      "pair_case_cache_entries": 3916,
+      "rss_peak_mib": 1595.730
+    }
   },
   "limitations": [
     "Development evidence on logged MIND-small slates",
+    "Runtime measurements are from one local scorer on one machine, not a capacity guarantee",
+    "Cold startup is process-cold but does not flush operating-system filesystem caches",
     "Not hidden-test, online-causal, transfer, capacity, or SOTA evidence"
   ]
 }
