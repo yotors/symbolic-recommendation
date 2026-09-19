@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import argparse, gzip, hashlib, hmac, html as html_lib, ipaddress, json, math, multiprocessing as mp, os, random, re, sys, threading, time, traceback, unicodedata, uuid
 from collections import Counter, OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -15,7 +16,10 @@ from ..integrations.engine import (
     PeTTaChainerInputError, PeTTaChainerProtocolError,
     PeTTaChainerTimeoutError, PeTTaChainerUpstreamError,
 )
-from ..adapters.mind import history_feature_context, load_mind, subcategory_transition_score
+from ..adapters.mind import (
+    history_feature_context,load_mind,prepare_history_feature_workspace,
+    subcategory_transition_score,
+)
 from ..core.ctv_calibration import (
     DEFAULT_EVIDENCE_K,
     CTVObservation,
@@ -1395,8 +1399,9 @@ class IsolatedPeTTaChainer:
 
 class Lab:
     def __init__(self, data=None, *, symbolic_only=False, config=None,
-                 serving_model=None):
+                 serving_model=None, serving_only=False):
         self.symbolic_only=bool(symbolic_only)
+        self.serving_only=bool(serving_only)
         if self.symbolic_only and data is not None:
             from ..pipelines.symbolic_data import strip_neural_evidence
             data=strip_neural_evidence(data)
@@ -1445,6 +1450,22 @@ class Lab:
         # and candidate articles.
         self._offline_event_count=len(self.data.get("events",[]))
         self._online_events=[]
+        try:
+            self._candidate_feature_workers=int(os.environ.get(
+                "RECOMMENDATION_CANDIDATE_THREADS","1"
+            ))
+        except ValueError as exc:
+            raise ValueError(
+                "RECOMMENDATION_CANDIDATE_THREADS must be an integer"
+            ) from exc
+        if not 1<=self._candidate_feature_workers<=16:
+            raise ValueError(
+                "RECOMMENDATION_CANDIDATE_THREADS must be between 1 and 16"
+            )
+        self._candidate_feature_executor=(ThreadPoolExecutor(
+            max_workers=self._candidate_feature_workers,
+            thread_name_prefix=f"recommendation-features-{self.instance_id[:8]}",
+        ) if self._candidate_feature_workers>1 else None)
         self.config = {"miner_strategy":"fixed_combinations",
                        "min_support":16,"max_rules":30,"top_k":5,"conjunctions":2,"chain_steps":10,
                        "mine_interval":8,"max_candidates":0,"random_seed":7,"query_batch_size":512,
@@ -1685,6 +1706,7 @@ class Lab:
             "model_event_sequence":self._last_mined_event_sequence,
             "pending_events":self.pending_events,
             "active_rule_version":self.version,
+            "serving_only":getattr(self,"serving_only",False),
         })
         last_mining=self.last_mining or {}
         last_pair=last_mining.get("pairwise",{}) or {}
@@ -1715,6 +1737,7 @@ class Lab:
                 "mining_workspace":mining_workspace,
                 "dataset":self.dataset_info(),"engine":{"status":"PeTTaChainer live",
                 "symbolic_only":self.symbolic_only,
+                "serving_only":getattr(self,"serving_only",False),
                 "semantic_workspace":bool(self._semantic_workspace_model),
                 "recency_workspace":bool(self._recency_workspace),
                 "llm_workspace":bool(self._llm_workspace),
@@ -1959,7 +1982,7 @@ class Lab:
                 match="none"
         return {LIVE_NEGATIVE_FEATURE:match}
 
-    def features(self,user,article):
+    def features(self,user,article,history_workspace=None):
         topic=article.get("topic",article.get("category","unknown"))
         article_format=article.get("format",article.get("subcategory","article"))
         profile=self.data["users"].get(user,{})
@@ -1971,6 +1994,7 @@ class Lab:
                 text_semantic_vectors=self._article_text_vectors,
                 title_idf_model=self._title_idf_model,
                 transition_model=self.data.get("subcategory_transition_model"),
+                workspace=history_workspace,
             )
             if self._lexical_idf_model:
                 attrs.update(build_lexical_workspace_facts(
@@ -2020,7 +2044,8 @@ class Lab:
                 "recent_subcategory_transition_score":transition,
                 **self._negative_feedback_features(user,article)}
 
-    def contextual_features(self,user,article,context=None):
+    def contextual_features(self,user,article,context=None,
+                            history_workspace=None):
         # A persisted pre-impression snapshot is authoritative, including
         # missing values. Never fill its absent evidence from a later live
         # profile: that can import future history into cold-start replay.
@@ -2030,7 +2055,9 @@ class Lab:
                    "subcategory":article.get("subcategory","unknown"),
                    "format":article.get("format","article")}
         else:
-            attrs=self.features(user,article)
+            attrs=self.features(
+                user,article,history_workspace=history_workspace
+            )
         if context:
             attrs.update({
                 key:str(context[key])[:200] for key in CONTEXT_FEATURES
@@ -2984,17 +3011,39 @@ class Lab:
             user,candidates,live_required,
             timeout_sec=self._serving_reasoner_timeout(),
         )
+        profile=self.data["users"].get(user,{})
+        history=(profile.get("history",[]) if isinstance(profile,dict) else [])
+        needs_live_history=any(
+            not (contexts.get(str(aid)) or {}).get("history_size_bucket")
+            for aid in candidates
+        )
+        history_workspace=(prepare_history_feature_workspace(
+            history,self._articles,
+            entity_vectors=self._article_entity_vectors,
+            text_semantic_vectors=self._article_text_vectors,
+        ) if isinstance(profile,dict) and "history" in profile
+             and needs_live_history else None)
         specs=[]
-        feature_seconds=0.0; projection_seconds=0.0
-        case_serialization_seconds=0.0
-        for aid in candidates:
-            started=time.perf_counter()
-            raw_attrs=self.contextual_features(user,self.article(aid),contexts.get(aid))
+        feature_started=time.perf_counter()
+        def prepare(aid):
             supplied=contexts.get(aid) or {}
+            raw_attrs=self.contextual_features(
+                user,self.article(aid),contexts.get(aid),
+                history_workspace=history_workspace,
+            )
             for feature,value in live_relational.get(str(aid),{}).items():
                 if feature not in supplied:
                     raw_attrs[feature]=value
-            feature_seconds+=time.perf_counter()-started
+            return aid,supplied,raw_attrs
+        executor=getattr(self,"_candidate_feature_executor",None)
+        if executor is not None and len(candidates)>1:
+            prepared=list(executor.map(prepare,candidates))
+        else:
+            prepared=[prepare(aid) for aid in candidates]
+        feature_seconds=time.perf_counter()-feature_started
+        projection_seconds=0.0
+        case_serialization_seconds=0.0
+        for aid,supplied,raw_attrs in prepared:
             started=time.perf_counter()
             attrs=self._bounded_features(raw_attrs)
             attrs={key:value for key,value in attrs.items() if key in active}
@@ -5680,6 +5729,10 @@ class Lab:
             self._closed=True
             coordinator=self._background_mining
             engine=self.engine
+            candidate_executor=getattr(
+                self,"_candidate_feature_executor",None
+            )
+            self._candidate_feature_executor=None
         def release_workspaces():
             if coordinator is not None:
                 coordinator.wait()
@@ -5704,8 +5757,14 @@ class Lab:
                 daemon=True,
             ).start()
         engine.close()
+        if candidate_executor is not None:
+            candidate_executor.shutdown(wait=True,cancel_futures=True)
 
     def mine(self):
+        if getattr(self,"serving_only",False):
+            raise ValueError(
+                "serving-only scorers cannot mine; publish a new frozen model"
+            )
         # Both PeTTa miner instances share the named recommendation scratch
         # space. Keep a metadata snapshot as well: if mining or clean-worker
         # compilation fails, the still-live old scorer and its model metadata
@@ -7446,6 +7505,12 @@ class Lab:
             "pair_ranking_seconds":round(rank_seconds,6),
             "total_seconds":round(time.perf_counter()-score_started,6),
             "point_reasoner_query_calls":_calls,
+            "candidate_plan":{
+                key:(round(value,6) if isinstance(value,float) else value)
+                for key,value in getattr(
+                    self,"_last_candidate_preparation_profile",{}
+                ).items()
+            },
             "pair_plan":({
                 key:(round(value,6) if isinstance(value,float) else value)
                 for key,value in getattr(
@@ -7567,9 +7632,11 @@ class Lab:
                 queue_update["delivery_recovery"]=delivery_recovery
         self._event_sequence+=1; self.pending_events+=1
         mining_scheduled=False
-        if self.pending_events>=self.config["mine_interval"]:
+        if (not getattr(self,"serving_only",False)
+                and self.pending_events>=self.config["mine_interval"]):
             mining_scheduled=self._background_mining.schedule()
         mining_status=self._background_mining.status()
+        mining_status["serving_only"]=getattr(self,"serving_only",False)
         return {"pending_events":self.pending_events,"mined":None,
                 "mining_scheduled":mining_scheduled,
                 "background_mining":mining_status,
@@ -10124,6 +10191,20 @@ class Handler(BaseHTTPRequestHandler):
                 return
             training_lock_claimed=True
         try:
+            if path in {
+                    "/api/config","/api/dataset/load","/api/mine",
+                    "/api/training-confirmation","/api/tune",
+            }:
+                with pinned_lab() as active:
+                    immutable=bool(getattr(active,"serving_only",False))
+                if immutable:
+                    self.send_json({
+                        "error":(
+                            "serving-only scorer is immutable; publish a new "
+                            "validated frozen model"
+                        )
+                    },409)
+                    return
             if path=="/api/semantic/preview":
                 # Copy the source record while holding the lab lock, then
                 # release it before the slower external model call so feed and
@@ -10162,7 +10243,11 @@ class Handler(BaseHTTPRequestHandler):
                                    max_eval_impressions=int(body.get("max_eval_impressions",500)),
                                    seed=int(body.get("random_seed",body.get("seed",7))),
                                    text_embedding_path=body.get("text_embedding_path"))
-                replacement=Lab(data=data,symbolic_only=symbolic_only,config=transferred_config)
+                replacement=Lab(
+                    data=data,symbolic_only=symbolic_only,
+                    config=transferred_config,
+                    serving_only=active.serving_only,
+                )
                 with LAB_SWAP_LOCK:
                     previous=LAB; LAB=replacement
                 # No new request can pin the old Lab after the swap. Waiting
@@ -10265,12 +10350,50 @@ class ProductionHTTPServer(ThreadingHTTPServer):
     request_queue_size=128
 
 
+def _scorer_worker_command(args,port):
+    command=[sys.executable,"-m","recommendation",
+             "--host","127.0.0.1","--port",str(port),"--workers","1",
+             "--max-train-cases",str(args.max_train_cases),
+             "--max-eval-impressions",str(args.max_eval_impressions),
+             "--seed",str(args.seed)]
+    if args.workers>1 or args.serving_only:
+        command.append("--serving-only")
+    for option,value in (
+        ("--symbolic-data",args.symbolic_data),
+        ("--semantic-data",args.semantic_data),
+        ("--replay-data",args.replay_data),
+        ("--config-file",args.config_file),
+        ("--serving-model",args.serving_model),
+        ("--text-embeddings",args.text_embeddings),
+    ):
+        if value:
+            command.extend((option,str(value)))
+    if args.fixture:
+        command.append("--fixture")
+    elif (not args.symbolic_data and not args.semantic_data
+          and not args.replay_data and args.mind):
+        command.extend(("--mind",str(args.mind)))
+    return tuple(command)
+
+
 def main():
     global LAB
     local_archive=DATASET_DIR/"MIND_small_x1.zip"
     parser=argparse.ArgumentParser()
     parser.add_argument("--host",default="127.0.0.1")
     parser.add_argument("--port",type=int,default=7070)
+    parser.add_argument(
+        "--workers",type=int,default=1,
+        help="Isolated scorer processes behind a session-sticky gateway",
+    )
+    parser.add_argument(
+        "--worker-start-port",type=int,
+        help="First loopback scorer port (default: gateway port + 1)",
+    )
+    parser.add_argument("--worker-ready-timeout",type=float,default=180.0)
+    parser.add_argument("--backend-timeout",type=float,default=120.0)
+    parser.add_argument("--gateway-threads",type=int,default=64)
+    parser.add_argument("--gateway-queue",type=int,default=256)
     parser.add_argument("--mind",default=str(local_archive) if local_archive.is_file() else None,
                         help="Extracted raw MIND root or RecZoo MIND_small_x1.zip")
     parser.add_argument("--fixture",action="store_true",help="Use only the bundled deterministic fixture")
@@ -10282,6 +10405,10 @@ def main():
     parser.add_argument(
         "--serving-model",
         help="Validated frozen serving-model JSON; skips fpMiner at startup",
+    )
+    parser.add_argument(
+        "--serving-only",action="store_true",
+        help="Disable online mining and require frozen model publication",
     )
     parser.add_argument(
         "--export-serving-model",
@@ -10297,10 +10424,43 @@ def main():
     )
     parser.add_argument("--max-train-cases",type=int,default=20000); parser.add_argument("--max-eval-impressions",type=int,default=500)
     parser.add_argument("--seed",type=int,default=7); args=parser.parse_args()
+    if args.workers<1:
+        parser.error("--workers must be positive")
+    if not (1<=args.port<=65535):
+        parser.error("--port must be between 1 and 65535")
+    if min(args.worker_ready_timeout,args.backend_timeout)<=0:
+        parser.error("pool timeouts must be positive")
+    if min(args.gateway_threads,args.gateway_queue)<1:
+        parser.error("gateway thread and queue limits must be positive")
     if args.export_only and not args.export_serving_model:
         parser.error("--export-only requires --export-serving-model")
     if args.config_file and args.serving_model:
         parser.error("--config-file cannot override --serving-model")
+    if args.serving_only and not args.serving_model:
+        parser.error("--serving-only requires --serving-model")
+    if args.workers>1:
+        if not args.serving_model:
+            parser.error("--workers > 1 requires an immutable --serving-model")
+        if args.export_serving_model or args.export_only:
+            parser.error("model export must run before starting a scorer pool")
+        start_port=(args.worker_start_port
+                    if args.worker_start_port is not None else args.port+1)
+        worker_ports=list(range(start_port,start_port+args.workers))
+        if (start_port<1 or worker_ports[-1]>65535
+                or args.port in worker_ports):
+            parser.error("worker port range is invalid or overlaps gateway port")
+        from .production_pool import serve_pool
+        serve_pool(
+            host=args.host,port=args.port,
+            worker_commands=[_scorer_worker_command(args,port)
+                             for port in worker_ports],
+            worker_ports=worker_ports,
+            ready_timeout=args.worker_ready_timeout,
+            backend_timeout=args.backend_timeout,
+            gateway_threads=args.gateway_threads,
+            gateway_queue=args.gateway_queue,
+        )
+        return
     config={}
     if args.config_file:
         saved=json.loads(Path(args.config_file).read_text())
@@ -10309,21 +10469,24 @@ def main():
                    if args.serving_model else None)
     if args.symbolic_data:
         LAB=Lab(load_symbolic_snapshot(args.symbolic_data),symbolic_only=True,
-                config=config,serving_model=serving_model)
+                config=config,serving_model=serving_model,
+                serving_only=args.serving_only)
     elif args.semantic_data:
         LAB=Lab(load_semantic_snapshot(args.semantic_data),config=config,
-                serving_model=serving_model)
+                serving_model=serving_model,serving_only=args.serving_only)
     elif args.replay_data:
         LAB=Lab(load_symbolic_snapshot(args.replay_data),config=config,
-                serving_model=serving_model)
+                serving_model=serving_model,serving_only=args.serving_only)
     elif args.mind and not args.fixture:
         data=load_mind(args.mind,max_train_cases=args.max_train_cases,
                        max_eval_impressions=args.max_eval_impressions,seed=args.seed,
                        text_embedding_path=args.text_embeddings)
-        LAB=Lab(data=data,config=config,serving_model=serving_model)
+        LAB=Lab(data=data,config=config,serving_model=serving_model,
+                serving_only=args.serving_only)
         print("Loaded:",json.dumps(LAB.dataset_info(),ensure_ascii=False))
     else:
-        LAB=Lab(config=config,serving_model=serving_model)
+        LAB=Lab(config=config,serving_model=serving_model,
+                serving_only=args.serving_only)
     if args.export_serving_model:
         write_serving_model(args.export_serving_model,LAB.serving_model())
         print(f"Serving model: {args.export_serving_model}")
