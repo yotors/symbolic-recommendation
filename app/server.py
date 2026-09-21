@@ -1037,6 +1037,94 @@ def parse_rules(raw, limit=None, features=FEATURES):
     return rules
 
 
+def parse_petta_target_rules(raw, *, features=FEATURES):
+    """Decode target-aware rule atoms without recomputing their statistics."""
+    clause_re = re.compile(
+        r'\((' + "|".join((*features, "engagement"))
+        + r')\s+[^\s()]+\s+"([^"]+)"\)'
+    )
+    metric_patterns = {
+        "target_auc": r"\(AUC\s+([0-9.eE+-]+)\)",
+        "target_auc_gain": r"\(AUC-Gain\s+([0-9.eE+-]+)\)",
+        "target_youden_j": r"\(Youden-J\s+([0-9.eE+-]+)\)",
+        "target_wracc": r"\(WRAcc\s+([0-9.eE+-]+)\)",
+        "target_information_gain": r"\(Information-Gain\s+([0-9.eE+-]+)\)",
+        "target_log_odds": r"\(Log-Odds\s+([0-9.eE+-]+)\)",
+    }
+    optional_metric_patterns = {
+        "target_parent_precision":
+            r"\(Parent-Precision\s+([0-9.eE+-]+)\)",
+        "target_incremental_precision":
+            r"\(Incremental-Precision\s+([0-9.eE+-]+)\)",
+        "target_incremental_wracc":
+            r"\(Incremental-WRAcc\s+([0-9.eE+-]+)\)",
+    }
+    unique = {}
+    for form in balanced_forms(" ".join(str(value) for value in raw), "targetScoreOf"):
+        clauses = clause_re.findall(form)
+        target = next((value for predicate, value in clauses
+                       if predicate == "engagement"), None)
+        premises = tuple((predicate, value) for predicate, value in clauses
+                         if predicate in features)
+        stvs = STV_RE.findall(form)
+        support_match = re.search(r"\)\s+([0-9]+)\s*\)$", form)
+        contingency_match = re.search(
+            r"\(Contingency\s+([0-9]+)\s+([0-9]+)\s+([0-9]+)\s+([0-9]+)\)",
+            form,
+        )
+        metrics = {
+            name: float(match.group(1))
+            for name, pattern in metric_patterns.items()
+            if (match := re.search(pattern, form)) is not None
+        }
+        optional_metrics = {
+            name: float(match.group(1))
+            for name, pattern in optional_metric_patterns.items()
+            if (match := re.search(pattern, form)) is not None
+        }
+        if (target not in POSITIVE or not premises or len(stvs) < 2
+                or support_match is None or contingency_match is None
+                or len(metrics) != len(metric_patterns)):
+            continue
+        strength, confidence = map(float, stvs[0])
+        negative_strength, negative_confidence = map(float, stvs[1])
+        contingency = tuple(map(int, contingency_match.groups()))
+        key = (premises, target)
+        record = {
+            "premises": premises,
+            "target": target,
+            "support": int(support_match.group(1)),
+            "strength": strength,
+            "confidence": confidence,
+            "negative_strength": negative_strength,
+            "negative_confidence": negative_confidence,
+            "target_contingency": {
+                "n11": contingency[0], "n10": contingency[1],
+                "n01": contingency[2], "n00": contingency[3],
+            },
+            "discovery_ctv": {
+                "positive": {"strength": strength, "confidence": confidence},
+                "negative": {
+                    "strength": negative_strength,
+                    "confidence": negative_confidence,
+                },
+                "complete": True,
+            },
+            "petta_target_aware": True,
+            "source": "recommendation/miner/fpMiner.metta#target-aware",
+            **metrics,
+            **optional_metrics,
+        }
+        previous = unique.get(key)
+        if previous is not None and previous != record:
+            raise ValueError("PeTTa target miner emitted conflicting duplicate rules")
+        unique[key] = record
+    rules = [unique[key] for key in sorted(unique)]
+    for index, rule in enumerate(rules, 1):
+        rule["id"] = f"petta_target_{index}"
+    return rules
+
+
 def proof_tv(proof):
     values = STV_RE.findall(proof)
     return tuple(map(float, values[-1])) if values else (0.0,0.0)
@@ -3574,6 +3662,76 @@ class Lab:
                         )
             raise
 
+    def _mine_petta_target_workspace(
+        self, synced, *, plan, features, depth, min_support,
+        min_auc_gain, workspace_kind, semantic_features=(), context_features=(),
+        min_incremental_precision=0.0,
+    ):
+        """Run target metrics and conjunction filtering entirely in PeTTa."""
+        try:
+            started = time.perf_counter()
+            if semantic_features or context_features:
+                if (not semantic_features or not context_features
+                        or int(depth) != 3):
+                    raise ValueError(
+                        "conditional PeTTa mining requires both predicate "
+                        "families and depth three"
+                    )
+                semantic_atom="("+" ".join(semantic_features)+")"
+                context_atom="("+" ".join(context_features)+")"
+                function="conditional-target-aware-frequency-pattern-miner"
+                query=(
+                    f"!({function} {synced.space} {int(min_support)} "
+                    f"{semantic_atom} {context_atom} \"click\" "
+                    f"{float(self.config['ctv_evidence_k']):.17g} "
+                    f"{float(min_auc_gain):.17g} "
+                    f"{float(min_incremental_precision):.17g})"
+                )
+            else:
+                function="target-aware-frequency-pattern-miner"
+                query=(
+                    f"!({function} {synced.space} {int(min_support)} "
+                    f"{int(depth)} \"click\" "
+                    f"{float(self.config['ctv_evidence_k']):.17g} "
+                    f"{float(min_auc_gain):.17g})"
+                )
+            raw = self.petta.process_metta_string(query)
+            values = (() if raw is None else (raw,) if isinstance(raw, (str, bytes))
+                      else tuple(raw))
+            rules = parse_petta_target_rules(values, features=features)
+            return rules, {
+                "plan": plan,
+                "space": synced.space,
+                "depth": int(depth),
+                "min_support": int(min_support),
+                "min_auc_gain": float(min_auc_gain),
+                "min_incremental_precision":
+                    float(min_incremental_precision),
+                "rules": len(rules),
+                "seconds": time.perf_counter() - started,
+                "executor": f"{function} via PeTTa",
+                "semantic_features": list(semantic_features),
+                "context_features": list(context_features),
+                "host_role": "workspace_transport_and_atom_decoding_only",
+                "symbolic_statistics": [
+                    "contingency", "CTV", "AUC", "Youden-J", "WRAcc",
+                    "information-gain", "log-odds", "parent-precision",
+                    "incremental-precision", "incremental-WRAcc",
+                ],
+            }
+        except BaseException as exc:
+            if plan not in self._active_mining_workspace_plans:
+                try:
+                    self._mining_workspaces.rollback(synced)
+                except BaseException as rollback_exc:
+                    if hasattr(exc, "add_note"):
+                        exc.add_note(
+                            f"failed to roll back rejected {workspace_kind} "
+                            "target-aware workspace: "
+                            f"{type(rollback_exc).__name__}: {rollback_exc}"
+                        )
+            raise
+
     def _mining_event_cases(self,indexed_events=None):
         """Sample point cases while retaining their append-stable source IDs."""
         indexed=(list(indexed_events) if indexed_events is not None else
@@ -4165,7 +4323,8 @@ class Lab:
         self._pair_categorical_labels={}
         strategy=self.config["miner_strategy"]
         weighted_search=strategy in {
-            "target_aware","conditional_llm","conditional_llm_seed_only"
+            "target_aware","conditional_llm","conditional_llm_seed_only",
+            "petta_conditional_seed_only",
         }
         discovery_cases=self._pair_training_cases(indexed_events=indexed_events)
         if not discovery_cases:
@@ -4395,7 +4554,86 @@ class Lab:
             "host_generated_rules":0,
         }
         target_search=None
-        if strategy in {"conditional_llm","conditional_llm_seed_only"}:
+        if strategy == "petta_conditional_seed_only":
+            semantic=tuple(feature for feature in active
+                           if feature in LLM_PAIR_PREDICATES)
+            context=tuple(feature for feature in active
+                          if feature in CONDITIONAL_LLM_CONTEXT_PREDICATES)
+            semantic_seeds=[
+                rule for rule in rules
+                if len(rule["premises"])==1
+                and rule["premises"][0][0] in semantic
+            ]
+            seed_predicates=tuple(sorted({
+                rule["premises"][0][0] for rule in semantic_seeds
+            }))
+            target_rules=[]; target_audits=[]
+            if seed_predicates and context:
+                existing={(rule["premises"],rule["target"]) for rule in rules}
+                selected_features=(*seed_predicates,*sorted(context))
+                synced,plan_key,_workspace_cases=sync_space(
+                    selected_features,3,bounded_population,
+                    "petta_conditional_full_population",
+                )
+                discovered,audit=self._mine_petta_target_workspace(
+                    synced,plan=plan_key,features=selected_features,
+                    depth=3,min_support=calibration_min_support,
+                    min_auc_gain=0.0,workspace_kind="pair",
+                    semantic_features=seed_predicates,
+                    context_features=tuple(sorted(context)),
+                )
+                target_audits.append(audit)
+                for rule in discovered:
+                    key=(rule["premises"],rule["target"])
+                    if key in existing:
+                        continue
+                    semantic_predicate=next(
+                        predicate for predicate,_value in rule["premises"]
+                        if predicate in seed_predicates
+                    )
+                    context_predicate=next(
+                        predicate for predicate,_value in rule["premises"]
+                        if predicate in context
+                    )
+                    rule.update(
+                        conditional_fpminer_seed_predicate=semantic_predicate,
+                        conditional_context_predicate=context_predicate,
+                        dependency_owner="pair_text_semantic_top3_mean",
+                        evidence_relationship="dependent_target_aware_variant",
+                    )
+                    target_rules.append(rule); existing.add(key)
+                rules.extend(target_rules)
+            semantic_seed_ids={rule["id"] for rule in semantic_seeds}
+            removed=[
+                rule for rule in rules
+                if rule.get("id") in semantic_seed_ids
+                and len(rule.get("premises",()))==1
+                and rule["premises"][0][0] in LLM_PAIR_PREDICATES
+            ]
+            removed_ids={id(rule) for rule in removed}
+            rules=[rule for rule in rules if id(rule) not in removed_ids]
+            target_search={
+                "kind":"petta_conditional_seed_only",
+                "executor":"recommendation/miner/fpMiner.metta via PeTTa",
+                "target_discovery_symbolic_computation":"PeTTa_only",
+                "semantic_predicates":list(semantic),
+                "context_predicates":list(context),
+                "fpminer_semantic_seeds":len(semantic_seeds),
+                "seed_predicates":list(seed_predicates),
+                "workspace_queries":target_audits,
+                "candidate_patterns":len(target_rules),
+                "deeper_candidate_patterns":len(target_rules),
+                "semantic_seed_policy":"discovery_only",
+                "discovery_only_seed_rules":[{
+                    "rule_id":rule["id"],
+                    "premises":[list(item) for item in rule["premises"]],
+                    "source":rule["source"],
+                    "support":rule["support"],
+                    "discovery_ctv":rule["discovery_ctv"],
+                } for rule in removed],
+                "backoff_policy":"non-LLM mined rules remain active",
+            }
+        elif strategy in {"conditional_llm","conditional_llm_seed_only"}:
             semantic=tuple(feature for feature in active
                            if feature in LLM_PAIR_PREDICATES)
             context=tuple(feature for feature in active
@@ -4644,8 +4882,9 @@ class Lab:
             calibration=None
             petta_calibration=None
             calibrated_base_rate=base_rate
-            is_conditional_child=rule.get("source","").endswith(
-                "conditional_llm_mining.py"
+            is_conditional_child=(
+                rule.get("petta_target_aware") is True
+                or rule.get("source","").endswith("conditional_llm_mining.py")
             )
             is_scoped_categorical=rule.get("scoped_categorical_prior") is True
             use_effective_conditional=(
@@ -4940,10 +5179,13 @@ class Lab:
                 variants[dependency_id]+=1
                 rule.update(id=dependency_id,dependency_id=dependency_id,
                             variant_id=f"{dependency_id}_v{variants[dependency_id]}")
-        if target_search is not None and strategy=="conditional_llm_seed_only":
+        if target_search is not None and strategy in {
+                "conditional_llm_seed_only","petta_conditional_seed_only"}:
             compiled_children=[
                 rule for rule in selected
-                if rule.get("source","").endswith("conditional_llm_mining.py")
+                if (rule.get("petta_target_aware") is True
+                    or rule.get("source","").endswith(
+                        "conditional_llm_mining.py"))
             ]
             target_search.update({
                 "compiled_conditional_children":len(compiled_children),
@@ -7722,10 +7964,12 @@ class Lab:
             miner_strategy=str(values["miner_strategy"])
             if miner_strategy not in {
                     "fixed_combinations","target_aware","conditional_llm",
-                    "conditional_llm_seed_only"}:
+                    "conditional_llm_seed_only",
+                    "petta_conditional_seed_only"}:
                 raise ValueError(
                     "miner_strategy must be fixed_combinations, target_aware "
-                    "conditional_llm or conditional_llm_seed_only"
+                    "conditional_llm, conditional_llm_seed_only or "
+                    "petta_conditional_seed_only"
                 )
             string_updates["miner_strategy"]=miner_strategy
         effective_strategy=string_updates.get(
@@ -7743,7 +7987,9 @@ class Lab:
                 "target_aware requires conjunctions >= 3 or "
                 "pair_conjunctions >= 3 so it can expand beyond fpMiner unaries"
             )
-        if (effective_strategy in {"conditional_llm","conditional_llm_seed_only"}
+        if (effective_strategy in {
+                "conditional_llm","conditional_llm_seed_only",
+                "petta_conditional_seed_only"}
                 and effective_pair_depth<3):
             raise ValueError(
                 "conditional LLM mining requires pair_conjunctions >= 3 so it can "
@@ -7996,7 +8242,9 @@ class Lab:
                 "LLM profiles require proof_margin so correlated variants use "
                 "isolated PeTTa proof channels"
             )
-        if (effective_strategy in {"conditional_llm","conditional_llm_seed_only"}
+        if (effective_strategy in {
+                "conditional_llm","conditional_llm_seed_only",
+                "petta_conditional_seed_only"}
                 and selected_pair not in {
                     "llm_conditional","llm_conditional_quantile",
                     "llm_conditional_quantile_relational",
@@ -8014,10 +8262,12 @@ class Lab:
             "pair_ctv_mode",self.config.get("pair_ctv_mode","raw_pairs")
         )
         if (effective_pair_ctv=="conditional_effective_backoff"
-                and effective_strategy!="conditional_llm_seed_only"):
+                and effective_strategy not in {
+                    "conditional_llm_seed_only","petta_conditional_seed_only"
+                }):
             raise ValueError(
                 "conditional_effective_backoff requires "
-                "miner_strategy conditional_llm_seed_only"
+                "a seed-only conditional miner strategy"
             )
         if (getattr(self,"_llm_workspace",{})
                 and changed_values.get("pair_dependency_mode",self.config["pair_dependency_mode"])!="clustered"):
@@ -9840,6 +10090,8 @@ class Lab:
                         "fpMiner LLM unary + stable conditional expansion -> PeTTaChainer",
                     "conditional_llm_seed_only":
                         "fpMiner LLM discovery seeds + stable conditional children -> PeTTaChainer",
+                    "petta_conditional_seed_only":
+                        "PeTTa target-aware fpMiner + PeTTaChainer",
                 }[run_config["miner_strategy"]]
                 return {
                     "profile":profile,"run_id":run["id"],"auc":run["auc"],
