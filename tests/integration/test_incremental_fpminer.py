@@ -181,6 +181,11 @@ class IncrementalFpMinerPeTTaIntegrationTest(unittest.TestCase):
         self.assertIn('(topic ', conditional_text)
         self.assertIn('(AUC 0.75)', conditional_text)
         self.assertIn('(Incremental-Precision ', conditional_text)
+        self.assertIn('(MDL-Gain ', conditional_text)
+        self.assertIn(
+            '(Hierarchical-Precision 0.6666666666666666)',
+            conditional_text,
+        )
         rejected = self.petta.process_metta_string(
             f'!(conditional-target-aware-frequency-pattern-miner {self.space} '
             '1 (format) (topic) "click" 2.0 0.0 0.5)'

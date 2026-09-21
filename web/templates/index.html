@@ -90,6 +90,8 @@
           <option value="conditional_llm">LLM-seeded conditional expansion</option>
           <option value="conditional_llm_seed_only">LLM conditional children (seed-only)</option>
           <option value="petta_conditional_seed_only">PeTTa target-aware conditional (experimental)</option>
+          <option value="petta_mdl_seed_only">PeTTa MDL selection (experimental)</option>
+          <option value="petta_hierarchical_seed_only">PeTTa hierarchical shrinkage (experimental)</option>
         </select>
       </label>
       <label>Min support <input id="min" type="number" value="16" min="1"></label>
@@ -236,7 +238,7 @@ function showMessage(message, error = false) {
 }
 
 function ensureTargetAwareDepths() {
-  if (!['target_aware','conditional_llm','conditional_llm_seed_only','petta_conditional_seed_only'].includes($('minerStrategy').value)) return;
+  if (!['target_aware','conditional_llm','conditional_llm_seed_only','petta_conditional_seed_only','petta_mdl_seed_only','petta_hierarchical_seed_only'].includes($('minerStrategy').value)) return;
   if (finite($('conjunctions').value, 2) < 3) $('conjunctions').value = 3;
   if (finite($('pairConjunctions').value, 2) < 3) $('pairConjunctions').value = 3;
 }

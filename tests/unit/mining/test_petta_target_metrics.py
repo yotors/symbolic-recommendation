@@ -9,7 +9,9 @@ def test_decodes_petta_target_metrics_without_recalculation():
         '(Contingency 3 1 1 3) (AUC 0.75) (AUC-Gain 0.25) '
         '(Youden-J 0.5) (WRAcc 0.125) (Information-Gain 0.1887) '
         '(Log-Odds 1.6946) (Parent-Precision 0.5) '
-        '(Incremental-Precision 0.25) (Incremental-WRAcc 0.0625) 3))'
+        '(Incremental-Precision 0.25) (Incremental-WRAcc 0.0625) '
+        '(MDL-Gain 1.25) (Hierarchical-Parent-Precision 0.5) '
+        '(Hierarchical-Precision 0.6) 3))'
     ]
     rules = parse_petta_target_rules(raw, features=("topic",))
     assert len(rules) == 1
@@ -23,5 +25,8 @@ def test_decodes_petta_target_metrics_without_recalculation():
     assert rule["target_parent_precision"] == 0.5
     assert rule["target_incremental_precision"] == 0.25
     assert rule["target_incremental_wracc"] == 0.0625
+    assert rule["target_mdl_gain"] == 1.25
+    assert rule["target_hierarchical_parent_precision"] == 0.5
+    assert rule["target_hierarchical_precision"] == 0.6
     assert rule["petta_target_aware"] is True
     assert rule["source"].endswith("#target-aware")

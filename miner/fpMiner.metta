@@ -115,13 +115,15 @@
      (let $support (counter $dbspace $unary-pattern)
        (if (>= $support $minsup)
            (let (TargetMetrics
-                  (CTV (STV $precision $_positive-confidence) $_negative-tv)
+                  (CTV (STV $precision $_positive-confidence)
+                       (STV $negative-precision $_negative-confidence))
                   $_counts $_auc (AUC-Gain $gain) $_youden $_wracc $_ig
                   $_log-odds)
                 (recommendation-target-metrics-with-support
                   $unary-pattern $dbspace $support $target-value $evidence-k)
              (if (>= $gain $min-auc-gain)
-                 (TargetCandidate $candidate $precision)
+                 (TargetCandidate
+                   $candidate $precision $negative-precision)
                  (empty)))
            (empty)))))
 
@@ -130,7 +132,8 @@
 ;; restating evidence already carried by the semantic clause.  All counts and
 ;; arithmetic stay inside PeTTa; the host only decodes the emitted atom.
 (= (conditional-target-aware-formatter
-      (conjunct $conjunct) $parent-precision $dbspace $minsup
+      (conjunct $conjunct) $semantic-precision $context-precision
+      $dbspace $minsup
       $target-value $evidence-k $min-auc-gain $min-incremental-precision)
    (let $support (counter $dbspace $conjunct)
      (if (>= $support $minsup)
@@ -142,12 +145,28 @@
                 (Log-Odds $log-odds))
               (recommendation-target-metrics-with-support
                 $conjunct $dbspace $support $target-value $evidence-k)
-           (let* (($incremental-precision (- $precision $parent-precision))
+           (let* (($parent-precision
+                     (max $semantic-precision $context-precision))
+                  ($incremental-precision (- $precision $parent-precision))
                   ($antecedent-support (+ $n11 $n10))
                   ($population (+ $n11 (+ $n10 (+ $n01 $n00))))
                   ($incremental-wracc
                      (* (// $antecedent-support $population)
-                        $incremental-precision)))
+                        $incremental-precision))
+                  ;; Two binary antecedent clauses add two structural degrees
+                  ;; of freedom.  Information gain is measured in bits, so the
+                  ;; BIC/MDL penalty uses log base two as well.
+                  ($mdl-gain
+                     (- (* $population $information-gain)
+                        (* 0.5 (* 2.0 (log-math 2.0 $population)))))
+                  ;; Empirical-Bayes child estimate: the semantic rule is the
+                  ;; parent lineage and evidence-k is its prior mass.  The
+                  ;; context child replaces that parent at inference; the two
+                  ;; nested populations are never treated as independent.
+                  ($hierarchical-precision
+                     (// (+ (* $antecedent-support $precision)
+                             (* $evidence-k $semantic-precision))
+                         (+ $antecedent-support $evidence-k))))
              (if (and (>= $gain $min-auc-gain)
                       (> $incremental-precision
                          $min-incremental-precision))
@@ -165,6 +184,9 @@
                      (Parent-Precision $parent-precision)
                      (Incremental-Precision $incremental-precision)
                      (Incremental-WRAcc $incremental-wracc)
+                     (MDL-Gain $mdl-gain)
+                     (Hierarchical-Parent-Precision $semantic-precision)
+                     (Hierarchical-Precision $hierarchical-precision)
                      $support))
                  (empty))))
          (empty))))
@@ -196,18 +218,19 @@
                  (target-aware-candidate-with-precision
                    (superpose $context-pool) $dbspace $minsup
                    $target-value $evidence-k $min-auc-gain))))
-       (let* (((TargetCandidate $semantic $semantic-precision)
+       (let* (((TargetCandidate
+                 $semantic $semantic-precision $_semantic-negative)
                  (superpose $semantic-candidates))
-              ((TargetCandidate $context $context-precision)
+              ((TargetCandidate
+                 $context $context-precision $_context-negative)
                  (superpose $context-candidates))
-              ($parent-precision
-                 (max $semantic-precision $context-precision))
               ($conjunction
                 (promote-placeholders
                   (, $semantic $context (engagement "$x" $target-value))
                   ("$x"))))
          (collapse
            (conditional-target-aware-formatter
-             (conjunct $conjunction) $parent-precision $dbspace $minsup
+             (conjunct $conjunction) $semantic-precision $context-precision
+             $dbspace $minsup
              $target-value $evidence-k $min-auc-gain
              $min-incremental-precision))))))

@@ -1058,6 +1058,11 @@ def parse_petta_target_rules(raw, *, features=FEATURES):
             r"\(Incremental-Precision\s+([0-9.eE+-]+)\)",
         "target_incremental_wracc":
             r"\(Incremental-WRAcc\s+([0-9.eE+-]+)\)",
+        "target_mdl_gain": r"\(MDL-Gain\s+([0-9.eE+-]+)\)",
+        "target_hierarchical_parent_precision":
+            r"\(Hierarchical-Parent-Precision\s+([0-9.eE+-]+)\)",
+        "target_hierarchical_precision":
+            r"\(Hierarchical-Precision\s+([0-9.eE+-]+)\)",
     }
     unique = {}
     for form in balanced_forms(" ".join(str(value) for value in raw), "targetScoreOf"):
@@ -3681,7 +3686,8 @@ class Lab:
                 context_atom="("+" ".join(context_features)+")"
                 function="conditional-target-aware-frequency-pattern-miner"
                 query=(
-                    f"!({function} {synced.space} {int(min_support)} "
+                    f"!({function} {synced.space} "
+                    f"{int(min_support)} "
                     f"{semantic_atom} {context_atom} \"click\" "
                     f"{float(self.config['ctv_evidence_k']):.17g} "
                     f"{float(min_auc_gain):.17g} "
@@ -3716,7 +3722,8 @@ class Lab:
                 "symbolic_statistics": [
                     "contingency", "CTV", "AUC", "Youden-J", "WRAcc",
                     "information-gain", "log-odds", "parent-precision",
-                    "incremental-precision", "incremental-WRAcc",
+                    "incremental-precision", "incremental-WRAcc", "MDL-gain",
+                    "hierarchical-parent-precision", "hierarchical-precision",
                 ],
             }
         except BaseException as exc:
@@ -4324,7 +4331,8 @@ class Lab:
         strategy=self.config["miner_strategy"]
         weighted_search=strategy in {
             "target_aware","conditional_llm","conditional_llm_seed_only",
-            "petta_conditional_seed_only",
+            "petta_conditional_seed_only","petta_mdl_seed_only",
+            "petta_hierarchical_seed_only",
         }
         discovery_cases=self._pair_training_cases(indexed_events=indexed_events)
         if not discovery_cases:
@@ -4554,7 +4562,9 @@ class Lab:
             "host_generated_rules":0,
         }
         target_search=None
-        if strategy == "petta_conditional_seed_only":
+        if strategy in {
+                "petta_conditional_seed_only","petta_mdl_seed_only",
+                "petta_hierarchical_seed_only"}:
             semantic=tuple(feature for feature in active
                            if feature in LLM_PAIR_PREDICATES)
             context=tuple(feature for feature in active
@@ -4613,7 +4623,7 @@ class Lab:
             removed_ids={id(rule) for rule in removed}
             rules=[rule for rule in rules if id(rule) not in removed_ids]
             target_search={
-                "kind":"petta_conditional_seed_only",
+                "kind":strategy,
                 "executor":"recommendation/miner/fpMiner.metta via PeTTa",
                 "target_discovery_symbolic_computation":"PeTTa_only",
                 "semantic_predicates":list(semantic),
@@ -4927,6 +4937,20 @@ class Lab:
                 if not use_effective_conditional:
                     negative_confidence=petta_calibration.negative.confidence
                     activation_coverage=calibration.activation.weighted_fraction
+            if (strategy=="petta_hierarchical_seed_only"
+                    and rule.get("petta_target_aware") is True):
+                hierarchical_strength=rule.get("target_hierarchical_precision")
+                if (not isinstance(hierarchical_strength,(int,float))
+                        or not math.isfinite(hierarchical_strength)
+                        or not 0.0<=hierarchical_strength<=1.0):
+                    raise ValueError(
+                        "PeTTa hierarchical rule is missing a valid strength"
+                    )
+                rule.update(
+                    unshrunk_calibrated_strength=strength,
+                    strength_estimator="petta_hierarchical_parent_shrinkage",
+                )
+                strength=float(hierarchical_strength)
             effect=strength-calibrated_base_rate; specificity=len(rule["premises"])
             fold_effects=[]
             fold_supports=[]
@@ -5077,7 +5101,20 @@ class Lab:
             if (calibrated_support>=required_support and effect>0
                     and stable_effect>=float(self.config["pair_min_effect"])):
                 calibrated.append(rule)
-        calibrated.sort(key=lambda rule:(-rule["quality"],-rule["specificity"],
+        def selection_quality(rule):
+            if (strategy=="petta_mdl_seed_only"
+                    and rule.get("petta_target_aware") is True):
+                value=rule.get("target_mdl_gain")
+                if not isinstance(value,(int,float)) or not math.isfinite(value):
+                    raise ValueError("PeTTa MDL rule is missing a finite MDL gain")
+                rule.update(
+                    selection_objective="petta_mdl_gain_bits",
+                    selection_objective_value=float(value),
+                )
+                return float(value)
+            return rule["quality"]
+        calibrated.sort(key=lambda rule:(-selection_quality(rule),
+                                         -rule["specificity"],
                                          -rule["antecedent_support"],rule["premises"]))
         selected=[]
         rule_cap=int(self.config["pair_max_rules"])
@@ -5180,7 +5217,8 @@ class Lab:
                 rule.update(id=dependency_id,dependency_id=dependency_id,
                             variant_id=f"{dependency_id}_v{variants[dependency_id]}")
         if target_search is not None and strategy in {
-                "conditional_llm_seed_only","petta_conditional_seed_only"}:
+                "conditional_llm_seed_only","petta_conditional_seed_only",
+                "petta_mdl_seed_only","petta_hierarchical_seed_only"}:
             compiled_children=[
                 rule for rule in selected
                 if (rule.get("petta_target_aware") is True
@@ -7965,11 +8003,13 @@ class Lab:
             if miner_strategy not in {
                     "fixed_combinations","target_aware","conditional_llm",
                     "conditional_llm_seed_only",
-                    "petta_conditional_seed_only"}:
+                    "petta_conditional_seed_only","petta_mdl_seed_only",
+                    "petta_hierarchical_seed_only"}:
                 raise ValueError(
                     "miner_strategy must be fixed_combinations, target_aware "
                     "conditional_llm, conditional_llm_seed_only or "
-                    "petta_conditional_seed_only"
+                    "petta_conditional_seed_only/petta_mdl_seed_only"
+                    "/petta_hierarchical_seed_only"
                 )
             string_updates["miner_strategy"]=miner_strategy
         effective_strategy=string_updates.get(
@@ -7989,7 +8029,8 @@ class Lab:
             )
         if (effective_strategy in {
                 "conditional_llm","conditional_llm_seed_only",
-                "petta_conditional_seed_only"}
+                "petta_conditional_seed_only","petta_mdl_seed_only",
+                "petta_hierarchical_seed_only"}
                 and effective_pair_depth<3):
             raise ValueError(
                 "conditional LLM mining requires pair_conjunctions >= 3 so it can "
@@ -8244,7 +8285,8 @@ class Lab:
             )
         if (effective_strategy in {
                 "conditional_llm","conditional_llm_seed_only",
-                "petta_conditional_seed_only"}
+                "petta_conditional_seed_only","petta_mdl_seed_only",
+                "petta_hierarchical_seed_only"}
                 and selected_pair not in {
                     "llm_conditional","llm_conditional_quantile",
                     "llm_conditional_quantile_relational",
@@ -8263,7 +8305,9 @@ class Lab:
         )
         if (effective_pair_ctv=="conditional_effective_backoff"
                 and effective_strategy not in {
-                    "conditional_llm_seed_only","petta_conditional_seed_only"
+                    "conditional_llm_seed_only","petta_conditional_seed_only",
+                    "petta_mdl_seed_only",
+                    "petta_hierarchical_seed_only",
                 }):
             raise ValueError(
                 "conditional_effective_backoff requires "
@@ -10092,6 +10136,10 @@ class Lab:
                         "fpMiner LLM discovery seeds + stable conditional children -> PeTTaChainer",
                     "petta_conditional_seed_only":
                         "PeTTa target-aware fpMiner + PeTTaChainer",
+                    "petta_mdl_seed_only":
+                        "PeTTa MDL-selected target rules + PeTTaChainer",
+                    "petta_hierarchical_seed_only":
+                        "PeTTa hierarchical target rules + PeTTaChainer",
                 }[run_config["miner_strategy"]]
                 return {
                     "profile":profile,"run_id":run["id"],"auc":run["auc"],
