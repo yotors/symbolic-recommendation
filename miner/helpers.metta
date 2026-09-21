@@ -226,6 +226,80 @@
              (recommendation-count-confidence $outside-support $evidence-k)))
          (empty))))
 
+;; The target-aware miner must optimize a ranking objective, not merely raw
+;; support.  Keep the complete 2x2 contingency and every derived statistic in
+;; MeTTa so the host only transports the returned atoms.
+(= (recommendation-contingency-with-support
+      $pattern $db $joint-support $target-value)
+   (let* (($antecedent-support
+              (counter $db (recommendation-antecedent $pattern)))
+          ($case-count (recommendation-case-count $db))
+          ($target-support (recommendation-target-support $db $target-value))
+          ($antecedent-nontarget (- $antecedent-support $joint-support))
+          ($outside-target (- $target-support $joint-support))
+          ($outside-nontarget
+             (- (- $case-count $antecedent-support) $outside-target))
+          ($valid
+             (and (> $case-count 0)
+               (and (> $target-support 0)
+                 (and (> (- $case-count $target-support) 0)
+                   (and (>= $joint-support 0)
+                     (and (>= $antecedent-nontarget 0)
+                       (and (>= $outside-target 0)
+                            (>= $outside-nontarget 0)))))))))
+     (if $valid
+         (Contingency $joint-support $antecedent-nontarget
+                      $outside-target $outside-nontarget)
+         (empty))))
+
+(= (recommendation-information-cell $cell $row $column $total)
+   (if (<= $cell 0)
+       0.0
+       (* (// $cell $total)
+          (log-math 2.0 (// (* $cell $total) (* $row $column))))))
+
+(= (recommendation-target-metrics-with-support
+      $pattern $db $joint-support $target-value $evidence-k)
+   (let (Contingency $n11 $n10 $n01 $n00)
+        (recommendation-contingency-with-support
+          $pattern $db $joint-support $target-value)
+     (let* (($n-a (+ $n11 $n10))
+            ($n-not-a (+ $n01 $n00))
+            ($n-y (+ $n11 $n01))
+            ($n-not-y (+ $n10 $n00))
+            ($n (+ $n-a $n-not-a))
+            ($true-positive-rate (// $n11 $n-y))
+            ($false-positive-rate (// $n10 $n-not-y))
+            ($youden-j (- $true-positive-rate $false-positive-rate))
+            ($auc (+ 0.5 (* 0.5 $youden-j)))
+            ($auc-gain (- $auc 0.5))
+            ($wracc (- (// $n11 $n)
+                       (// (* $n-a $n-y) (* $n $n))))
+            ($information-gain
+              (+
+                (recommendation-information-cell $n11 $n-a $n-y $n)
+                (+
+                  (recommendation-information-cell $n10 $n-a $n-not-y $n)
+                  (+
+                    (recommendation-information-cell $n01 $n-not-a $n-y $n)
+                    (recommendation-information-cell
+                      $n00 $n-not-a $n-not-y $n)))))
+            ($smoothed-odds-ratio
+              (// (* (+ $n11 0.5) (+ $n00 0.5))
+                  (* (+ $n10 0.5) (+ $n01 0.5))))
+            ($log-odds (log-math 2.718281828459045 $smoothed-odds-ratio))
+            ($ctv (recommendation-ctv-with-support
+                    $pattern $db $joint-support $target-value $evidence-k)))
+       (TargetMetrics
+         $ctv
+         (Contingency $n11 $n10 $n01 $n00)
+         (AUC $auc)
+         (AUC-Gain $auc-gain)
+         (Youden-J $youden-j)
+         (WRAcc $wracc)
+         (Information-Gain $information-gain)
+         (Log-Odds $log-odds)))))
+
 
 (= (sup-eval $db $pattern $minSup)
     (let $matches (collapse (match $db $pattern $pattern))

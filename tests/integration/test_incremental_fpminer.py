@@ -142,6 +142,51 @@ class IncrementalFpMinerPeTTaIntegrationTest(unittest.TestCase):
         self.assertEqual(rebuilt.audit.changed_cases, 1)
         self.assertEqual(self.parsed(rebuilt.output), self.parsed(self.full_reference(2)))
 
+    def test_target_metrics_and_auc_gate_are_computed_by_petta(self):
+        cases = {
+            "c1": closed_case("c1", "news", "long", "click"),
+            "c2": closed_case("c2", "news", "long", "click"),
+            "c3": closed_case("c3", "news", "short", "skip"),
+            "c4": closed_case("c4", "sports", "short", "skip"),
+        }
+        self.replace_full_space(cases)
+        raw = self.petta.process_metta_string(
+            f'!(target-aware-frequency-pattern-miner {self.space} '
+            '1 2 "click" 2.0 0.3)'
+        )
+        text = " ".join(map(str, raw))
+        self.assertIn('(format ', text)
+        self.assertIn('(AUC 1.0)', text)
+        self.assertIn('(Contingency 2 0 0 2)', text)
+        self.assertIn('(Information-Gain 1.0)', text)
+        # Topic has AUC 0.75 (gain 0.25), so the symbolic gate excludes it.
+        self.assertNotIn('(topic ', text)
+
+        # Here neither unary parent predicts the target, but their conjunction
+        # does. The conditional miner must calculate and gate that incremental
+        # precision inside PeTTa.
+        conditional_cases = {
+            "c1": closed_case("c1", "news", "long", "click"),
+            "c2": closed_case("c2", "sports", "long", "skip"),
+            "c3": closed_case("c3", "news", "short", "skip"),
+            "c4": closed_case("c4", "sports", "short", "click"),
+        }
+        self.replace_full_space(conditional_cases)
+        conditional = self.petta.process_metta_string(
+            f'!(conditional-target-aware-frequency-pattern-miner {self.space} '
+            '1 (format) (topic) "click" 2.0 0.0 0.0)'
+        )
+        conditional_text = " ".join(map(str, conditional))
+        self.assertIn('(format ', conditional_text)
+        self.assertIn('(topic ', conditional_text)
+        self.assertIn('(AUC 0.75)', conditional_text)
+        self.assertIn('(Incremental-Precision ', conditional_text)
+        rejected = self.petta.process_metta_string(
+            f'!(conditional-target-aware-frequency-pattern-miner {self.space} '
+            '1 (format) (topic) "click" 2.0 0.0 0.5)'
+        )
+        self.assertNotIn('(targetScoreOf ', " ".join(map(str, rejected)))
+
 
 if __name__ == "__main__":
     unittest.main()
