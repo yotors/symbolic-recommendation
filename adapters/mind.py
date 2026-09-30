@@ -37,6 +37,7 @@ import gzip
 import hashlib
 import heapq
 import io
+import itertools
 import json
 import math
 import random
@@ -61,7 +62,8 @@ NEWS_COLUMNS = 8
 BEHAVIOR_COLUMNS = 5
 DEFAULT_MAX_TRAIN_CASES = 5_000
 DEFAULT_MAX_EVAL_IMPRESSIONS = 500
-_RECZOO_CACHE_VERSION = "whole-impression-text-semantic-attention-v13"
+_RECZOO_HISTORY_LIMIT = 50
+_RECZOO_CACHE_VERSION = "whole-impression-full-stream-causal-v17"
 _TIME_FORMATS = (
     "%m/%d/%Y %I:%M:%S %p",  # MIND-small/full canonical format
     "%m/%d/%Y %H:%M:%S",
@@ -93,6 +95,41 @@ class HistoryFeatureWorkspace:
     recent_subcategories: tuple[str, ...]
     multi_interest: PreparedMultiInterestHistory
     text_semantic: PreparedSemanticHistory
+
+
+@dataclass(frozen=True)
+class _OfficialBehaviorRecord:
+    """One authoritative row from an official MIND ``behaviors.tsv``."""
+
+    line_number: int
+    impression_id: str
+    user_id: str
+    timestamp: datetime
+    history: tuple[str, ...]
+    candidates: tuple[tuple[str, int], ...]
+
+
+def _training_behavior_identity_digest(
+    impression_id: str,
+    user_id: str,
+    hour: int,
+    history: Iterable[str],
+    candidates: Iterable[tuple[str, int]],
+) -> str:
+    """Canonical identity shared by RecZoo and official training rows."""
+
+    payload = {
+        "schema": "mind-training-impression-identity-v1",
+        "impression_id": str(impression_id),
+        "user_id": str(user_id),
+        "hour": int(hour),
+        "history_tail_50": tuple(history)[-_RECZOO_HISTORY_LIMIT:],
+        "candidates": tuple((str(article), int(label))
+                            for article, label in candidates),
+    }
+    return hashlib.sha256(json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    ).encode("utf-8")).hexdigest()
 
 # Deliberately fixed, low-cardinality thresholds.  Keeping them here makes the
 # experiment reproducible and prevents the miner vocabulary growing with raw
@@ -536,6 +573,15 @@ def _positive_limit(name: str, value: int | None) -> int | None:
     return value
 
 
+def _source_sha256(path: Path) -> str:
+    source = path / "behaviors.tsv" if path.is_dir() else path
+    digest = hashlib.sha256()
+    with source.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def _parse_time(raw: str, path: Path, line_number: int) -> datetime:
     value = raw.strip()
     for fmt in _TIME_FORMATS:
@@ -823,6 +869,220 @@ def _behavior_rows(path: Path):
                 raw_history.split(),
                 _parse_impressions(raw_impressions, path, line_number),
             )
+
+
+def _official_behavior_rows(path: Path):
+    """Yield authoritative behavior rows from a file, directory, or zip.
+
+    The RecZoo projection intentionally retains only hour-of-day.  This reader
+    supplies full timestamps from the official five-column MIND behavior file;
+    it never treats archive order or impression identifiers as chronology.
+    """
+
+    def parsed(handle, source: Path):
+        reader = csv.reader(handle, delimiter="\t", quoting=csv.QUOTE_NONE)
+        for line_number, row in enumerate(reader, 1):
+            if not row or not any(field.strip() for field in row):
+                continue
+            if len(row) != BEHAVIOR_COLUMNS:
+                raise MindDataError(
+                    f"{source}:{line_number}: expected {BEHAVIOR_COLUMNS} "
+                    f"behavior columns, got {len(row)}"
+                )
+            impression_id, source_user, raw_time, raw_history, raw_impressions = row
+            if not impression_id.strip() or not source_user.strip():
+                raise MindDataError(
+                    f"{source}:{line_number}: empty impression or user ID"
+                )
+            yield _OfficialBehaviorRecord(
+                line_number=line_number,
+                impression_id=impression_id.strip(),
+                user_id=source_user.strip(),
+                timestamp=_parse_time(raw_time, source, line_number),
+                history=tuple(raw_history.split()),
+                candidates=tuple(_parse_impressions(
+                    raw_impressions, source, line_number
+                )),
+            )
+
+    if path.is_dir():
+        source = path / "behaviors.tsv"
+        if not source.is_file():
+            raise MindDataError(
+                f"Official MIND directory has no behaviors.tsv: {path}"
+            )
+        with source.open("r", encoding="utf-8-sig", newline="") as handle:
+            yield from parsed(handle, source)
+        return
+    if not path.is_file():
+        raise MindDataError(f"Official MIND behavior source does not exist: {path}")
+    if path.suffix.casefold() != ".zip":
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            yield from parsed(handle, path)
+        return
+    try:
+        with zipfile.ZipFile(path) as archive:
+            matches = [
+                name for name in archive.namelist()
+                if Path(name).name.casefold() == "behaviors.tsv"
+                and not name.endswith("/")
+            ]
+            if len(matches) != 1:
+                raise MindDataError(
+                    f"Official MIND archive must contain exactly one "
+                    f"behaviors.tsv, found {len(matches)}: {path}"
+                )
+            source = Path(f"{path}!{matches[0]}")
+            with archive.open(matches[0]) as binary, io.TextIOWrapper(
+                binary, encoding="utf-8-sig", newline=""
+            ) as handle:
+                yield from parsed(handle, source)
+    except zipfile.BadZipFile as exc:
+        raise MindDataError(f"Invalid official MIND zip archive: {path}") from exc
+
+
+def _select_official_behavior_cohort(
+    path: Path,
+    *,
+    train_users: set[str],
+    max_users: int,
+    cohort: str,
+    seed: int,
+) -> tuple[dict[str, _OfficialBehaviorRecord], set[str], dict[str, Any]]:
+    """Select complete repeated-user sequences without consulting outcomes."""
+
+    if cohort not in {"all", "unseen", "seen"}:
+        raise ValueError("eval_user_cohort must be one of: all, unseen, seen")
+    by_user: dict[str, list[tuple[str, datetime, int, int]]] = defaultdict(list)
+    seen_impressions: set[str] = set()
+    total = 0
+    for record in _official_behavior_rows(path):
+        if record.impression_id in seen_impressions:
+            raise MindDataError(
+                "Official MIND behavior source contains duplicate impression "
+                f"ID {record.impression_id!r}"
+            )
+        seen_impressions.add(record.impression_id)
+        by_user[record.user_id].append((
+            record.impression_id,
+            record.timestamp,
+            record.line_number,
+            len(record.candidates),
+        ))
+        total += 1
+
+    def eligible(user: str, rows: list[tuple[str, datetime, int, int]]) -> bool:
+        if len({timestamp for _identity, timestamp, _line, _size in rows}) < 2:
+            return False
+        if cohort == "unseen" and user in train_users:
+            return False
+        if cohort == "seen" and user not in train_users:
+            return False
+        return True
+
+    eligible_users = [
+        user for user, rows in by_user.items() if eligible(user, rows)
+    ]
+    eligible_users.sort(key=lambda user: (
+        int.from_bytes(hashlib.sha256(
+            f"{seed}\0valid-user\0{cohort}\0{user}".encode("utf-8")
+        ).digest(), "big"),
+        user,
+    ))
+    selected_users = set(eligible_users[:max_users])
+    selected_ids = {
+        impression_id
+        for user in selected_users
+        for impression_id, _timestamp, _line, _size in by_user[user]
+    }
+    selected: dict[str, _OfficialBehaviorRecord] = {}
+    # A second bounded pass avoids retaining all 2.74M candidate tokens merely
+    # to choose users. Only complete selected sequences survive in memory.
+    for record in _official_behavior_rows(path):
+        if record.impression_id in selected_ids:
+            selected[record.impression_id] = record
+    missing = selected_ids.difference(selected)
+    if missing:
+        raise MindDataError(
+            "Official MIND behavior cohort changed between validation passes: "
+            + ", ".join(sorted(missing)[:5])
+        )
+    return selected, selected_users, {
+        "official_impressions": total,
+        "official_users": len(by_user),
+        "eligible_repeated_users": len(eligible_users),
+        "selected_users": len(selected_users),
+        "selected_impressions": len(selected),
+        "selected_histories_truncated_by_reczoo": sum(
+            len(record.history) > _RECZOO_HISTORY_LIMIT
+            for record in selected.values()
+        ),
+        "history_projection": "ordered tail 50 articles",
+        "cohort": cohort,
+        "selection": "seeded hash-priority complete users; outcomes excluded",
+    }
+
+
+def _select_official_behavior_records(
+    path: Path,
+    impression_ids: set[str],
+) -> tuple[
+    dict[str, _OfficialBehaviorRecord],
+    tuple[_OfficialBehaviorRecord, ...],
+    dict[str, Any],
+]:
+    """Return an exact, audited official companion for selected impressions.
+
+    Training sampling happens against the RecZoo projection before this join,
+    so the companion cannot influence which labels or impressions are kept.
+    The full official source is nevertheless scanned for duplicate identities;
+    a missing or ambiguous selected identity fails closed.
+    """
+
+    selected: dict[str, _OfficialBehaviorRecord] = {}
+    population: list[_OfficialBehaviorRecord] = []
+    seen_impressions: set[str] = set()
+    total = 0
+    source_order_inversions = 0
+    previous_timestamp: datetime | None = None
+    for record in _official_behavior_rows(path):
+        if record.impression_id in seen_impressions:
+            raise MindDataError(
+                "Official MIND behavior source contains duplicate impression "
+                f"ID {record.impression_id!r}"
+            )
+        seen_impressions.add(record.impression_id)
+        if (previous_timestamp is not None
+                and record.timestamp < previous_timestamp):
+            source_order_inversions += 1
+        previous_timestamp = record.timestamp
+        total += 1
+        population.append(record)
+        if record.impression_id in impression_ids:
+            selected[record.impression_id] = record
+    missing = impression_ids.difference(selected)
+    if missing:
+        raise MindDataError(
+            "Selected RecZoo impressions are absent from the official MIND "
+            "behavior source: " + ", ".join(sorted(missing)[:5])
+        )
+    population.sort(key=lambda item: (
+        item.timestamp, item.line_number, item.impression_id
+    ))
+    return selected, tuple(population), {
+        "official_impressions": total,
+        "selected_impressions": len(selected),
+        "selected_histories_truncated_by_reczoo": sum(
+            len(record.history) > _RECZOO_HISTORY_LIMIT
+            for record in selected.values()
+        ),
+        "history_projection": "ordered tail 50 articles",
+        "source_order_timestamp_inversions": source_order_inversions,
+        "selection": (
+            "RecZoo hash-priority sample joined by exact impression identity; "
+            "outcomes excluded from selection"
+        ),
+    }
 
 
 def _topic_list(article_ids: Iterable[str], news: dict[str, dict[str, Any]]) -> list[str]:
@@ -1299,6 +1559,10 @@ def _load_reczoo_archive(
     max_eval_impressions: int | None,
     seed: int,
     text_embedding_path: Path | None = None,
+    training_behaviors_path: Path | None = None,
+    evaluation_behaviors_path: Path | None = None,
+    max_eval_users: int | None = None,
+    eval_user_cohort: str = "all",
 ) -> dict[str, Any]:
     """Load the 8.58M-row public MIND-small projection without extracting 6.3 GB.
 
@@ -1309,6 +1573,12 @@ def _load_reczoo_archive(
     the complete scanned training population. Passing ``None`` retains the
     complete respective split.
     """
+
+    if training_behaviors_path is not None and max_train_cases is None:
+        raise ValueError(
+            "max_train_cases must be bounded when joining a RecZoo training "
+            "projection to official timestamps"
+        )
 
     try:
         archive = zipfile.ZipFile(path)
@@ -1351,6 +1621,9 @@ def _load_reczoo_archive(
         exposure_sequence = 0
         train_interactions_scanned = 0
         train_impressions_scanned = 0
+        train_source_users: set[str] = set()
+        reczoo_training_impression_digests: dict[str, str] = {}
+        official_train_audit: dict[str, Any] | None = None
 
         def projected_article_id(source_id: str) -> str:
             article = news.get(source_id)
@@ -1374,7 +1647,10 @@ def _load_reczoo_archive(
             group_id: str | None = None
             group_start = 0
 
-            def append_training_group(selected_group: list[dict[str, Any]]) -> None:
+            def append_training_group(
+                selected_group: list[dict[str, Any]],
+                official: _OfficialBehaviorRecord | None = None,
+            ) -> None:
                 first = selected_group[0]["row"]
                 source_user = first["user_id"]
                 source_impression = first["imp_id"]
@@ -1417,8 +1693,9 @@ def _load_reczoo_archive(
                         title_idf_model,
                     )
                     # This value was captured from counters frozen before the
-                    # complete impression.  Never replace it with the later
-                    # full-training model used by validation/live serving.
+                    # complete impression.  Never replace it with the final
+                    # retained-population model used by validation/live
+                    # serving.
                     context["recent_subcategory_transition_score"]=(
                         item["prior_transition_score"]
                     )
@@ -1430,7 +1707,19 @@ def _load_reczoo_archive(
                         "action": "click" if item["label"] else "skip",
                         "impression": safe_impression,
                         "source_impression_id": source_impression,
-                        "timestamp": f"train-row-{item['row_number']:09d}",
+                        "timestamp": (
+                            official.timestamp.isoformat()
+                            if official is not None else
+                            f"train-row-{item['row_number']:09d}"
+                        ),
+                        "timestamp_source": (
+                            "official_mind_behaviors"
+                            if official is not None else "reczoo_source_row"
+                        ),
+                        "source_line_number": (
+                            official.line_number
+                            if official is not None else item["row_number"]
+                        ),
                         "hour": row["hour"],
                         "position": item["position"],
                         **context,
@@ -1446,10 +1735,30 @@ def _load_reczoo_archive(
                 train_impressions_scanned += 1
                 first = group[0]["row"]
                 source_user = first["user_id"]
+                source_impression = str(first["imp_id"])
                 if any(item["row"]["user_id"] != source_user for item in group):
                     raise MindDataError(
                         f"train.csv:{group_start}: impression {group_id} contains multiple users"
                     )
+                behavior_digest = _training_behavior_identity_digest(
+                    source_impression,
+                    source_user,
+                    _hour_value(first.get("hour")),
+                    _caret_values(first.get("news_his", "")),
+                    ((item["row"]["news_id"], int(item["row"]["click"]))
+                     for item in group),
+                )
+                previous_digest = reczoo_training_impression_digests.get(
+                    source_impression
+                )
+                if previous_digest is not None:
+                    raise MindDataError(
+                        "train.csv contains a duplicate/non-contiguous "
+                        f"impression ID {source_impression!r}"
+                    )
+                reczoo_training_impression_digests[
+                    source_impression
+                ] = behavior_digest
                 safe_user = safe_metta_symbol(source_user, "user")
                 incoming = Counter(
                     news[source_id]["topic"]
@@ -1543,6 +1852,7 @@ def _load_reczoo_archive(
                 group = []
 
             for row_number, row in enumerate(rows, 2):
+                train_source_users.add(row["user_id"])
                 source_article = row["news_id"]
                 article = news.get(source_article)
                 if article is None:
@@ -1628,10 +1938,324 @@ def _load_reczoo_archive(
 
             if max_train_cases is not None:
                 chosen_train = [(entry[2], entry[3]) for entry in sampled_train]
-                for _start, selected_group in sorted(
-                    chosen_train, key=lambda item: item[0]
-                ):
-                    append_training_group(selected_group)
+                if training_behaviors_path is not None:
+                    selected_ids = {
+                        str(selected_group[0]["row"]["imp_id"])
+                        for _start, selected_group in chosen_train
+                    }
+                    (official_train_records,
+                     official_training_population,
+                     official_train_audit) = (
+                        _select_official_behavior_records(
+                            training_behaviors_path, selected_ids
+                        )
+                    )
+                    official_population_ids = {
+                        record.impression_id
+                        for record in official_training_population
+                    }
+                    if (len(official_training_population)
+                            != train_impressions_scanned
+                            or official_population_ids
+                            != set(reczoo_training_impression_digests)):
+                        raise MindDataError(
+                            "Official/RecZoo training populations contain "
+                            "different impression identities"
+                        )
+                    for official in official_training_population:
+                        official_digest = _training_behavior_identity_digest(
+                            official.impression_id,
+                            official.user_id,
+                            official.timestamp.hour,
+                            official.history,
+                            official.candidates,
+                        )
+                        if (official_digest
+                                != reczoo_training_impression_digests[
+                                    official.impression_id
+                                ]):
+                            raise MindDataError(
+                                "Official/RecZoo training mismatch for "
+                                f"impression {official.impression_id!r}: "
+                                "ordered candidates/labels, user, history, "
+                                "or hour"
+                            )
+                    population_hasher = hashlib.sha256()
+                    for impression_id in sorted(
+                            reczoo_training_impression_digests):
+                        population_hasher.update(impression_id.encode("utf-8"))
+                        population_hasher.update(b"\0")
+                        population_hasher.update(
+                            reczoo_training_impression_digests[
+                                impression_id
+                            ].encode("ascii")
+                        )
+                        population_hasher.update(b"\n")
+                    official_train_audit.update({
+                        "population_identity_schema": (
+                            "mind-training-impression-identity-v1"
+                        ),
+                        "population_identity_sha256": (
+                            population_hasher.hexdigest()
+                        ),
+                        "population_identity_verified": True,
+                    })
+                    joined_train = []
+                    for start, selected_group in chosen_train:
+                        first = selected_group[0]["row"]
+                        source_impression = str(first["imp_id"])
+                        official = official_train_records[source_impression]
+                        reczoo_history = tuple(_caret_values(
+                            first.get("news_his", "")
+                        ))
+                        reczoo_candidates = tuple(
+                            (item["row"]["news_id"], int(item["row"]["click"]))
+                            for item in selected_group
+                        )
+                        mismatches = []
+                        if any(
+                            tuple(_caret_values(item["row"].get(
+                                "news_his", ""
+                            ))) != reczoo_history
+                            or item["row"].get("hour") != first.get("hour")
+                            for item in selected_group
+                        ):
+                            mismatches.append("internally consistent history/hour")
+                        if first["user_id"] != official.user_id:
+                            mismatches.append("user")
+                        if reczoo_history != official.history[
+                            -_RECZOO_HISTORY_LIMIT:
+                        ]:
+                            mismatches.append("ordered history")
+                        if reczoo_candidates != official.candidates:
+                            mismatches.append("ordered candidates/labels")
+                        if _hour_value(first.get("hour")) != official.timestamp.hour:
+                            mismatches.append("hour")
+                        if mismatches:
+                            raise MindDataError(
+                                "Official/RecZoo training mismatch for impression "
+                                f"{source_impression!r}: {', '.join(mismatches)}"
+                            )
+                        joined_train.append((
+                            official.timestamp,
+                            official.line_number,
+                            start,
+                            selected_group,
+                            official,
+                        ))
+                    ordered_train = sorted(joined_train)
+                    selected_groups_by_impression = {
+                        str(selected_group[0]["row"]["imp_id"]): selected_group
+                        for _start, selected_group in chosen_train
+                    }
+
+                    # RecZoo rows do not provide a wall-clock ordering.  The
+                    # source-order priors captured while scanning train.csv
+                    # are therefore invalid. Replay the complete official
+                    # training stream from an empty state in wall-clock time,
+                    # but materialize feature snapshots only for the bounded
+                    # mining sample. This is the production analogue: every
+                    # preceding exposure updates state even when it is not
+                    # selected as a miner case. All impressions at one
+                    # timestamp observe the same frozen state; their outcomes
+                    # become visible only to a later timestamp.
+                    replay_exposures: Counter[str] = Counter()
+                    replay_clicks: Counter[str] = Counter()
+                    replay_first_seen: dict[str, int] = {}
+                    replay_sequence = 0
+                    replay_candidate_exposures: Counter[str] = Counter()
+                    replay_candidate_clicks: Counter[str] = Counter()
+                    replay_transition_exposures: Counter[
+                        tuple[str, str]
+                    ] = Counter()
+                    replay_transition_clicks: Counter[
+                        tuple[str, str]
+                    ] = Counter()
+                    replay_global_exposures = 0
+                    replay_global_clicks = 0
+
+                    for _timestamp, timestamp_entries in itertools.groupby(
+                        official_training_population,
+                        key=lambda entry: entry.timestamp,
+                    ):
+                        batch = list(timestamp_entries)
+                        batch_start_sequence = replay_sequence
+
+                        # Capture every feature before revealing any outcome
+                        # from this timestamp group.
+                        prior_global_rate = (
+                            replay_global_clicks / replay_global_exposures
+                            if replay_global_exposures else 0.0
+                        )
+                        for official in batch:
+                            selected_group = selected_groups_by_impression.get(
+                                official.impression_id
+                            )
+                            if selected_group is None:
+                                continue
+                            for item in selected_group:
+                                source_id = item["source_article"]
+                                item["prior_exposures"] = replay_exposures[
+                                    source_id
+                                ]
+                                item["prior_clicks"] = replay_clicks[source_id]
+                                item["prior_first_seen"] = (
+                                    replay_first_seen.get(source_id)
+                                )
+                                item["prior_sequence"] = replay_sequence
+
+                                candidate = item["candidate_subcategory"]
+                                candidate_exposures = (
+                                    replay_candidate_exposures[candidate]
+                                )
+                                candidate_score = (
+                                    replay_candidate_clicks[candidate]
+                                    + 20.0 * prior_global_rate
+                                ) / (candidate_exposures + 20.0)
+                                transition_scores = [candidate_score]
+                                for history_subcategory in item[
+                                    "recent_subcategories"
+                                ]:
+                                    key = (history_subcategory, candidate)
+                                    transition_scores.append((
+                                        replay_transition_clicks[key]
+                                        + 10.0 * candidate_score
+                                    ) / (
+                                        replay_transition_exposures[key] + 10.0
+                                    ))
+                                item["prior_transition_score"] = round(
+                                    max(transition_scores), 8
+                                )
+
+                        # Apply the complete timestamp group only after all of
+                        # its candidate snapshots have been captured.
+                        for official in batch:
+                            recent_subcategories = tuple(dict.fromkeys(
+                                news[source_id]["subcategory"]
+                                for source_id in official.history[-5:]
+                                if source_id in news
+                            ))
+                            for source_id, label in official.candidates:
+                                article = news.get(source_id)
+                                if article is None:
+                                    raise MindDataError(
+                                        "Official MIND training behavior "
+                                        f"{official.impression_id!r} references "
+                                        f"unknown news ID {source_id!r}"
+                                    )
+                                candidate = article["subcategory"]
+                                replay_first_seen.setdefault(
+                                    source_id, batch_start_sequence
+                                )
+                                replay_exposures[source_id] += 1
+                                replay_clicks[source_id] += label
+                                replay_candidate_exposures[candidate] += 1
+                                replay_candidate_clicks[candidate] += label
+                                replay_global_exposures += 1
+                                replay_global_clicks += label
+                                for history_subcategory in recent_subcategories:
+                                    key = (history_subcategory, candidate)
+                                    replay_transition_exposures[key] += 1
+                                    replay_transition_clicks[key] += label
+                                replay_sequence += 1
+
+                    # Training snapshots and validation/live priors now share
+                    # one causal state definition: all official interactions
+                    # preceding the scoring time. The bounded hash sample
+                    # controls miner cost only; it does not erase observations
+                    # from the online state that produced those features.
+                    train_exposures.clear()
+                    train_exposures.update(replay_exposures)
+                    train_clicks.clear()
+                    train_clicks.update(replay_clicks)
+                    first_seen.clear()
+                    first_seen.update(replay_first_seen)
+                    exposure_sequence = replay_sequence
+                    transition_candidate_exposures.clear()
+                    transition_candidate_exposures.update(
+                        replay_candidate_exposures
+                    )
+                    transition_candidate_clicks.clear()
+                    transition_candidate_clicks.update(
+                        replay_candidate_clicks
+                    )
+                    transition_exposures.clear()
+                    transition_exposures.update(replay_transition_exposures)
+                    transition_clicks.clear()
+                    transition_clicks.update(replay_transition_clicks)
+                    transition_global_exposures = replay_global_exposures
+                    transition_global_clicks = replay_global_clicks
+                    if replay_sequence != train_interactions_scanned:
+                        raise MindDataError(
+                            "Official/RecZoo training populations contain "
+                            "different candidate counts"
+                        )
+
+                    replay_global_rate = (
+                        replay_global_clicks / replay_global_exposures
+                        if replay_global_exposures else 0.0
+                    )
+                    replay_candidate_scores = {
+                        candidate: (
+                            replay_candidate_clicks[candidate]
+                            + 20.0 * replay_global_rate
+                        ) / (exposures + 20.0)
+                        for candidate, exposures
+                        in replay_candidate_exposures.items()
+                    }
+                    replay_transition_scores: dict[
+                        str, dict[str, float]
+                    ] = defaultdict(dict)
+                    for (
+                        history_subcategory, candidate
+                    ), exposures in replay_transition_exposures.items():
+                        backoff = replay_candidate_scores.get(
+                            candidate, replay_global_rate
+                        )
+                        replay_transition_scores[history_subcategory][
+                            candidate
+                        ] = round((
+                            replay_transition_clicks[
+                                (history_subcategory, candidate)
+                            ] + 10.0 * backoff
+                        ) / (exposures + 10.0), 8)
+                    subcategory_transition_model.clear()
+                    subcategory_transition_model.update({
+                        "global": round(replay_global_rate, 8),
+                        "candidate": {
+                            key: round(value, 8)
+                            for key, value in replay_candidate_scores.items()
+                        },
+                        "transition": dict(replay_transition_scores),
+                    })
+
+                    official_train_audit.update({
+                        "feature_replay_population": (
+                            "complete official training behavior stream"
+                        ),
+                        "feature_replay_interactions": replay_sequence,
+                        "materialized_training_interactions": sum(
+                            len(selected_group)
+                            for selected_group
+                            in selected_groups_by_impression.values()
+                        ),
+                        "feature_replay_order": (
+                            "official timestamp; equal timestamps share one "
+                            "frozen pre-outcome state"
+                        ),
+                        "evaluation_prior_population": (
+                            "complete official training behavior stream"
+                        ),
+                    })
+                    del official_training_population
+                    for (_timestamp, _line_number, _start,
+                         selected_group, official) in ordered_train:
+                        append_training_group(selected_group, official)
+                else:
+                    for _start, selected_group in sorted(
+                        chosen_train, key=lambda item: item[0]
+                    ):
+                        append_training_group(selected_group)
 
         finally:
             text.close()
@@ -1639,6 +2263,29 @@ def _load_reczoo_archive(
 
         eval_interactions_scanned = 0
         eval_impressions_scanned = 0
+        official_records: dict[str, _OfficialBehaviorRecord] = {}
+        official_selected_users: set[str] = set()
+        official_audit: dict[str, Any] | None = None
+        official_seen: set[str] = set()
+        if evaluation_behaviors_path is not None:
+            if max_eval_users is None:
+                raise ValueError(
+                    "max_eval_users is required with evaluation_behaviors_path"
+                )
+            official_records, official_selected_users, official_audit = (
+                _select_official_behavior_cohort(
+                    evaluation_behaviors_path,
+                    train_users=train_source_users,
+                    max_users=max_eval_users,
+                    cohort=eval_user_cohort,
+                    seed=seed,
+                )
+            )
+            if not official_records:
+                raise MindDataError(
+                    "Official MIND behavior source produced no eligible "
+                    "repeated-user evaluation cohort"
+                )
         binary, text, rows = _reczoo_reader(archive, "valid.csv")
         try:
             sampled_eval: list[
@@ -1649,7 +2296,8 @@ def _load_reczoo_archive(
             group_start = 0
 
             def append_validation_group(
-                selected_group: list[tuple[int, dict[str, str]]]
+                selected_group: list[tuple[int, dict[str, str]]],
+                official: _OfficialBehaviorRecord | None = None,
             ) -> None:
                 first = selected_group[0][1]
                 source_user = first["user_id"]
@@ -1685,7 +2333,7 @@ def _load_reczoo_archive(
                     referenced_articles.add(article_id)
                     if row["click"] == "1":
                         relevant.append(article_id)
-                if not relevant:
+                if not relevant and official is None:
                     return
                 incoming = Counter(
                     news[source_id]["topic"]
@@ -1699,7 +2347,19 @@ def _load_reczoo_archive(
                     "source_impression_id": source_impression,
                     "user": safe_user,
                     "source_user_id": source_user,
-                    "timestamp": f"valid-row-{selected_group[0][0]:09d}",
+                    "timestamp": (
+                        official.timestamp.isoformat()
+                        if official is not None else
+                        f"valid-row-{selected_group[0][0]:09d}"
+                    ),
+                    "timestamp_source": (
+                        "official_mind_behaviors"
+                        if official is not None else "reczoo_source_row"
+                    ),
+                    "source_line_number": (
+                        official.line_number
+                        if official is not None else selected_group[0][0]
+                    ),
                     "hour": first["hour"],
                     "history": [
                         projected_article_id(source_id)
@@ -1739,6 +2399,49 @@ def _load_reczoo_archive(
                         raise MindDataError(
                             f"valid.csv:{row_number}: invalid click label {label!r}"
                         )
+                    if (row.get("news_his", "") != first.get("news_his", "")
+                            or row.get("hour") != first.get("hour")):
+                        raise MindDataError(
+                            f"valid.csv:{row_number}: impression {group_id} "
+                            "contains inconsistent history or hour"
+                        )
+                if official_records:
+                    official = official_records.get(str(group_id))
+                    if source_user in official_selected_users and official is None:
+                        raise MindDataError(
+                            "RecZoo validation contains an unpaired impression "
+                            f"for selected user {source_user!r}: {group_id!r}"
+                        )
+                    if official is None:
+                        group = []
+                        return
+                    reczoo_history = tuple(_caret_values(
+                        first.get("news_his", "")
+                    ))
+                    reczoo_candidates = tuple(
+                        (row["news_id"], int(row["click"]))
+                        for _row_number, row in group
+                    )
+                    mismatches = []
+                    if source_user != official.user_id:
+                        mismatches.append("user")
+                    if reczoo_history != official.history[
+                        -_RECZOO_HISTORY_LIMIT:
+                    ]:
+                        mismatches.append("ordered history")
+                    if reczoo_candidates != official.candidates:
+                        mismatches.append("ordered candidates/labels")
+                    if _hour_value(first.get("hour")) != official.timestamp.hour:
+                        mismatches.append("hour")
+                    if mismatches:
+                        raise MindDataError(
+                            "Official/RecZoo validation mismatch for impression "
+                            f"{group_id!r}: {', '.join(mismatches)}"
+                        )
+                    official_seen.add(str(group_id))
+                    append_validation_group(group, official)
+                    group = []
+                    return
                 if not any(row["click"] == "1" for _row_number, row in group):
                     group = []
                     return
@@ -1777,6 +2480,35 @@ def _load_reczoo_archive(
             text.close()
             binary.close()
 
+        if official_records:
+            missing_official = set(official_records).difference(official_seen)
+            if missing_official:
+                raise MindDataError(
+                    "Selected official MIND impressions are absent from RecZoo: "
+                    + ", ".join(sorted(missing_official)[:5])
+                )
+            selected_tests.sort(key=lambda case: (
+                str(case["source_user_id"]),
+                str(case["timestamp"]),
+                int(case["source_line_number"]),
+            ))
+            for _user, user_cases in itertools.groupby(
+                selected_tests, key=lambda case: case["source_user_id"]
+            ):
+                sequence = list(user_cases)
+                timestamp_group = -1
+                previous_timestamp = None
+                for sequence_index, case in enumerate(sequence):
+                    if case["timestamp"] != previous_timestamp:
+                        timestamp_group += 1
+                        previous_timestamp = case["timestamp"]
+                    case["user_sequence_index"] = sequence_index
+                    case["user_timestamp_group"] = timestamp_group
+                first_case = sequence[0]
+                profile_histories[first_case["user"]] = list(
+                    first_case.get("history", ())
+                )
+
     if not selected_events:
         raise MindDataError("train.csv contains no selected training cases")
     if not selected_tests:
@@ -1789,12 +2521,17 @@ def _load_reczoo_archive(
         recent_by_user[event["user"]] = list(
             event.get("recent_history_subcategories", [])
         )[-5:]
+    official_recent_users: set[str] = set()
     for test in selected_tests:
+        if (official_audit is not None
+                and test["user"] in official_recent_users):
+            continue
         recent_by_user[test["user"]] = [
             article_by_safe_id[article_id]["subcategory"]
             for article_id in test.get("history", [])
             if article_id in article_by_safe_id
         ][-5:]
+        official_recent_users.add(test["user"])
     users = {
         user: {
             "topics":[topic for topic, _ in sorted(
@@ -1828,7 +2565,42 @@ def _load_reczoo_archive(
             "projection": "RecZoo MIND_small_x1",
             "root": str(path),
             "seed": seed,
-            "sampling": "seeded hash-priority whole impressions",
+            "sampling": (
+                "seeded hash-priority complete repeated-user sequences"
+                if official_audit is not None else
+                "seeded hash-priority whole impressions"
+            ),
+            "training_chronology": (
+                "selected RecZoo impressions exact-joined to official MIND "
+                "behaviors.tsv and ordered by timestamp; equal timestamps "
+                "retain official line order"
+                if official_train_audit is not None else
+                "RecZoo source-row order only; not wall-clock chronology"
+            ),
+            "training_feature_chronology": (
+                "CTR, freshness, and recent-subcategory transition contexts "
+                "are replayed over the complete official training population in "
+                "official timestamp order; equal timestamps share one frozen "
+                "pre-outcome state"
+                if official_train_audit is not None else
+                "RecZoo source-row pre-impression snapshots"
+            ),
+            "evaluation_chronology": (
+                "official MIND behaviors.tsv timestamp; equal timestamps are "
+                "one simultaneous update group"
+                if official_audit is not None else
+                "RecZoo source-row order only; not wall-clock chronology"
+            ),
+            "official_behavior_source": (
+                str(evaluation_behaviors_path)
+                if evaluation_behaviors_path is not None else None
+            ),
+            "official_behavior_join": official_audit,
+            "official_training_behavior_source": (
+                str(training_behaviors_path)
+                if training_behaviors_path is not None else None
+            ),
+            "official_training_behavior_join": official_train_audit,
             "source_train_interactions": 5_843_444,
             "source_eval_interactions": 2_740_998,
             "train_interactions_scanned": train_interactions_scanned,
@@ -1870,6 +2642,10 @@ def load_mind(
     max_eval_impressions: int | None = DEFAULT_MAX_EVAL_IMPRESSIONS,
     seed: int = 7,
     text_embedding_path: str | Path | None = None,
+    training_behaviors_path: str | Path | None = None,
+    evaluation_behaviors_path: str | Path | None = None,
+    max_eval_users: int | None = None,
+    eval_user_cohort: str = "all",
 ) -> dict[str, Any]:
     """Load bounded MIND train/dev projections for the live recommendation lab.
 
@@ -1880,8 +2656,69 @@ def load_mind(
 
     max_train_cases = _positive_limit("max_train_cases", max_train_cases)
     max_eval_impressions = _positive_limit("max_eval_impressions", max_eval_impressions)
+    max_eval_users = _positive_limit("max_eval_users", max_eval_users)
     if isinstance(seed, bool) or not isinstance(seed, int):
         raise ValueError("seed must be an integer")
+    if eval_user_cohort not in {"all", "unseen", "seen"}:
+        raise ValueError("eval_user_cohort must be one of: all, unseen, seen")
+    resolved_training_behaviors = (
+        Path(training_behaviors_path).expanduser().resolve()
+        if training_behaviors_path is not None else None
+    )
+    resolved_evaluation_behaviors = (
+        Path(evaluation_behaviors_path).expanduser().resolve()
+        if evaluation_behaviors_path is not None else None
+    )
+    if resolved_training_behaviors is not None:
+        if not resolved_training_behaviors.exists():
+            raise MindDataError(
+                "Official MIND training behavior source does not exist: "
+                f"{resolved_training_behaviors}"
+            )
+        if (resolved_training_behaviors.is_dir()
+                and not (resolved_training_behaviors / "behaviors.tsv").is_file()):
+            raise MindDataError(
+                "Official MIND training directory has no behaviors.tsv: "
+                f"{resolved_training_behaviors}"
+            )
+        if max_train_cases is None:
+            raise ValueError(
+                "max_train_cases must be bounded when using "
+                "training_behaviors_path"
+            )
+    if resolved_evaluation_behaviors is not None:
+        if not resolved_evaluation_behaviors.exists():
+            raise MindDataError(
+                "Official MIND behavior source does not exist: "
+                f"{resolved_evaluation_behaviors}"
+            )
+        if (resolved_evaluation_behaviors.is_dir()
+                and not (resolved_evaluation_behaviors / "behaviors.tsv").is_file()):
+            raise MindDataError(
+                "Official MIND directory has no behaviors.tsv: "
+                f"{resolved_evaluation_behaviors}"
+            )
+        if max_eval_users is None:
+            raise ValueError(
+                "max_eval_users is required with evaluation_behaviors_path"
+            )
+        if max_eval_impressions is not None:
+            raise ValueError(
+                "max_eval_impressions must be None when selecting complete "
+                "evaluation user sequences"
+            )
+    elif max_eval_users is not None:
+        raise ValueError(
+            "max_eval_users requires evaluation_behaviors_path"
+        )
+    evaluation_behaviors_sha256 = (
+        _source_sha256(resolved_evaluation_behaviors)
+        if resolved_evaluation_behaviors is not None else None
+    )
+    training_behaviors_sha256 = (
+        _source_sha256(resolved_training_behaviors)
+        if resolved_training_behaviors is not None else None
+    )
 
     dataset_root = Path(root).expanduser().resolve()
     if dataset_root.is_dir() and (dataset_root / "MIND_small_x1.zip").is_file():
@@ -1919,6 +2756,32 @@ def load_mind(
                 text_embedding_stat.st_mtime_ns
                 if text_embedding_stat is not None else None
             ),
+            **({
+                "training_behaviors_path":str(resolved_training_behaviors),
+                "training_behaviors_size":(
+                    resolved_training_behaviors.stat().st_size
+                    if resolved_training_behaviors.is_file() else None
+                ),
+                "training_behaviors_mtime_ns":(
+                    resolved_training_behaviors.stat().st_mtime_ns
+                    if resolved_training_behaviors.is_file() else None
+                ),
+                "training_behaviors_sha256":training_behaviors_sha256,
+            } if resolved_training_behaviors is not None else {}),
+            **({
+                "evaluation_behaviors_path":str(resolved_evaluation_behaviors),
+                "evaluation_behaviors_size":(
+                    resolved_evaluation_behaviors.stat().st_size
+                    if resolved_evaluation_behaviors.is_file() else None
+                ),
+                "evaluation_behaviors_mtime_ns":(
+                    resolved_evaluation_behaviors.stat().st_mtime_ns
+                    if resolved_evaluation_behaviors.is_file() else None
+                ),
+                "evaluation_behaviors_sha256":evaluation_behaviors_sha256,
+                "max_eval_users":max_eval_users,
+                "eval_user_cohort":eval_user_cohort,
+            } if resolved_evaluation_behaviors is not None else {}),
         },sort_keys=True,separators=(",",":"))
         cache_key=hashlib.sha256(cache_signature.encode("utf-8")).hexdigest()[:20]
         cache_path=dataset_root.parent/f".mind-replay-{cache_key}.json.gz"
@@ -1937,9 +2800,21 @@ def load_mind(
             max_eval_impressions=max_eval_impressions,
             seed=seed,
             text_embedding_path=resolved_text_embedding,
+            training_behaviors_path=resolved_training_behaviors,
+            evaluation_behaviors_path=resolved_evaluation_behaviors,
+            max_eval_users=max_eval_users,
+            eval_user_cohort=eval_user_cohort,
         )
         loaded["metadata"]["cache"]="available"
         loaded["metadata"]["cache_path"]=str(cache_path)
+        if evaluation_behaviors_sha256 is not None:
+            loaded["metadata"]["official_behavior_source_sha256"] = (
+                evaluation_behaviors_sha256
+            )
+        if training_behaviors_sha256 is not None:
+            loaded["metadata"]["official_training_behavior_source_sha256"] = (
+                training_behaviors_sha256
+            )
         temporary=cache_path.with_suffix(cache_path.suffix+".tmp")
         try:
             with gzip.open(temporary,"wt",encoding="utf-8") as handle:
@@ -1948,6 +2823,13 @@ def load_mind(
         finally:
             temporary.unlink(missing_ok=True)
         return loaded
+    if (resolved_training_behaviors is not None
+            or resolved_evaluation_behaviors is not None):
+        raise ValueError(
+            "training/evaluation behavior companions are only supported for "
+            "the RecZoo MIND archive; extracted official splits already "
+            "carry timestamps"
+        )
     train_dir, eval_dir = _resolve_splits(dataset_root)
     train_news = _read_news(train_dir / "news.tsv", train_dir.name)
     eval_news = _read_news(eval_dir / "news.tsv", eval_dir.name)

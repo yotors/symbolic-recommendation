@@ -482,6 +482,331 @@ class MindAdapterTest(unittest.TestCase):
         self.assertEqual(data["metadata"]["transition_training_encoding"],
                          "prequential-impression-v1")
 
+    def test_official_behavior_companion_keeps_complete_chronological_users(self):
+        archive_path = self.root / "longitudinal_reczoo.zip"
+        companion_path = self.root / "MINDsmall_dev.zip"
+        news_header = (
+            "news_id\tcat\tsub_cat\ttitle_entities\tabstract_entities\t"
+            "title\tabstract"
+        )
+        csv_header = (
+            "imp_id,click,hour,user_id,news_id,cat,sub_cat,title_entities,"
+            "abstract_entities,news_his,cat_his,subcat_his"
+        )
+        with zipfile.ZipFile(
+            archive_path, "w", compression=zipfile.ZIP_DEFLATED
+        ) as archive:
+            archive.writestr("news_corpus.tsv", "\n".join([
+                news_header,
+                "N1\tnews\tworld\t\t\tHistory\tOne",
+                "N2\tnews\tpolitics\t\t\tCandidate two\tTwo",
+                "N3\tsports\tfootball\t\t\tCandidate three\tThree",
+            ]) + "\n")
+            archive.writestr("train.csv", "\n".join([
+                csv_header,
+                "T,1,8AM,TRAIN,N1,news,world,,,N1,news,world",
+                "T,0,8AM,TRAIN,N2,news,politics,,,N1,news,world",
+            ]) + "\n")
+            # Source order is deliberately the reverse of wall-clock order.
+            archive.writestr("valid.csv", "\n".join([
+                csv_header,
+                "LATE,0,11AM,COLD,N3,sports,football,,,N1,news,world",
+                "LATE,1,11AM,COLD,N2,news,politics,,,N1,news,world",
+                "EARLY,0,9AM,COLD,N2,news,politics,,,N1,news,world",
+                "EARLY,1,9AM,COLD,N3,sports,football,,,N1,news,world",
+                "ONLY,1,10AM,SINGLE,N1,news,world,,,N1,news,world",
+            ]) + "\n")
+        with zipfile.ZipFile(
+            companion_path, "w", compression=zipfile.ZIP_DEFLATED
+        ) as archive:
+            archive.writestr("behaviors.tsv", "\n".join([
+                "LATE\tCOLD\t11/16/2019 11:05:00 AM\tN1\tN3-0 N2-1",
+                "EARLY\tCOLD\t11/15/2019 9:05:00 AM\tN1\tN2-0 N3-1",
+                "ONLY\tSINGLE\t11/15/2019 10:00:00 AM\tN1\tN1-1",
+            ]) + "\n")
+
+        data = load_mind(
+            archive_path,
+            max_train_cases=2,
+            max_eval_impressions=None,
+            evaluation_behaviors_path=companion_path,
+            max_eval_users=1,
+            eval_user_cohort="unseen",
+            seed=7,
+        )
+
+        self.assertEqual(
+            [case["source_impression_id"] for case in data["tests"]],
+            ["EARLY", "LATE"],
+        )
+        self.assertEqual(
+            [case["user_sequence_index"] for case in data["tests"]], [0, 1]
+        )
+        self.assertEqual(
+            [case["user_timestamp_group"] for case in data["tests"]], [0, 1]
+        )
+        self.assertTrue(all(
+            case["timestamp_source"] == "official_mind_behaviors"
+            for case in data["tests"]
+        ))
+        self.assertEqual(
+            data["metadata"]["official_behavior_join"]["selected_users"], 1
+        )
+        self.assertIn(
+            "complete repeated-user sequences", data["metadata"]["sampling"]
+        )
+
+    def test_official_training_companion_orders_exact_joined_impressions(self):
+        archive_path = self.root / "training_chronology_reczoo.zip"
+        companion_path = self.root / "MINDsmall_train.zip"
+        news_header = (
+            "news_id\tcat\tsub_cat\ttitle_entities\tabstract_entities\t"
+            "title\tabstract"
+        )
+        csv_header = (
+            "imp_id,click,hour,user_id,news_id,cat,sub_cat,title_entities,"
+            "abstract_entities,news_his,cat_his,subcat_his"
+        )
+        reczoo_late_history = "^".join(["N1"] * 50)
+        official_late_history = " ".join(["N2", *("N1" for _ in range(50))])
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("news_corpus.tsv", "\n".join([
+                news_header,
+                "N1\tnews\tworld\t\t\tOne\tOne",
+                "N2\tnews\tpolitics\t\t\tTwo\tTwo",
+            ]) + "\n")
+            # RecZoo source order deliberately contradicts wall-clock order.
+            archive.writestr("train.csv", "\n".join([
+                csv_header,
+                f"LATE,0,11AM,U1,N1,news,world,,,{reczoo_late_history},news,world",
+                f"LATE,1,11AM,U1,N2,news,politics,,,{reczoo_late_history},news,world",
+                "EARLY,1,9AM,U2,N1,news,world,,,N2,news,politics",
+                "EARLY,0,9AM,U2,N2,news,politics,,,N2,news,politics",
+            ]) + "\n")
+            archive.writestr("valid.csv", "\n".join([
+                csv_header,
+                "V,1,12PM,U3,N1,news,world,,,N2,news,politics",
+                "V,0,12PM,U3,N2,news,politics,,,N2,news,politics",
+            ]) + "\n")
+        with zipfile.ZipFile(companion_path, "w") as archive:
+            archive.writestr("behaviors.tsv", "\n".join([
+                f"LATE\tU1\t11/16/2019 11:05:00 AM\t{official_late_history}\tN1-0 N2-1",
+                "EARLY\tU2\t11/15/2019 9:05:00 AM\tN2\tN1-1 N2-0",
+            ]) + "\n")
+
+        data = load_mind(
+            archive_path,
+            max_train_cases=4,
+            max_eval_impressions=1,
+            training_behaviors_path=companion_path,
+            seed=7,
+        )
+
+        impressions = list(dict.fromkeys(
+            event["source_impression_id"] for event in data["events"]
+        ))
+        self.assertEqual(impressions, ["EARLY", "LATE"])
+        self.assertTrue(all(
+            event["timestamp_source"] == "official_mind_behaviors"
+            for event in data["events"]
+        ))
+        self.assertEqual(
+            data["metadata"]["official_training_behavior_join"]
+            ["source_order_timestamp_inversions"],
+            1,
+        )
+        self.assertEqual(
+            data["metadata"]["official_training_behavior_join"]
+            ["selected_histories_truncated_by_reczoo"],
+            1,
+        )
+        self.assertIn(
+            "ordered by timestamp", data["metadata"]["training_chronology"]
+        )
+        by_impression = {
+            impression: {
+                event["source_article_id"]: event
+                for event in data["events"]
+                if event["source_impression_id"] == impression
+            }
+            for impression in ("EARLY", "LATE")
+        }
+        # EARLY appears after LATE in RecZoo source rows, but its official-time
+        # context must not contain LATE's outcomes.
+        self.assertEqual(by_impression["EARLY"]["N1"]["ctr_bucket"], "cold")
+        self.assertEqual(
+            by_impression["EARLY"]["N1"]["freshness_bucket"], "new"
+        )
+        self.assertEqual(
+            by_impression["EARLY"]["N1"]
+            ["recent_subcategory_transition_score"],
+            0.0,
+        )
+        # The later impression may use outcomes from EARLY.
+        self.assertEqual(by_impression["LATE"]["N1"]["ctr_bucket"], "medium")
+        self.assertEqual(
+            by_impression["LATE"]["N1"]["freshness_bucket"], "recent"
+        )
+        self.assertAlmostEqual(
+            by_impression["LATE"]["N1"]
+            ["recent_subcategory_transition_score"],
+            11 / 21,
+            places=7,
+        )
+        feature_audit = data["metadata"]["official_training_behavior_join"]
+        self.assertEqual(
+            feature_audit["feature_replay_population"],
+            "complete official training behavior stream",
+        )
+        self.assertEqual(feature_audit["feature_replay_interactions"], 4)
+        self.assertEqual(feature_audit["materialized_training_interactions"], 4)
+        self.assertIn(
+            "equal timestamps share one frozen pre-outcome state",
+            data["metadata"]["training_feature_chronology"],
+        )
+
+        # Sampling controls miner materialization only. The final serving
+        # state must still contain every causally preceding observation from
+        # the complete official stream, exactly as it would in production.
+        bounded = load_mind(
+            archive_path,
+            max_train_cases=2,
+            max_eval_impressions=1,
+            training_behaviors_path=companion_path,
+            seed=7,
+        )
+        bounded_audit = bounded["metadata"][
+            "official_training_behavior_join"
+        ]
+        self.assertEqual(
+            bounded_audit["evaluation_prior_population"],
+            "complete official training behavior stream",
+        )
+        self.assertEqual(bounded_audit["feature_replay_interactions"], 4)
+        self.assertEqual(bounded_audit["materialized_training_interactions"], 2)
+        self.assertAlmostEqual(
+            bounded["subcategory_transition_model"]["global"], 0.5
+        )
+        self.assertEqual(
+            sorted(bounded["subcategory_transition_model"]["candidate"].values()),
+            [0.5, 0.5],
+        )
+
+        # With seed 4 only the later impression is materialized, but its
+        # snapshot must still include the earlier non-materialized outcome.
+        later_only = load_mind(
+            archive_path,
+            max_train_cases=2,
+            max_eval_impressions=1,
+            training_behaviors_path=companion_path,
+            seed=4,
+        )
+        self.assertEqual(
+            {event["source_impression_id"] for event in later_only["events"]},
+            {"LATE"},
+        )
+        later_by_article = {
+            event["source_article_id"]: event
+            for event in later_only["events"]
+        }
+        self.assertEqual(later_by_article["N1"]["ctr_bucket"], "medium")
+        self.assertAlmostEqual(
+            later_by_article["N1"]["recent_subcategory_transition_score"],
+            11 / 21,
+            places=7,
+        )
+
+    def test_official_training_companion_rejects_candidate_mismatch(self):
+        archive_path = self.root / "training_mismatch_reczoo.zip"
+        companion_path = self.root / "training_mismatch.zip"
+        news_header = (
+            "news_id\tcat\tsub_cat\ttitle_entities\tabstract_entities\t"
+            "title\tabstract"
+        )
+        csv_header = (
+            "imp_id,click,hour,user_id,news_id,cat,sub_cat,title_entities,"
+            "abstract_entities,news_his,cat_his,subcat_his"
+        )
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("news_corpus.tsv", "\n".join([
+                news_header,
+                "N1\tnews\tworld\t\t\tOne\tOne",
+                "N2\tnews\tpolitics\t\t\tTwo\tTwo",
+            ]) + "\n")
+            archive.writestr("train.csv", "\n".join([
+                csv_header,
+                "T,1,8AM,U1,N1,news,world,,,N1,news,world",
+                "T,0,8AM,U1,N2,news,politics,,,N1,news,world",
+            ]) + "\n")
+            archive.writestr("valid.csv", "\n".join([
+                csv_header,
+                "V,1,9AM,U2,N1,news,world,,,N1,news,world",
+                "V,0,9AM,U2,N2,news,politics,,,N1,news,world",
+            ]) + "\n")
+        with zipfile.ZipFile(companion_path, "w") as archive:
+            archive.writestr(
+                "behaviors.tsv",
+                "T\tU1\t11/15/2019 8:00:00 AM\tN1\tN1-0 N2-1\n",
+            )
+
+        with self.assertRaisesRegex(
+            MindDataError, "ordered candidates/labels"
+        ):
+            load_mind(
+                archive_path,
+                max_train_cases=2,
+                max_eval_impressions=1,
+                training_behaviors_path=companion_path,
+            )
+
+    def test_official_behavior_companion_rejects_label_mismatch(self):
+        archive_path = self.root / "mismatch_reczoo.zip"
+        companion_path = self.root / "mismatch_dev.zip"
+        news_header = (
+            "news_id\tcat\tsub_cat\ttitle_entities\tabstract_entities\t"
+            "title\tabstract"
+        )
+        csv_header = (
+            "imp_id,click,hour,user_id,news_id,cat,sub_cat,title_entities,"
+            "abstract_entities,news_his,cat_his,subcat_his"
+        )
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("news_corpus.tsv", "\n".join([
+                news_header,
+                "N1\tnews\tworld\t\t\tOne\tOne",
+                "N2\tnews\tpolitics\t\t\tTwo\tTwo",
+            ]) + "\n")
+            archive.writestr("train.csv", "\n".join([
+                csv_header,
+                "T,1,8AM,TRAIN,N1,news,world,,,N1,news,world",
+                "T,0,8AM,TRAIN,N2,news,politics,,,N1,news,world",
+            ]) + "\n")
+            archive.writestr("valid.csv", "\n".join([
+                csv_header,
+                "A,1,9AM,COLD,N1,news,world,,,N1,news,world",
+                "A,0,9AM,COLD,N2,news,politics,,,N1,news,world",
+                "B,0,10AM,COLD,N1,news,world,,,N1,news,world",
+                "B,1,10AM,COLD,N2,news,politics,,,N1,news,world",
+            ]) + "\n")
+        with zipfile.ZipFile(companion_path, "w") as archive:
+            archive.writestr("behaviors.tsv", "\n".join([
+                # A deliberately reverses the two labels.
+                "A\tCOLD\t11/15/2019 9:00:00 AM\tN1\tN1-0 N2-1",
+                "B\tCOLD\t11/15/2019 10:00:00 AM\tN1\tN1-0 N2-1",
+            ]) + "\n")
+
+        with self.assertRaisesRegex(
+            MindDataError, "ordered candidates/labels"
+        ):
+            load_mind(
+                archive_path,
+                max_train_cases=2,
+                max_eval_impressions=None,
+                evaluation_behaviors_path=companion_path,
+                max_eval_users=1,
+                eval_user_cohort="unseen",
+            )
+
     @unittest.skipIf(h5py is None or np is None, "h5py is not installed")
     def test_reczoo_entity_similarity_uses_normalized_mean_top1_and_recent5(self):
         archive_path = self.root / "entity_mind.zip"
