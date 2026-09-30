@@ -171,10 +171,3 @@ PeTTaChainer/.venv/bin/python -m pytest recommendation/tests/browser -q
 
 Tests remain separated by behavior. Generated caches and duplicate historical
 experiment fixtures are not retained.
-
-## Maintained documentation
-
-- `docs/architecture/ARCHITECTURE.md`: logic, formulas, workspaces, inference,
-  ranking, and evaluation contract.
-- `docs/architecture/RELATIONAL_REASONING.md`: bounded relational proofs and
-  provenance.
