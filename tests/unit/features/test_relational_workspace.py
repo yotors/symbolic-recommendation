@@ -5,6 +5,7 @@ import inspect
 import unittest
 
 from recommendation.features.relational_workspace import (
+    CANONICAL_CANDIDATE_CONCEPT_BRIDGE_RULE_ID,
     CANONICAL_CONCEPT_BRIDGE_RULE_ID,
     CONCEPT_CONTINUITY_RULE_ID,
     ENGAGED_ENTITY_RULE_ID,
@@ -95,7 +96,7 @@ def concept_proof(plan, origin, path_index=0):
         f"(by {ENGAGED_CONCEPT_RULE_ID} {origin.observed_click_fact_id} "
         f"(by {CANONICAL_CONCEPT_BRIDGE_RULE_ID} "
         f"{history.annotation_anchor_fact_id} {history.canonical_mapping_fact_id})) "
-        f"(by {CANONICAL_CONCEPT_BRIDGE_RULE_ID} "
+        f"(by {CANONICAL_CANDIDATE_CONCEPT_BRIDGE_RULE_ID} "
         f"{candidate.annotation_anchor_fact_id} {candidate.canonical_mapping_fact_id})) "
         f"(RelConceptContinuity {plan.case_id} {origin.origin_id} "
         f"{candidate.concept_atom}) "
@@ -122,14 +123,21 @@ class RelationalWorkspaceTest(unittest.TestCase):
         self.assertEqual(len(facts[REL_CONCEPT_CONTINUITY_PROOF_IDS]), 1)
         record = next(iter(ledger.values()))
         self.assertEqual(record["matched_canonical_concept_ids"], [concept])
-        self.assertEqual(record["annotation_anchor_fact_ids"], [
-            "anchor_candidate", "anchor_recent",
-        ])
+        self.assertEqual(
+            record["annotation_anchor_fact_ids"],
+            sorted({
+                path.annotation_anchor_fact_id
+                for path in (
+                    *plan.origins[0].candidate_bridge_paths,
+                    *plan.origins[0].history_bridge_paths,
+                )
+            }),
+        )
         self.assertEqual(len(record["canonical_mapping_fact_ids"]), 2)
         retained = record["proof_alternatives"][0]
         self.assertEqual(
             retained["annotation_anchor_fact_ids"],
-            ["anchor_candidate", "anchor_recent"],
+            record["annotation_anchor_fact_ids"],
         )
         self.assertTrue(all(
             fact_id in retained["proof_metta"]

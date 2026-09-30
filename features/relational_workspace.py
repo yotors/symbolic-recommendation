@@ -15,31 +15,49 @@ No outcome, label, score, mined rule, or latest-user profile is accepted here.
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 import re
 from typing import Any
 
 
-RELATIONAL_WORKSPACE_SCHEMA = "mindplex-relational-continuity-proofs-v3"
-RELATIONAL_PROJECTION_SCHEMA = "mindplex-preserved-relational-projection-v3"
+RELATIONAL_WORKSPACE_SCHEMA = "mindplex-relational-continuity-proofs-v4"
+MATERIALIZED_RELATIONAL_WORKSPACE_SCHEMA = (
+    "mindplex-relational-hypergraph-materialization-v1"
+)
+RELATIONAL_PROJECTION_SCHEMA = "mindplex-preserved-relational-projection-v4"
 REL_ENTITY_CONTINUITY_SCOPE = "rel_entity_continuity_scope"
 REL_ENTITY_CONTINUITY_PROOF_IDS = "rel_entity_continuity_proof_ids"
+REL_ENTITY_PATH_MULTIPLICITY = "rel_entity_path_multiplicity"
+REL_ENTITY_PATH_MULTIPLICITY_PROOF_IDS = "rel_entity_path_multiplicity_proof_ids"
 REL_CONCEPT_CONTINUITY_SCOPE = "rel_concept_continuity_scope"
 REL_CONCEPT_CONTINUITY_PROOF_IDS = "rel_concept_continuity_proof_ids"
 RELATIONAL_WORKSPACE_FEATURES = (
-    REL_ENTITY_CONTINUITY_SCOPE, REL_CONCEPT_CONTINUITY_SCOPE,
+    REL_ENTITY_CONTINUITY_SCOPE, REL_ENTITY_PATH_MULTIPLICITY,
+    REL_CONCEPT_CONTINUITY_SCOPE,
 )
 RELATIONAL_SCOPE_VALUES = ("unknown", "none", "older", "recent")
+REL_ENTITY_PATH_MULTIPLICITY_VALUES = ("none", "one", "two_plus")
 RECENT_HISTORY_POSITIONS = 5
 
 ENGAGED_ENTITY_RULE_ID = "rel_v1_derive_engaged_entity_origin"
 ENTITY_CONTINUITY_RULE_ID = "rel_v1_derive_entity_continuity"
+ENTITY_PATH_CASE_NODE_RULE_ID = "rel_v4_entity_path_case_node"
+ENTITY_PATH_ORIGIN_NODE_RULE_ID = "rel_v4_entity_path_origin_node"
+ENTITY_PATH_COUNT_RULE_ID = "rel_v4_entity_path_degree"
+ENTITY_PATH_NONE_RULE_ID = "rel_v4_entity_path_none"
+ENTITY_PATH_ONE_RULE_ID = "rel_v4_entity_path_one"
+ENTITY_PATH_TWO_PLUS_RULE_ID = "rel_v4_entity_path_two_plus"
 ENGAGED_CONCEPT_RULE_ID = "rel_v1_derive_engaged_concept_origin"
 CONCEPT_CONTINUITY_RULE_ID = "rel_v1_derive_concept_continuity"
 CANONICAL_CONCEPT_BRIDGE_RULE_ID = "rel_v2_ground_canonical_concept"
+CANONICAL_CANDIDATE_CONCEPT_BRIDGE_RULE_ID = (
+    "rel_v5_ground_candidate_canonical_concept"
+)
 ENTITY_RELATIONAL_STRUCTURAL_RULES = (
     (
         f"(: {ENGAGED_ENTITY_RULE_ID} "
@@ -54,8 +72,57 @@ ENTITY_RELATIONAL_STRUCTURAL_RULES = (
         "(Implication "
         "(And (RelCaseCandidate $case $scope $user $candidate) "
         "(RelEngagedEntityOrigin $scope $user $entity $origin) "
-        "(RelMentionsEntity $candidate $entity)) "
+        "(RelCandidateMentionsEntity $case $candidate $entity)) "
         "(RelEntityContinuity $case $origin $entity)) "
+        "(CTV (STV 1.0 1.0) (STV 0.0 1.0)))"
+    ),
+    # Project every proven entity path onto its interaction-origin node. The
+    # reasoner merges alternate entity paths with the same case/origin root,
+    # so the following FoldAll computes graph degree over distinct click
+    # origins rather than over raw paths.  A candidate-case anchor makes zero
+    # degree explicit without Python closed-world counting.
+    (
+        f"(: {ENTITY_PATH_CASE_NODE_RULE_ID} "
+        "(Implication "
+        "(RelCaseCandidate $case $scope $user $candidate) "
+        "(RelEntityPathNode $case rel_entity_path_case_anchor)) "
+        "(CTV (STV 1.0 1.0) (STV 0.0 1.0)))"
+    ),
+    (
+        f"(: {ENTITY_PATH_ORIGIN_NODE_RULE_ID} "
+        "(Implication "
+        "(RelEntityContinuity $case $origin $entity) "
+        "(RelEntityPathNode $case $origin)) "
+        "(CTV (STV 1.0 1.0) (STV 0.0 1.0)))"
+    ),
+    (
+        f"(: {ENTITY_PATH_COUNT_RULE_ID} "
+        "(Implication "
+        "(FoldAll (RelEntityPathNode $case $node) 1 0 "
+        "(|-> ($acc $elem) (+ $acc $elem)) -> $degree) "
+        "(RelEntityPathDegree $case $degree)) "
+        "(CTV (STV 1.0 1.0) (STV 0.0 1.0)))"
+    ),
+    (
+        f"(: {ENTITY_PATH_NONE_RULE_ID} "
+        "(Implication "
+        "(RelEntityPathDegree $case 1) "
+        "(RelEntityPathMultiplicity $case none)) "
+        "(CTV (STV 1.0 1.0) (STV 0.0 1.0)))"
+    ),
+    (
+        f"(: {ENTITY_PATH_ONE_RULE_ID} "
+        "(Implication "
+        "(RelEntityPathDegree $case 2) "
+        "(RelEntityPathMultiplicity $case one)) "
+        "(CTV (STV 1.0 1.0) (STV 0.0 1.0)))"
+    ),
+    (
+        f"(: {ENTITY_PATH_TWO_PLUS_RULE_ID} "
+        "(Implication "
+        "(And (RelEntityPathDegree $case $degree) "
+        "(Compute > ($degree 2) -> True)) "
+        "(RelEntityPathMultiplicity $case two_plus)) "
         "(CTV (STV 1.0 1.0) (STV 0.0 1.0)))"
     ),
 )
@@ -66,6 +133,15 @@ CONCEPT_RELATIONAL_STRUCTURAL_RULES = (
         "(And (HasConcept $source $lexical) "
         "(RelCanonicalConceptMapping $source $lexical $article $concept)) "
         "(RelHasCanonicalConcept $article $concept)) "
+        "(CTV (STV 1.0 1.0) (STV 0.0 1.0)))"
+    ),
+    (
+        f"(: {CANONICAL_CANDIDATE_CONCEPT_BRIDGE_RULE_ID} "
+        "(Implication "
+        "(And (RelCandidateConceptAnchor $case $source $lexical) "
+        "(RelCandidateCanonicalConceptMapping "
+        "$case $source $lexical $article $concept)) "
+        "(RelCandidateHasCanonicalConcept $case $article $concept)) "
         "(CTV (STV 1.0 1.0) (STV 0.0 1.0)))"
     ),
     (
@@ -81,7 +157,7 @@ CONCEPT_RELATIONAL_STRUCTURAL_RULES = (
         "(Implication "
         "(And (RelConceptCaseCandidate $case $scope $user $candidate) "
         "(RelEngagedConceptOrigin $scope $user $concept $origin) "
-        "(RelHasCanonicalConcept $candidate $concept)) "
+        "(RelCandidateHasCanonicalConcept $case $candidate $concept)) "
         "(RelConceptContinuity $case $origin $concept)) "
         "(CTV (STV 1.0 1.0) (STV 0.0 1.0)))"
     ),
@@ -323,6 +399,25 @@ class RelationalProofPlan:
     def proof_queries(self) -> tuple[str, ...]:
         return tuple(root.query for root in self.proof_roots)
 
+    @property
+    def entity_path_multiplicity_query(self) -> str | None:
+        """Return the categorical graph-degree query when evidence is complete.
+
+        Incomplete entity annotations must abstain: a currently visible path
+        does not establish whether the exact degree bucket is ``one`` or
+        ``two_plus``.  PeTTa, not this plan builder, chooses the category.
+        """
+
+        if not self.complete_entity_evidence or self.case_candidate_fact_id is None:
+            return None
+        return (
+            f"(: $prf (RelEntityPathMultiplicity {self.case_id} $value) $tv)"
+        )
+
+    @property
+    def requires_entity_path_multiplicity_query(self) -> bool:
+        return self.entity_path_multiplicity_query is not None
+
 
 @dataclass(frozen=True, slots=True)
 class ConceptBridgePath:
@@ -462,11 +557,26 @@ def build_relational_proof_plan(
         candidate_atom if candidate_atom is not None else ("unknown", candidate_id),
     )
 
-    statements = {statement for _, statement in candidate_facts}
+    # Candidate and history roles need distinct typed hyperedges. When an
+    # already-clicked article is a candidate again, one RelMentionsEntity atom
+    # cannot serve as both proof leaves in PeTTa's final conjunction. The
+    # case-bound candidate edge is grounded in the same immutable article
+    # observation; history keeps the canonical source assertion below.
+    candidate_fact_ids = {}
+    statements = set()
+    for entity, (source_fact_id, source_statement) in zip(
+        candidate_entities or (), candidate_facts,
+    ):
+        candidate_fact_id = _symbol(
+            "fact_rel_candidate_mentions", case_id, source_fact_id,
+        )
+        statements.add(
+            f"(: {candidate_fact_id} "
+            f"(RelCandidateMentionsEntity {case_id} {candidate_atom} "
+            f"rel_entity_{entity.lower()}) (STV 1.0 1.0))"
+        )
+        candidate_fact_ids[entity] = candidate_fact_id
     origins: list[RelationalOriginPlan] = []
-    candidate_fact_ids = {
-        entity: fact_id for entity, (fact_id, _) in zip(candidate_entities or (), candidate_facts)
-    }
     for position, (history_id, observation) in enumerate(zip(history, history_observations)):
         article_atom, entities, entity_facts = observation
         statements.update(statement for _, statement in entity_facts)
@@ -646,7 +756,46 @@ def build_concept_relational_proof_plan(
         "rel_concept_case", scope_id,
         candidate_atom if candidate_atom is not None else ("unknown", candidate_id),
     )
-    statements = {statement for _, statement in candidate_facts}
+    candidate_fact_by_id = dict(candidate_facts)
+    candidate_role_paths = {}
+    statements = set()
+    for concept_id, paths in candidate_paths.items():
+        typed_paths = []
+        for path in paths:
+            statements.add(candidate_fact_by_id[path.annotation_anchor_fact_id])
+            statements.add(candidate_fact_by_id[path.canonical_mapping_fact_id])
+            parsed = _parse_concept_anchor(
+                candidate_fact_by_id[path.annotation_anchor_fact_id]
+            )
+            if parsed is None:
+                raise ValueError("candidate concept anchor is invalid")
+            _source_id, source_article_id, lexical, _source = parsed
+            anchor_id = _symbol(
+                "fact_rel_candidate_concept_anchor", case_id,
+                path.annotation_anchor_fact_id,
+            )
+            mapping_id = _symbol(
+                "fact_rel_candidate_canonical_mapping", case_id,
+                path.canonical_mapping_fact_id,
+            )
+            statements.add(
+                f"(: {anchor_id} (RelCandidateConceptAnchor {case_id} "
+                f"{json.dumps(source_article_id, ensure_ascii=False)} "
+                f"{json.dumps(lexical, ensure_ascii=False)}) (STV 1.0 1.0))"
+            )
+            statements.add(
+                f"(: {mapping_id} (RelCandidateCanonicalConceptMapping "
+                f"{case_id} {json.dumps(source_article_id, ensure_ascii=False)} "
+                f"{json.dumps(lexical, ensure_ascii=False)} {candidate_atom} "
+                f"{path.concept_atom}) (STV 1.0 1.0))"
+            )
+            typed_paths.append(ConceptBridgePath(
+                canonical_concept_id=concept_id,
+                concept_atom=path.concept_atom,
+                annotation_anchor_fact_id=anchor_id,
+                canonical_mapping_fact_id=mapping_id,
+            ))
+        candidate_role_paths[concept_id] = tuple(typed_paths)
     origins = []
     for position, (history_id, observation) in enumerate(zip(history, history_observations)):
         article_atom, concepts, concept_facts, history_paths = observation
@@ -664,7 +813,8 @@ def build_concept_relational_proof_plan(
         )
         matched = tuple(sorted(set(candidate_concepts or ()) & set(concepts or ())))
         matched_candidate_paths = tuple(
-            path for concept in matched for path in candidate_paths.get(concept, ())
+            path for concept in matched
+            for path in candidate_role_paths.get(concept, ())
         )
         matched_history_paths = tuple(
             path for concept in matched for path in history_paths.get(concept, ())
@@ -956,6 +1106,189 @@ def reduce_relational_proofs(
     }, ledger
 
 
+def reduce_entity_path_multiplicity_proofs(
+    plan: RelationalProofPlan,
+    proof_strings: Iterable[str],
+) -> tuple[dict[str, object], dict[str, dict[str, object]]]:
+    """Validate and serialize PeTTa's categorical entity-path-degree proof.
+
+    The reducer never derives a bucket by counting source rows.  It accepts the
+    single ``RelEntityPathMultiplicity`` conclusion proved by PeTTa, then uses
+    nested origin paths only as a fail-closed provenance/completeness check.
+    """
+
+    materialized = tuple(proof_strings)
+    query = plan.entity_path_multiplicity_query
+    if query is None:
+        if materialized:
+            raise ValueError(
+                "an incomplete entity snapshot cannot have a multiplicity proof"
+            )
+        # Absence is deliberate: ``unknown`` is not one of the categorical
+        # predicate's values and must not be silently converted to ``none``.
+        return {}, {}
+    if len(materialized) != 1:
+        raise ValueError(
+            "entity-path multiplicity requires exactly one PeTTa category proof"
+        )
+    proof = materialized[0]
+    if not isinstance(proof, str) or not proof.strip() or proof != proof.strip():
+        raise ValueError("entity-path multiplicity proof must be a canonical string")
+
+    root = re.compile(
+        rf"\(RelEntityPathMultiplicity\s+{re.escape(plan.case_id)}\s+"
+        r"(none|one|two_plus)\)"
+    )
+    categories = root.findall(proof)
+    if len(categories) != 1:
+        raise ValueError(
+            "entity-path multiplicity proof lacks one requested categorical root"
+        )
+    category = categories[0]
+    category_rule = {
+        "none": ENTITY_PATH_NONE_RULE_ID,
+        "one": ENTITY_PATH_ONE_RULE_ID,
+        "two_plus": ENTITY_PATH_TWO_PLUS_RULE_ID,
+    }[category]
+    common_rules = (
+        ENTITY_PATH_CASE_NODE_RULE_ID,
+        ENTITY_PATH_COUNT_RULE_ID,
+        category_rule,
+    )
+    if any(not _proof_contains_atom(proof, rule_id) for rule_id in common_rules):
+        raise ValueError("entity-path multiplicity proof misses a classifier rule")
+    if plan.case_candidate_fact_id is None or not _proof_contains_atom(
+        proof, plan.case_candidate_fact_id,
+    ):
+        raise ValueError("entity-path multiplicity proof misses its candidate anchor")
+    if "foldall-proof" not in proof:
+        raise ValueError("entity-path multiplicity was not derived by PeTTa FoldAll")
+
+    origin_by_id = {origin.origin_id: origin for origin in plan.origins}
+    source_fact_ids = {plan.case_candidate_fact_id}
+    matched_values: set[str] = set()
+    origin_ids: set[str] = set()
+    for origin in plan.origins:
+        if not _proof_contains_atom(proof, origin.observed_click_fact_id):
+            continue
+        matches = [
+            (entity_id, candidate_fact, history_fact)
+            for entity_id, candidate_fact, history_fact in zip(
+                origin.matched_entity_ids,
+                origin.candidate_entity_fact_ids,
+                origin.history_entity_fact_ids,
+            )
+            if _proof_contains_atom(proof, candidate_fact)
+            and _proof_contains_atom(proof, history_fact)
+        ]
+        if not matches:
+            raise ValueError(
+                "entity-path multiplicity proof lacks a grounded origin path"
+            )
+        origin_ids.add(origin.origin_id)
+        source_fact_ids.add(origin.observed_click_fact_id)
+        for entity_id, candidate_fact, history_fact in matches:
+            matched_values.add(entity_id)
+            source_fact_ids.update((candidate_fact, history_fact))
+    retained_observed_facts = set(re.findall(
+        r"(?<![A-Za-z0-9_])(fact_rel_observed_[A-Za-z0-9_]+)"
+        r"(?![A-Za-z0-9_])",
+        proof,
+    ))
+    if retained_observed_facts != {
+        origin_by_id[origin_id].observed_click_fact_id for origin_id in origin_ids
+    }:
+        raise ValueError(
+            "entity-path multiplicity proof references a foreign click origin"
+        )
+
+    # FoldAll may yield an internally valid prefix before bounded search has
+    # discovered every origin node.  The plan's exact proof roots are a
+    # label-free completeness oracle: alternate entity paths collapse to one
+    # graph node, but every distinct expected origin must occur in the
+    # category proof.  This check can reject a partial PeTTa conclusion; it
+    # never manufactures or replaces the category returned by PeTTa.
+    expected_origin_ids = {
+        root.origin_id for root in plan.proof_roots
+    }
+    if origin_ids != expected_origin_ids:
+        raise ValueError(
+            "entity-path multiplicity proof coverage is incomplete or unexpected "
+            f"(expected_origins={len(expected_origin_ids)}, "
+            f"actual_origins={len(origin_ids)}, "
+            f"missing={len(expected_origin_ids - origin_ids)}, "
+            f"extra={len(origin_ids - expected_origin_ids)})"
+        )
+
+    # These are validation assertions over PeTTa's proof, not a Python
+    # classifier over raw observations.  They fail closed if a rule or runtime
+    # ever emits a category inconsistent with its retained proof structure.
+    if category == "none" and origin_ids:
+        raise ValueError("a none multiplicity proof contains an entity-path origin")
+    if category == "one" and len(origin_ids) != 1:
+        raise ValueError("a one multiplicity proof must retain one distinct origin")
+    if category == "two_plus" and len(origin_ids) < 2:
+        raise ValueError(
+            "a two_plus multiplicity proof must retain two distinct origins"
+        )
+    if category != "none" and any(not _proof_contains_atom(proof, rule_id) for rule_id in (
+        ENGAGED_ENTITY_RULE_ID,
+        ENTITY_CONTINUITY_RULE_ID,
+        ENTITY_PATH_ORIGIN_NODE_RULE_ID,
+    )):
+        raise ValueError("positive entity-path multiplicity lacks its path rules")
+    if category == "two_plus" and not _proof_contains_atom(proof, "cpu"):
+        raise ValueError("two_plus multiplicity lacks its PeTTa degree guard")
+
+    ordered_origins = sorted(
+        (origin_by_id[origin_id] for origin_id in origin_ids),
+        key=lambda origin: (origin.history_position, origin.origin_id),
+    )
+    proof_id = _symbol(
+        "rel_entity_path_multiplicity_proof", plan.case_id, category,
+    )
+    rule_ids = [*common_rules]
+    if category != "none":
+        rule_ids = [
+            ENGAGED_ENTITY_RULE_ID,
+            ENTITY_CONTINUITY_RULE_ID,
+            ENTITY_PATH_ORIGIN_NODE_RULE_ID,
+            *common_rules,
+        ]
+    record = {
+        "schema": RELATIONAL_WORKSPACE_SCHEMA,
+        "relation_family": "wikidata_entity_path_multiplicity",
+        "case_id": plan.case_id,
+        "scope_id": plan.scope_id,
+        "causal_history_id": (
+            plan.origins[0].causal_history_id
+            if plan.origins else _symbol("rel_causal_history", plan.user_id, ())
+        ),
+        "user_id": plan.user_id,
+        "candidate_id": plan.candidate_id,
+        "value": category,
+        "origin_ids": [origin.origin_id for origin in ordered_origins],
+        "dependency_keys": [origin.dependency_key for origin in ordered_origins],
+        "history_article_ids": [
+            origin.history_article_id for origin in ordered_origins
+        ],
+        "history_positions": [origin.history_position for origin in ordered_origins],
+        "recencies": [origin.recency for origin in ordered_origins],
+        "matched_wikidata_entity_ids": sorted(matched_values),
+        "source_fact_ids": sorted(source_fact_ids),
+        "rule_ids": rule_ids,
+        "proof_metta": proof,
+        "proof_sha256": hashlib.sha256(proof.encode("utf-8")).hexdigest(),
+        "structural_rule_ctv": {
+            "positive": [1.0, 1.0], "negative": [0.0, 1.0],
+        },
+    }
+    return {
+        REL_ENTITY_PATH_MULTIPLICITY: category,
+        REL_ENTITY_PATH_MULTIPLICITY_PROOF_IDS: [proof_id],
+    }, {proof_id: record}
+
+
 def _concept_proof_origins(plan: ConceptRelationalProofPlan, proofs: Iterable[str]):
     pattern = re.compile(
         rf"\(RelConceptContinuity\s+{re.escape(plan.case_id)}\s+"
@@ -977,6 +1310,7 @@ def _concept_proof_origins(plan: ConceptRelationalProofPlan, proofs: Iterable[st
             raise ValueError("concept proof returned an origin without shared canonical evidence")
         required = (
             CANONICAL_CONCEPT_BRIDGE_RULE_ID,
+            CANONICAL_CANDIDATE_CONCEPT_BRIDGE_RULE_ID,
             ENGAGED_CONCEPT_RULE_ID,
             CONCEPT_CONTINUITY_RULE_ID,
             plan.case_candidate_fact_id,
@@ -1108,6 +1442,7 @@ def reduce_concept_relational_proofs(
             "canonical_mapping_fact_ids": mappings,
             "rule_ids": [
                 CANONICAL_CONCEPT_BRIDGE_RULE_ID,
+                CANONICAL_CANDIDATE_CONCEPT_BRIDGE_RULE_ID,
                 ENGAGED_CONCEPT_RULE_ID,
                 CONCEPT_CONTINUITY_RULE_ID,
             ],
@@ -1191,10 +1526,124 @@ def relational_context_observations_sha256(data: Mapping[str, object]) -> str:
             "ordered_history_ids": history,
             "entity_scope": context.get(REL_ENTITY_CONTINUITY_SCOPE),
             "entity_proofs": context.get(REL_ENTITY_CONTINUITY_PROOF_IDS),
+            "entity_path_multiplicity": context.get(
+                REL_ENTITY_PATH_MULTIPLICITY,
+            ),
+            "entity_path_multiplicity_proofs": context.get(
+                REL_ENTITY_PATH_MULTIPLICITY_PROOF_IDS,
+            ),
             "concept_scope": context.get(REL_CONCEPT_CONTINUITY_SCOPE),
             "concept_proofs": context.get(REL_CONCEPT_CONTINUITY_PROOF_IDS),
         })
     return _canonical_hash(observations)
+
+
+def materialized_relational_features(
+    entity_plan: RelationalProofPlan,
+    concept_plan: ConceptRelationalProofPlan,
+) -> dict[str, str]:
+    """Traverse the finite typed source graph without assigning rank scores.
+
+    This is the deterministic closure of the structural continuity rules. It
+    supplies categorical observations to fpMiner; it does not replace mined
+    rules or PeTTa recommendation proofs.
+    """
+
+    entity_origins = [
+        origin for origin in entity_plan.origins if origin.matched_entity_ids
+    ]
+    if any(origin.recency == "recent" for origin in entity_origins):
+        entity_scope = "recent"
+    elif entity_origins and entity_plan.complete_recent_entity_evidence:
+        entity_scope = "older"
+    elif entity_origins:
+        entity_scope = "unknown"
+    elif entity_plan.complete_entity_evidence:
+        entity_scope = "none"
+    else:
+        entity_scope = "unknown"
+
+    concept_origins = [
+        origin for origin in concept_plan.origins if origin.matched_concept_ids
+    ]
+    if any(origin.recency == "recent" for origin in concept_origins):
+        concept_scope = "recent"
+    elif concept_origins and concept_plan.complete_recent_concept_evidence:
+        concept_scope = "older"
+    elif concept_origins:
+        concept_scope = "unknown"
+    elif concept_plan.complete_concept_evidence:
+        concept_scope = "none"
+    else:
+        concept_scope = "unknown"
+
+    features = {
+        REL_ENTITY_CONTINUITY_SCOPE: entity_scope,
+        REL_CONCEPT_CONTINUITY_SCOPE: concept_scope,
+    }
+    if entity_plan.complete_entity_evidence:
+        degree = len(entity_origins)
+        features[REL_ENTITY_PATH_MULTIPLICITY] = (
+            "none" if degree == 0 else "one" if degree == 1 else "two_plus"
+        )
+    return features
+
+
+def validate_materialized_relational_projection(data: Mapping[str, object]) -> None:
+    """Recompute every materialized graph observation and reject drift."""
+
+    if not isinstance(data, Mapping):
+        raise ValueError("materialized relational projection must be a mapping")
+    metadata = data.get("metadata")
+    audit = metadata.get("relational_workspace") if isinstance(metadata, Mapping) else None
+    if (not isinstance(audit, Mapping)
+            or audit.get("schema") != MATERIALIZED_RELATIONAL_WORKSPACE_SCHEMA):
+        raise ValueError("missing or invalid materialized relational workspace metadata")
+    if data.get("relational_proof_ledger") not in (None, {}):
+        raise ValueError("materialized graph observations cannot claim a PeTTa proof ledger")
+
+    raw_articles = data.get("articles")
+    annotations = data.get("llm_article_annotations") or {}
+    if not isinstance(raw_articles, list) or not isinstance(annotations, Mapping):
+        raise ValueError("materialized graph source records are invalid")
+    articles = {
+        str(article.get("id")): article for article in raw_articles
+        if isinstance(article, Mapping) and article.get("id") is not None
+    }
+    entity_cache = {}
+    concept_cache = {}
+    contexts = 0
+    counts = Counter()
+    for _location, context, user_id, candidate_id, history in _context_bindings(data):
+        entity_plan, concept_plan = build_relational_plans(
+            candidate_id, history, articles, annotations, user_id=user_id,
+            entity_observation_cache=entity_cache,
+            concept_observation_cache=concept_cache,
+        )
+        expected = materialized_relational_features(entity_plan, concept_plan)
+        observed = {
+            field: context[field] for field in RELATIONAL_WORKSPACE_FEATURES
+            if field in context
+        }
+        if observed != expected:
+            raise ValueError(
+                f"materialized relational observations disagree at {_location}"
+            )
+        if any(field in context for field in (
+            REL_ENTITY_CONTINUITY_PROOF_IDS,
+            REL_ENTITY_PATH_MULTIPLICITY_PROOF_IDS,
+            REL_CONCEPT_CONTINUITY_PROOF_IDS,
+        )):
+            raise ValueError("materialized graph observations cannot claim proof IDs")
+        contexts += 1
+        counts.update(f"{key}:{value}" for key, value in expected.items())
+    if audit.get("contexts") != contexts:
+        raise ValueError("materialized relational context count is inconsistent")
+    if audit.get("feature_counts") != dict(sorted(counts.items())):
+        raise ValueError("materialized relational feature counts are inconsistent")
+    if (audit.get("context_observations_sha256")
+            != relational_context_observations_sha256(data)):
+        raise ValueError("materialized relational observation hash is inconsistent")
 
 
 def _expected_projection_roots(data: Mapping[str, object]) -> dict[str, int]:
@@ -1236,6 +1685,17 @@ def _expected_projection_roots(data: Mapping[str, object]) -> dict[str, int]:
         len(concept_plan.proof_roots)
         for _entity_plan, concept_plan in planned.values()
     )
+    multiplicity = sum(
+        int(entity_plan.requires_entity_path_multiplicity_query)
+        for entity_plan, _concept_plan in planned.values()
+    )
+    multiplicity_no_path = sum(
+        int(
+            entity_plan.requires_entity_path_multiplicity_query
+            and not entity_plan.proof_roots
+        )
+        for entity_plan, _concept_plan in planned.values()
+    )
     queryable = sum(
         int(plan.requires_query)
         for pair in planned.values() for plan in pair
@@ -1245,7 +1705,14 @@ def _expected_projection_roots(data: Mapping[str, object]) -> dict[str, int]:
         "queryable_plans": queryable,
         "expected_entity_proof_roots": entity,
         "expected_concept_proof_roots": concept,
-        "expected_proof_roots": entity + concept,
+        "expected_entity_path_multiplicity_queries": multiplicity,
+        "expected_entity_path_multiplicity_no_path_queries": (
+            multiplicity_no_path
+        ),
+        "expected_entity_path_multiplicity_positive_path_queries": (
+            multiplicity - multiplicity_no_path
+        ),
+        "expected_proof_roots": entity + concept + multiplicity,
     }
 
 
@@ -1305,6 +1772,66 @@ def relational_safety_audit(data: Mapping[str, object]) -> dict[str, int]:
                 dependency_keys.append(record.get("dependency_key"))
             valid_keys = [key for key in dependency_keys if isinstance(key, str)]
             duplicate_origin_contributions += len(valid_keys) - len(set(valid_keys))
+        references = context.get(REL_ENTITY_PATH_MULTIPLICITY_PROOF_IDS)
+        if references is None:
+            continue
+        if not isinstance(references, list):
+            future_history_references += 1
+            continue
+        for reference in references:
+            record = ledger.get(reference)
+            if not isinstance(record, Mapping) or record.get(
+                "relation_family"
+            ) != "wikidata_entity_path_multiplicity":
+                future_history_references += 1
+                continue
+            if any((
+                record.get("user_id") != user_id,
+                record.get("candidate_id") != candidate_id,
+                record.get("causal_history_id") != _symbol(
+                    "rel_causal_history", user_id, history,
+                ),
+            )):
+                future_history_references += 1
+            positions = record.get("history_positions")
+            articles = record.get("history_article_ids")
+            dependencies = record.get("dependency_keys")
+            recencies = record.get("recencies")
+            if not all(isinstance(values, list) for values in (
+                positions, articles, dependencies, recencies,
+            )) or not len(positions) == len(articles) == len(
+                dependencies
+            ) == len(recencies):
+                future_history_references += 1
+                continue
+            valid_dependencies = [
+                key for key in dependencies if isinstance(key, str)
+            ]
+            duplicate_origin_contributions += (
+                len(valid_dependencies) - len(set(valid_dependencies))
+            )
+            for position, article_id, dependency, recency in zip(
+                positions, articles, dependencies, recencies,
+            ):
+                if (isinstance(position, bool) or not isinstance(position, int)
+                        or not 0 <= position < len(history)):
+                    future_history_references += 1
+                    continue
+                expected_recency = (
+                    "recent"
+                    if position >= max(0, len(history) - RECENT_HISTORY_POSITIONS)
+                    else "older"
+                )
+                if any((
+                    article_id != history[position],
+                    dependency != _symbol(
+                        "rel_interaction_origin",
+                        _symbol("rel_causal_history", user_id, history),
+                        position, history[position],
+                    ),
+                    recency != expected_recency,
+                )):
+                    future_history_references += 1
     return {
         "duplicate_origin_contributions": duplicate_origin_contributions,
         "future_history_references": future_history_references,
@@ -1331,6 +1858,7 @@ def _validated_proof_alternatives(
         "canonical_concept_continuity": (
             (
                 CANONICAL_CONCEPT_BRIDGE_RULE_ID,
+                CANONICAL_CANDIDATE_CONCEPT_BRIDGE_RULE_ID,
                 ENGAGED_CONCEPT_RULE_ID,
                 CONCEPT_CONTINUITY_RULE_ID,
             ),
@@ -1474,32 +2002,113 @@ def validate_relational_projection(data: Mapping[str, object]) -> None:
                 f"relational projection {name} disagrees with label-free proof plans"
             )
     root_count = expected_roots["expected_proof_roots"]
-    if count("wildcard_queries_submitted") != 0:
-        raise ValueError("relational projection used wildcard proof queries")
+    multiplicity_queries = expected_roots[
+        "expected_entity_path_multiplicity_queries"
+    ]
+    multiplicity_no_path_queries = expected_roots[
+        "expected_entity_path_multiplicity_no_path_queries"
+    ]
+    multiplicity_positive_path_queries = expected_roots[
+        "expected_entity_path_multiplicity_positive_path_queries"
+    ]
+    exact_root_count = (
+        expected_roots["expected_entity_proof_roots"]
+        + expected_roots["expected_concept_proof_roots"]
+    )
+    if count("wildcard_queries_submitted") != multiplicity_queries:
+        raise ValueError(
+            "relational projection has an invalid categorical wildcard count"
+        )
     if count("queries_submitted") != root_count:
-        raise ValueError("relational projection did not query every exact proof root")
-    if count("complete_proof_roots") != root_count:
+        raise ValueError("relational projection did not query every proof obligation")
+    if count("complete_proof_roots") != exact_root_count:
         raise ValueError("relational projection has incomplete exact proof roots")
+    if count("complete_entity_path_multiplicity_queries") != multiplicity_queries:
+        raise ValueError(
+            "relational projection has incomplete entity-path category queries"
+        )
     if count("proof_rows_returned") < root_count:
         raise ValueError("relational projection returned fewer proofs than exact roots")
     if count("proof_origins") != len(ledger):
         raise ValueError("relational projection proof-origin count is inconsistent")
     steps = count("query_steps_per_root")
+    multiplicity_steps = count(
+        "entity_path_multiplicity_query_steps_per_root"
+    )
     batch_size = count("query_batch_size")
-    if steps < 1 or batch_size < 1 or count("query_steps") != steps:
+    if (steps < 1 or multiplicity_steps < 1 or batch_size < 1
+            or count("query_steps") != steps):
         raise ValueError("relational projection has an invalid per-root query budget")
     if audit.get("query_step_budget_policy") != (
-        "per-root budget multiplied by roots in each query_many batch"
+        "exact roots share a per-root-multiplied batch budget; every "
+        "entity-path multiplicity FoldAll root has an independent fixed budget"
     ):
         raise ValueError("relational projection has an unsupported query-budget policy")
-    if count("total_query_step_budget") != steps * root_count:
+    expected_total_budget = (
+        steps * exact_root_count + multiplicity_steps * multiplicity_queries
+    )
+    if count("total_query_step_budget") != expected_total_budget:
         raise ValueError("relational projection total query budget is inconsistent")
-    expected_maximum = steps * min(batch_size, root_count) if root_count else 0
+    expected_maximum = max(
+        steps * min(batch_size, exact_root_count) if exact_root_count else 0,
+        multiplicity_steps if multiplicity_queries else 0,
+    )
     if count("maximum_batch_query_step_budget") != expected_maximum:
         raise ValueError("relational projection batch query budget is inconsistent")
-    expected_batches = (root_count + batch_size - 1) // batch_size
+    expected_exact_calls = (
+        (exact_root_count + batch_size - 1) // batch_size
+        if exact_root_count else 0
+    )
+    expected_batches = expected_exact_calls + multiplicity_queries
     if count("query_batches") != expected_batches:
         raise ValueError("relational projection query-batch count is inconsistent")
+    if count("exact_query_calls") != expected_exact_calls:
+        raise ValueError("relational projection exact-query count is inconsistent")
+    if count("entity_path_multiplicity_query_calls") != multiplicity_queries:
+        raise ValueError("relational projection category-query count is inconsistent")
+    if count("entity_path_multiplicity_no_path_query_calls") != (
+        multiplicity_no_path_queries
+    ):
+        raise ValueError("relational projection no-path query count is inconsistent")
+    if count("entity_path_multiplicity_positive_path_query_calls") != (
+        multiplicity_positive_path_queries
+    ):
+        raise ValueError("relational projection positive-path query count is inconsistent")
+    timings = audit.get("timings_seconds")
+    if not isinstance(timings, Mapping):
+        raise ValueError("relational projection timings are missing")
+
+    def seconds(name: str) -> float:
+        value = timings.get(name)
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or value < 0):
+            raise ValueError(f"relational projection has an invalid {name} timing")
+        return float(value)
+
+    query_seconds = seconds("petta_queries")
+    exact_seconds = seconds("petta_exact_queries")
+    multiplicity_seconds = seconds(
+        "petta_entity_path_multiplicity_queries"
+    )
+    no_path_seconds = seconds(
+        "petta_entity_path_multiplicity_no_path_queries"
+    )
+    positive_path_seconds = seconds(
+        "petta_entity_path_multiplicity_positive_path_queries"
+    )
+    tolerance = max(1e-9, query_seconds * 1e-9)
+    if not math.isclose(
+        query_seconds, exact_seconds + multiplicity_seconds,
+        rel_tol=1e-9, abs_tol=tolerance,
+    ):
+        raise ValueError("relational projection query timings are inconsistent")
+    if not math.isclose(
+        multiplicity_seconds, no_path_seconds + positive_path_seconds,
+        rel_tol=1e-9, abs_tol=tolerance,
+    ):
+        raise ValueError(
+            "relational projection multiplicity timings are inconsistent"
+        )
     safety = audit.get("safety")
     computed_safety = relational_safety_audit(data)
     if not isinstance(safety, Mapping) or any(
@@ -1518,8 +2127,18 @@ def validate_relational_projection(data: Mapping[str, object]) -> None:
         family = record.get("relation_family")
         if family not in {
             "wikidata_entity_continuity", "canonical_concept_continuity",
+            "wikidata_entity_path_multiplicity",
         }:
             raise ValueError("relational proof has an unknown relation family")
+        if family == "wikidata_entity_path_multiplicity":
+            if record.get("schema") != RELATIONAL_WORKSPACE_SCHEMA:
+                raise ValueError("multiplicity proof record has the wrong schema")
+            proof = record.get("proof_metta")
+            if not isinstance(proof, str) or hashlib.sha256(
+                proof.encode("utf-8"),
+            ).hexdigest() != record.get("proof_sha256"):
+                raise ValueError("multiplicity proof text disagrees with its hash")
+            continue
         _validated_proof_alternatives(proof_id, record, family)
         position = record.get("history_position")
         if isinstance(position, bool) or not isinstance(position, int) or position < 0:
@@ -1532,7 +2151,22 @@ def validate_relational_projection(data: Mapping[str, object]) -> None:
     if any(len(keys) != 1 or None in keys for keys in dependency_groups.values()):
         raise ValueError("relation families disagree about a shared click dependency")
 
+    raw_articles = data.get("articles")
+    if not isinstance(raw_articles, list):
+        raise ValueError("relational projection articles must be a list")
+    articles = {}
+    for index, article in enumerate(raw_articles):
+        if not isinstance(article, Mapping):
+            raise ValueError(f"relational projection article {index} is invalid")
+        article_id = article.get("id")
+        if not isinstance(article_id, str) or not article_id:
+            raise ValueError(f"relational projection article {index} lacks an ID")
+        if article_id in articles:
+            raise ValueError(f"duplicate relational projection article ID: {article_id}")
+        articles[article_id] = article
+
     referenced_proofs = set()
+    entity_observation_cache: dict[str, tuple[object, ...]] = {}
     for _location, context, user_id, candidate_id, history in _context_bindings(data):
         for scope_field, proof_field, family in (
             (
@@ -1570,12 +2204,56 @@ def validate_relational_projection(data: Mapping[str, object]) -> None:
             if expected != scope:
                 raise ValueError("relational scope disagrees with referenced origin proofs")
             referenced_proofs.update(references)
+
+        entity_plan = build_relational_proof_plan(
+            candidate_id, history, articles, user_id=user_id,
+            observation_cache=entity_observation_cache,
+        )
+        multiplicity = context.get(REL_ENTITY_PATH_MULTIPLICITY)
+        multiplicity_references = context.get(
+            REL_ENTITY_PATH_MULTIPLICITY_PROOF_IDS,
+        )
+        if not entity_plan.requires_entity_path_multiplicity_query:
+            if (REL_ENTITY_PATH_MULTIPLICITY in context
+                    or REL_ENTITY_PATH_MULTIPLICITY_PROOF_IDS in context):
+                raise ValueError(
+                    "incomplete entity evidence cannot carry path multiplicity"
+                )
+            continue
+        if multiplicity not in REL_ENTITY_PATH_MULTIPLICITY_VALUES:
+            raise ValueError("candidate context lacks a valid path multiplicity")
+        if (not isinstance(multiplicity_references, list)
+                or len(multiplicity_references) != 1):
+            raise ValueError(
+                "path multiplicity requires exactly one proof reference"
+            )
+        multiplicity_id = multiplicity_references[0]
+        record = ledger.get(multiplicity_id)
+        if not isinstance(multiplicity_id, str) or not isinstance(record, Mapping):
+            raise ValueError("candidate context has an invalid multiplicity proof")
+        if record.get("relation_family") != "wikidata_entity_path_multiplicity":
+            raise ValueError("candidate context references the wrong proof family")
+        expected_facts, expected_records = reduce_entity_path_multiplicity_proofs(
+            entity_plan, [record.get("proof_metta")],
+        )
+        if expected_facts != {
+            REL_ENTITY_PATH_MULTIPLICITY: multiplicity,
+            REL_ENTITY_PATH_MULTIPLICITY_PROOF_IDS: [multiplicity_id],
+        } or expected_records != {multiplicity_id: record}:
+            raise ValueError(
+                "path multiplicity record disagrees with its causal context"
+            )
+        referenced_proofs.add(multiplicity_id)
     if referenced_proofs != set(ledger):
         raise ValueError("relational proof ledger contains unreferenced or missing records")
 
 
 __all__ = [
     "CANONICAL_CONCEPT_BRIDGE_RULE_ID",
+    "CANONICAL_CANDIDATE_CONCEPT_BRIDGE_RULE_ID",
+    "MATERIALIZED_RELATIONAL_WORKSPACE_SCHEMA",
+    "materialized_relational_features",
+    "validate_materialized_relational_projection",
     "CONCEPT_CONTINUITY_RULE_ID",
     "CONCEPT_RELATIONAL_STRUCTURAL_RULES",
     "ConceptBridgePath",
@@ -1585,6 +2263,12 @@ __all__ = [
     "ENGAGED_CONCEPT_RULE_ID",
     "ENTITY_RELATIONAL_STRUCTURAL_RULES",
     "ENTITY_CONTINUITY_RULE_ID",
+    "ENTITY_PATH_CASE_NODE_RULE_ID",
+    "ENTITY_PATH_COUNT_RULE_ID",
+    "ENTITY_PATH_NONE_RULE_ID",
+    "ENTITY_PATH_ONE_RULE_ID",
+    "ENTITY_PATH_ORIGIN_NODE_RULE_ID",
+    "ENTITY_PATH_TWO_PLUS_RULE_ID",
     "RECENT_HISTORY_POSITIONS",
     "RELATIONAL_PROJECTION_SCHEMA",
     "RELATIONAL_SCOPE_VALUES",
@@ -1595,6 +2279,9 @@ __all__ = [
     "REL_CONCEPT_CONTINUITY_SCOPE",
     "REL_ENTITY_CONTINUITY_PROOF_IDS",
     "REL_ENTITY_CONTINUITY_SCOPE",
+    "REL_ENTITY_PATH_MULTIPLICITY",
+    "REL_ENTITY_PATH_MULTIPLICITY_PROOF_IDS",
+    "REL_ENTITY_PATH_MULTIPLICITY_VALUES",
     "RelationalOriginPlan",
     "RelationalProofRoot",
     "RelationalProofPlan",
@@ -1606,6 +2293,7 @@ __all__ = [
     "relational_safety_audit",
     "canonical_annotation_concepts",
     "reduce_concept_relational_proofs",
+    "reduce_entity_path_multiplicity_proofs",
     "reduce_relational_proofs",
     "validate_relational_projection",
 ]

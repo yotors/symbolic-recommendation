@@ -6,18 +6,27 @@ from io import StringIO
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 
 from recommendation.features.relational_workspace import (
+    CANONICAL_CANDIDATE_CONCEPT_BRIDGE_RULE_ID,
     CANONICAL_CONCEPT_BRIDGE_RULE_ID,
     CONCEPT_CONTINUITY_RULE_ID,
     ENGAGED_ENTITY_RULE_ID,
     ENGAGED_CONCEPT_RULE_ID,
     ENTITY_CONTINUITY_RULE_ID,
+    ENTITY_PATH_CASE_NODE_RULE_ID,
+    ENTITY_PATH_COUNT_RULE_ID,
+    ENTITY_PATH_NONE_RULE_ID,
+    ENTITY_PATH_ONE_RULE_ID,
+    ENTITY_PATH_ORIGIN_NODE_RULE_ID,
     REL_CONCEPT_CONTINUITY_PROOF_IDS,
     REL_CONCEPT_CONTINUITY_SCOPE,
     REL_ENTITY_CONTINUITY_PROOF_IDS,
     REL_ENTITY_CONTINUITY_SCOPE,
+    REL_ENTITY_PATH_MULTIPLICITY,
+    REL_ENTITY_PATH_MULTIPLICITY_PROOF_IDS,
     RELATIONAL_PROJECTION_SCHEMA,
     RELATIONAL_WORKSPACE_SCHEMA,
     build_relational_plans,
@@ -49,6 +58,41 @@ class StructuralProofReasoner:
             if plan is None:
                 results.append([])
                 continue
+            if root == "multiplicity":
+                matching_origins=[
+                    item for item in plan.origins if item.matched_entity_ids
+                ]
+                if not matching_origins:
+                    results.append([(
+                        f"(: (by {ENTITY_PATH_NONE_RULE_ID} "
+                        f"(by {ENTITY_PATH_COUNT_RULE_ID} foldall-proof "
+                        f"(by {ENTITY_PATH_CASE_NODE_RULE_ID} "
+                        f"{plan.case_candidate_fact_id}))) "
+                        f"(RelEntityPathMultiplicity {plan.case_id} none) "
+                        "(STV 1.0 0.999))"
+                    )])
+                    continue
+                path = matching_origins[0]
+                entity_id = path.matched_entity_ids[0]
+                entity_atom = f"rel_entity_{entity_id.lower()}"
+                results.append([(
+                    f"(: (by {ENTITY_PATH_ONE_RULE_ID} "
+                    f"(by {ENTITY_PATH_COUNT_RULE_ID} foldall-proof "
+                    f"(by {ENTITY_PATH_CASE_NODE_RULE_ID} "
+                    f"{plan.case_candidate_fact_id}) "
+                    f"(by {ENTITY_PATH_ORIGIN_NODE_RULE_ID} "
+                    f"(by {ENTITY_CONTINUITY_RULE_ID} "
+                    f"{plan.case_candidate_fact_id} "
+                    f"(by {ENGAGED_ENTITY_RULE_ID} "
+                    f"{path.observed_click_fact_id} "
+                    f"{path.history_entity_fact_ids[0]}) "
+                    f"{path.candidate_entity_fact_ids[0]} "
+                    f"(RelEntityContinuity {plan.case_id} "
+                    f"{path.origin_id} {entity_atom}))))) "
+                    f"(RelEntityPathMultiplicity {plan.case_id} one) "
+                    "(STV 1.0 0.999))"
+                )])
+                continue
             if hasattr(origin, "matched_entity_ids"):
                 path_index = origin.matched_entity_ids.index(root.matched_value_id)
                 entity_atom = root.matched_value_atom
@@ -78,7 +122,7 @@ class StructuralProofReasoner:
                     f"(by {CANONICAL_CONCEPT_BRIDGE_RULE_ID} "
                     f"{history.annotation_anchor_fact_id} "
                     f"{history.canonical_mapping_fact_id})) "
-                    f"(by {CANONICAL_CONCEPT_BRIDGE_RULE_ID} "
+                    f"(by {CANONICAL_CANDIDATE_CONCEPT_BRIDGE_RULE_ID} "
                     f"{candidate.annotation_anchor_fact_id} "
                     f"{candidate.canonical_mapping_fact_id})) "
                     f"(RelConceptContinuity {plan.case_id} {origin.origin_id} "
@@ -143,7 +187,9 @@ class RelationalProjectionTest(unittest.TestCase):
         data = source or self.source
         article_map = {article["id"]: article for article in data["articles"]}
         expected = {}
-        for user, candidate, history in (("u", "C", ["H"]),):
+        for user, candidate, history in (
+            ("u", "C", ["H"]), ("u", "D", ["H"]),
+        ):
             plans = build_relational_plans(
                 candidate, history, article_map, data["llm_article_annotations"],
                 user_id=user,
@@ -152,6 +198,11 @@ class RelationalProjectionTest(unittest.TestCase):
                 origins = {origin.origin_id: origin for origin in plan.origins}
                 for root in plan.proof_roots:
                     expected[root.query] = (plan, origins[root.origin_id], root)
+            entity_plan = plans[0]
+            if entity_plan.entity_path_multiplicity_query is not None:
+                expected[entity_plan.entity_path_multiplicity_query] = (
+                    entity_plan, None, "multiplicity",
+                )
         return StructuralProofReasoner(expected)
 
     def project(self, source=None):
@@ -176,8 +227,10 @@ class RelationalProjectionTest(unittest.TestCase):
         self.assertEqual(result["tests"][0]["labels"], {"C": 1, "D": 0})
         self.assertEqual(result["events"][0][REL_ENTITY_CONTINUITY_SCOPE], "recent")
         self.assertEqual(result["events"][0][REL_CONCEPT_CONTINUITY_SCOPE], "recent")
+        self.assertEqual(result["events"][0][REL_ENTITY_PATH_MULTIPLICITY], "one")
         self.assertEqual(result["events"][1][REL_ENTITY_CONTINUITY_SCOPE], "none")
         self.assertEqual(result["events"][1][REL_CONCEPT_CONTINUITY_SCOPE], "none")
+        self.assertEqual(result["events"][1][REL_ENTITY_PATH_MULTIPLICITY], "none")
         self.assertEqual(
             result["tests"][0]["candidate_context"]["C"][REL_ENTITY_CONTINUITY_SCOPE],
             "recent",
@@ -187,6 +240,9 @@ class RelationalProjectionTest(unittest.TestCase):
         self.assertIn(refs[0], result["relational_proof_ledger"])
         self.assertNotIn("label", result["relational_proof_ledger"][refs[0]])
         self.assertEqual(len(result["events"][0][REL_CONCEPT_CONTINUITY_PROOF_IDS]), 1)
+        self.assertEqual(
+            len(result["events"][0][REL_ENTITY_PATH_MULTIPLICITY_PROOF_IDS]),1,
+        )
         validate_relational_projection(result)
 
     def test_projection_queries_every_specific_root_with_per_root_budget(self):
@@ -195,20 +251,43 @@ class RelationalProjectionTest(unittest.TestCase):
             self.source, reasoner=reasoner, query_batch_size=2, query_steps=17,
         )
         queries = [query for call, _steps, _timeout in reasoner.query_calls for query in call]
-        self.assertEqual(len(queries), 2)
-        self.assertEqual(len(set(queries)), 2)
-        self.assertTrue(all("$origin" not in query for query in queries))
+        self.assertEqual(len(queries), 4)
+        self.assertEqual(len(set(queries)), 4)
+        self.assertEqual(sum("$value" in query for query in queries),2)
         self.assertEqual(reasoner.query_calls[0][1], 34)
+        self.assertEqual(
+            [steps for _queries,steps,_timeout in reasoner.query_calls[1:]],
+            [2_000,2_000],
+        )
+        self.assertTrue(all(
+            len(queries)==1
+            for queries,_steps,_timeout in reasoner.query_calls[1:]
+        ))
         audit = result["metadata"]["relational_workspace"]
         self.assertEqual(audit["queryable_plans"], 2)
         self.assertEqual(audit["expected_entity_proof_roots"], 1)
         self.assertEqual(audit["expected_concept_proof_roots"], 1)
-        self.assertEqual(audit["expected_proof_roots"], 2)
-        self.assertEqual(audit["queries_submitted"], 2)
+        self.assertEqual(audit["expected_entity_path_multiplicity_queries"],2)
+        self.assertEqual(audit["expected_proof_roots"], 4)
+        self.assertEqual(audit["queries_submitted"], 4)
         self.assertEqual(audit["complete_proof_roots"], 2)
-        self.assertEqual(audit["wildcard_queries_submitted"], 0)
+        self.assertEqual(audit["complete_entity_path_multiplicity_queries"],2)
+        self.assertEqual(audit["wildcard_queries_submitted"], 2)
         self.assertEqual(audit["query_steps_per_root"], 17)
-        self.assertEqual(audit["total_query_step_budget"], 34)
+        self.assertEqual(
+            audit["entity_path_multiplicity_query_steps_per_root"],2_000,
+        )
+        self.assertEqual(audit["total_query_step_budget"], 4_034)
+        self.assertEqual(audit["maximum_batch_query_step_budget"],2_000)
+        self.assertEqual(audit["query_batches"],3)
+        self.assertEqual(audit["exact_query_calls"],1)
+        self.assertEqual(audit["entity_path_multiplicity_query_calls"],2)
+        self.assertEqual(
+            audit["entity_path_multiplicity_no_path_query_calls"],1,
+        )
+        self.assertEqual(
+            audit["entity_path_multiplicity_positive_path_query_calls"],1,
+        )
 
     def test_root_batch_shards_are_proof_equivalent_to_reference_workspace(self):
         reference = self.project()
@@ -217,7 +296,7 @@ class RelationalProjectionTest(unittest.TestCase):
         shard_root_indices = []
 
         def execute(roots, **kwargs):
-            shard_root_indices.append(tuple(index for index, _plan, _root in roots))
+            shard_root_indices.append(tuple(index for index,*_rest in roots))
             return module._run_reasoner_shard(
                 roots, self.reasoner(), **kwargs,
             )
@@ -230,7 +309,7 @@ class RelationalProjectionTest(unittest.TestCase):
             self.source, query_batch_size=1, query_steps=17,
             shard_root_size=1,
         )
-        self.assertEqual(shard_root_indices, [(0,), (1,)])
+        self.assertEqual(shard_root_indices, [(0,), (1,), (2,), (3,)])
         self.assertEqual(
             sharded["relational_proof_ledger"],
             reference["relational_proof_ledger"],
@@ -238,13 +317,37 @@ class RelationalProjectionTest(unittest.TestCase):
         for before, after in zip(reference["events"], sharded["events"]):
             for field in (
                 REL_ENTITY_CONTINUITY_SCOPE, REL_ENTITY_CONTINUITY_PROOF_IDS,
+                REL_ENTITY_PATH_MULTIPLICITY,
+                REL_ENTITY_PATH_MULTIPLICITY_PROOF_IDS,
                 REL_CONCEPT_CONTINUITY_SCOPE, REL_CONCEPT_CONTINUITY_PROOF_IDS,
             ):
                 self.assertEqual(after[field], before[field])
         audit = sharded["metadata"]["relational_workspace"]
-        self.assertEqual(audit["workspace_shard_count"], 2)
-        self.assertEqual(audit["query_batches"], 2)
+        self.assertEqual(audit["workspace_shard_count"], 4)
+        self.assertEqual(audit["query_batches"], 4)
         validate_relational_projection(sharded)
+
+    def test_shard_checkpoint_is_atomic_and_bound_to_exact_roots(self):
+        import recommendation.pipelines.relational_data as module
+        shard = ((3, SimpleNamespace(case_id="case_a"), "(query A)",
+                  "exact", "origin/value"),)
+        identity = {"source_sha256": "a" * 64, "query_steps": 17}
+        result = {"root_results": [(3, ["proof"])], "proof_roots": 1}
+        with tempfile.TemporaryDirectory() as directory:
+            path, digest = module._shard_checkpoint_path(
+                Path(directory), identity, 0, shard,
+            )
+            module._write_shard_checkpoint(path, digest, 0, result)
+            self.assertEqual(
+                module._read_shard_checkpoint(path, digest, 0),
+                {"root_results": [[3, ["proof"]]], "proof_roots": 1},
+            )
+            changed, _ = module._shard_checkpoint_path(
+                Path(directory), {**identity, "query_steps": 18}, 0, shard,
+            )
+            self.assertNotEqual(path, changed)
+            with self.assertRaisesRegex(ValueError, "invalid relational shard"):
+                module._read_shard_checkpoint(path, "b" * 64, 0)
 
     def test_statement_name_collision_is_rejected_before_sharding(self):
         import recommendation.pipelines.relational_data as module
@@ -296,6 +399,8 @@ class RelationalProjectionTest(unittest.TestCase):
             self.assertEqual(context[REL_CONCEPT_CONTINUITY_SCOPE], "unknown")
             self.assertEqual(context[REL_ENTITY_CONTINUITY_PROOF_IDS], [])
             self.assertEqual(context[REL_CONCEPT_CONTINUITY_PROOF_IDS], [])
+            self.assertNotIn(REL_ENTITY_PATH_MULTIPLICITY,context)
+            self.assertNotIn(REL_ENTITY_PATH_MULTIPLICITY_PROOF_IDS,context)
         self.assertEqual(result["relational_proof_ledger"], {})
         validate_relational_projection(result)
 
@@ -331,10 +436,14 @@ class RelationalProjectionTest(unittest.TestCase):
             self.assertEqual(
                 {key: event_before[key] for key in (
                     REL_ENTITY_CONTINUITY_SCOPE, REL_ENTITY_CONTINUITY_PROOF_IDS,
+                    REL_ENTITY_PATH_MULTIPLICITY,
+                    REL_ENTITY_PATH_MULTIPLICITY_PROOF_IDS,
                     REL_CONCEPT_CONTINUITY_SCOPE, REL_CONCEPT_CONTINUITY_PROOF_IDS,
                 )},
                 {key: event_after[key] for key in (
                     REL_ENTITY_CONTINUITY_SCOPE, REL_ENTITY_CONTINUITY_PROOF_IDS,
+                    REL_ENTITY_PATH_MULTIPLICITY,
+                    REL_ENTITY_PATH_MULTIPLICITY_PROOF_IDS,
                     REL_CONCEPT_CONTINUITY_SCOPE, REL_CONCEPT_CONTINUITY_PROOF_IDS,
                 )},
             )
@@ -377,6 +486,10 @@ class RelationalProjectionTest(unittest.TestCase):
             timing_keys,
             {
                 "planning", "atomspace_insertion", "petta_queries",
+                "petta_exact_queries",
+                "petta_entity_path_multiplicity_queries",
+                "petta_entity_path_multiplicity_no_path_queries",
+                "petta_entity_path_multiplicity_positive_path_queries",
                 "shard_execution_wall",
                 "reduction_and_ledger_serialization", "total_projection",
             },

@@ -32,6 +32,12 @@ import traceback
 
 from ..features.relational_workspace import (
     CANONICAL_CONCEPT_BRIDGE_RULE_ID,
+    ENTITY_PATH_CASE_NODE_RULE_ID,
+    ENTITY_PATH_COUNT_RULE_ID,
+    ENTITY_PATH_NONE_RULE_ID,
+    ENTITY_PATH_ONE_RULE_ID,
+    ENTITY_PATH_ORIGIN_NODE_RULE_ID,
+    ENTITY_PATH_TWO_PLUS_RULE_ID,
     RELATIONAL_PROJECTION_SCHEMA,
     RELATIONAL_STRUCTURAL_RULES,
     RELATIONAL_WORKSPACE_FEATURES,
@@ -40,15 +46,24 @@ from ..features.relational_workspace import (
     REL_CONCEPT_CONTINUITY_SCOPE,
     REL_ENTITY_CONTINUITY_PROOF_IDS,
     REL_ENTITY_CONTINUITY_SCOPE,
+    REL_ENTITY_PATH_MULTIPLICITY,
+    REL_ENTITY_PATH_MULTIPLICITY_PROOF_IDS,
     build_relational_plans,
     relational_context_observations_sha256,
     reduce_concept_relational_proofs,
+    reduce_entity_path_multiplicity_proofs,
     reduce_relational_proofs,
     relational_safety_audit,
     validate_relational_projection,
 )
 from .recency_data import _evaluation, _history, _read
 from ..paths import WORKSPACE_ROOT
+
+
+# FoldAll must enumerate the complete origin subgraph before its categorical
+# result is meaningful.  Give every categorical query its own fixed expansion
+# budget; sharing a query_many budget lets one candidate starve another.
+ENTITY_PATH_MULTIPLICITY_QUERY_STEPS = 2_000
 
 
 def _positive_integer(value, label):
@@ -77,6 +92,71 @@ def _new_reasoner():
             "PeTTaChainer is required; use the PeTTaChainer virtual environment"
         ) from exc
     return PeTTaChainer()
+
+
+def _isolated_query_workspace_process(connection, statements, requests):
+    """Execute arbitrary proof requests on one short-lived shared engine."""
+
+    try:
+        engine = _new_reasoner()
+        engine.add_atoms_no_check(list(statements))
+        results = [
+            engine.query_many(list(queries), steps=steps, timeout_sec=0)
+            for queries, steps in requests
+        ]
+        connection.send(("ok", results))
+    except BaseException as exc:  # pragma: no cover - exercised by parent
+        connection.send((
+            "error", exc.__class__.__name__, str(exc), traceback.format_exc(),
+        ))
+    finally:
+        connection.close()
+
+
+def _run_isolated_query_workspace(statements, requests):
+    """Run real PeTTa requests in one spawned workspace, then retire Janus.
+
+    Integration tests use this seam when several queries must share one
+    AtomSpace.  The spawned process prevents PeTTa's process-global runtime
+    from colliding with a server worker imported earlier in the test process.
+    """
+
+    normalized_statements = tuple(str(statement) for statement in statements)
+    normalized_requests = tuple(
+        (tuple(str(query) for query in queries), _positive_integer(steps, "steps"))
+        for queries, steps in requests
+    )
+    context = mp.get_context("spawn")
+    parent, child = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_isolated_query_workspace_process,
+        args=(child, normalized_statements, normalized_requests),
+        name="relational-petta-one-shot-workspace", daemon=False,
+    )
+    try:
+        process.start()
+        child.close()
+        try:
+            payload = parent.recv()
+        except EOFError as exc:
+            raise RuntimeError(
+                "PeTTa one-shot workspace exited without returning a result"
+            ) from exc
+    finally:
+        parent.close()
+        process.join()
+    if process.exitcode != 0:
+        raise RuntimeError(
+            "PeTTa one-shot workspace exited unexpectedly "
+            f"({process.exitcode})"
+        )
+    if not payload or payload[0] != "ok":
+        _status, error_type, message, error_traceback = payload
+        raise RuntimeError(
+            f"PeTTa one-shot workspace failed [{error_type}]: "
+            f"{message}\n{error_traceback}"
+        )
+    return payload[1]
 
 
 def _article_mapping(data):
@@ -168,13 +248,33 @@ def _root_batch_shards(indexed_roots, query_batch_size, shard_root_size):
     )
 
 
+def _reasoner_query_batches(indexed_roots, query_batch_size):
+    """Batch exact roots while isolating every FoldAll category root."""
+
+    pending_exact = []
+    for item in indexed_roots:
+        kind = item[3]
+        if kind == "entity_path_multiplicity":
+            if pending_exact:
+                yield tuple(pending_exact)
+                pending_exact.clear()
+            yield (item,)
+            continue
+        pending_exact.append(item)
+        if len(pending_exact) == query_batch_size:
+            yield tuple(pending_exact)
+            pending_exact.clear()
+    if pending_exact:
+        yield tuple(pending_exact)
+
+
 def _run_reasoner_shard(
     indexed_roots, engine, *, add_batch_size, query_batch_size, query_steps,
 ):
     """Execute one root-batch-preserving proof shard."""
 
     statements = set(RELATIONAL_STRUCTURAL_RULES)
-    for _root_index, plan, _root in indexed_roots:
+    for _root_index, plan, _query, _kind, _diagnostic in indexed_roots:
         statements.update(plan.statements)
     ordered_statements = sorted(statements)
     ordered_source_statements = sorted(
@@ -191,33 +291,74 @@ def _run_reasoner_shard(
     roots = list(indexed_roots)
     root_results = []
     query_batches = 0
+    exact_query_calls = 0
+    multiplicity_query_calls = 0
+    multiplicity_no_path_query_calls = 0
+    multiplicity_positive_path_query_calls = 0
     proof_rows_returned = 0
-    query_started = time.perf_counter()
-    for start in range(0, len(roots), query_batch_size):
+    query_seconds = 0.0
+    exact_query_seconds = 0.0
+    multiplicity_query_seconds = 0.0
+    multiplicity_no_path_query_seconds = 0.0
+    multiplicity_positive_path_query_seconds = 0.0
+    for batch in _reasoner_query_batches(roots, query_batch_size):
         query_batches += 1
-        batch = roots[start:start + query_batch_size]
-        results = engine.query_many(
-            [root.query for _root_index, _plan, root in batch],
-            steps=query_steps * len(batch), timeout_sec=0,
+        category = batch[0][3] == "entity_path_multiplicity"
+        if category and len(batch) != 1:
+            raise RuntimeError(
+                "entity-path multiplicity queries must execute independently"
+            )
+        steps = (
+            ENTITY_PATH_MULTIPLICITY_QUERY_STEPS
+            if category else query_steps * len(batch)
         )
+        query_started = time.perf_counter()
+        results = engine.query_many(
+            [query for _root_index, _plan, query, _kind, _diagnostic in batch],
+            steps=steps, timeout_sec=0,
+        )
+        elapsed = time.perf_counter() - query_started
+        query_seconds += elapsed
+        if category:
+            multiplicity_query_calls += 1
+            multiplicity_query_seconds += elapsed
+            plan = batch[0][1]
+            if plan.proof_roots:
+                multiplicity_positive_path_query_calls += 1
+                multiplicity_positive_path_query_seconds += elapsed
+            else:
+                multiplicity_no_path_query_calls += 1
+                multiplicity_no_path_query_seconds += elapsed
+        else:
+            exact_query_calls += 1
+            exact_query_seconds += elapsed
         if not isinstance(results, Sequence) or len(results) != len(batch):
             raise RuntimeError("PeTTaChainer returned an invalid query batch")
-        for (root_index, _plan, root), proofs in zip(batch, results):
+        for (root_index, _plan, _query, _kind, diagnostic), proofs in zip(
+            batch, results,
+        ):
             if not isinstance(proofs, Sequence) or isinstance(proofs, (str, bytes)):
                 raise RuntimeError("PeTTaChainer returned an invalid proof result")
             if not proofs:
                 raise RuntimeError(
                     "a required relational proof root returned no PeTTaChainer proof: "
-                    f"{root.origin_id}/{root.matched_value_id}"
+                    f"{diagnostic}"
                 )
             root_results.append((root_index, list(proofs)))
             proof_rows_returned += len(proofs)
-    query_seconds = time.perf_counter() - query_started
     return {
         "root_results": root_results,
-        "plan_count": len({plan.case_id for _index, plan, _root in roots}),
+        "plan_count": len({plan.case_id for _index, plan, *_rest in roots}),
         "proof_roots": len(roots),
         "query_batches": query_batches,
+        "exact_query_calls": exact_query_calls,
+        "entity_path_multiplicity_query_calls": multiplicity_query_calls,
+        "entity_path_multiplicity_no_path_query_calls": (
+            multiplicity_no_path_query_calls
+        ),
+        "entity_path_multiplicity_positive_path_query_calls": (
+            multiplicity_positive_path_query_calls
+        ),
         "proof_rows_returned": proof_rows_returned,
         "source_statements": len(ordered_source_statements),
         "atomspace_statements": len(ordered_statements),
@@ -231,6 +372,14 @@ def _run_reasoner_shard(
         ).encode("utf-8")).hexdigest(),
         "insertion_seconds": insertion_seconds,
         "query_seconds": query_seconds,
+        "exact_query_seconds": exact_query_seconds,
+        "entity_path_multiplicity_query_seconds": multiplicity_query_seconds,
+        "entity_path_multiplicity_no_path_query_seconds": (
+            multiplicity_no_path_query_seconds
+        ),
+        "entity_path_multiplicity_positive_path_query_seconds": (
+            multiplicity_positive_path_query_seconds
+        ),
         "reasoner": f"{type(engine).__module__}.{type(engine).__qualname__}",
     }
 
@@ -256,28 +405,115 @@ def _reasoner_shard_process(
 
 def _run_isolated_reasoner_shard(
     indexed_roots, *, add_batch_size, query_batch_size, query_steps,
+    checkpoint_dir=None, checkpoint_identity=None,
 ):
     """Spawn, collect, and fully retire one PeTTa shard."""
 
     return _run_isolated_reasoner_shards(
         (indexed_roots,), workers=1, add_batch_size=add_batch_size,
         query_batch_size=query_batch_size, query_steps=query_steps,
+        checkpoint_dir=checkpoint_dir,
+        checkpoint_identity=checkpoint_identity,
     )[0]
+
+
+def _shard_checkpoint_path(checkpoint_dir, checkpoint_identity, shard_index, shard):
+    roots = [
+        {
+            "root_index": root_index,
+            "case_id": plan.case_id,
+            "query": query,
+            "kind": kind,
+            "diagnostic": diagnostic,
+        }
+        for root_index, plan, query, kind, diagnostic in shard
+    ]
+    payload = {
+        "schema": "recommendation-relational-shard-checkpoint-v1",
+        "identity": checkpoint_identity,
+        "shard_index": shard_index,
+        "roots": roots,
+    }
+    digest = hashlib.sha256(json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")).hexdigest()
+    return checkpoint_dir / f"shard_{shard_index:06d}_{digest}.json", digest
+
+
+def _write_shard_checkpoint(path, digest, shard_index, result):
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent,
+            prefix=f".{path.name}.", delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            json.dump({
+                "schema": "recommendation-relational-shard-checkpoint-v1",
+                "digest": digest,
+                "shard_index": shard_index,
+                "result": result,
+            }, stream, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _read_shard_checkpoint(path, digest, shard_index):
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if (value.get("schema") != "recommendation-relational-shard-checkpoint-v1"
+            or value.get("digest") != digest
+            or value.get("shard_index") != shard_index
+            or not isinstance(value.get("result"), Mapping)):
+        raise ValueError(f"invalid relational shard checkpoint: {path}")
+    return value["result"]
 
 
 def _run_isolated_reasoner_shards(
     shards, *, workers, add_batch_size, query_batch_size, query_steps,
+    checkpoint_dir=None, checkpoint_identity=None,
 ):
     """Execute one-process-per-shard in bounded concurrent waves."""
 
     context = mp.get_context("spawn")
     results = [None] * len(shards)
-    for wave_start in range(0, len(shards), workers):
+    pending = []
+    if checkpoint_dir is not None:
+        checkpoint_dir = Path(checkpoint_dir)
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        if checkpoint_identity is None:
+            raise ValueError("checkpoint_identity is required with checkpoint_dir")
+    for shard_index, shard in enumerate(shards):
+        if checkpoint_dir is None:
+            pending.append(shard_index)
+            continue
+        path, digest = _shard_checkpoint_path(
+            checkpoint_dir, checkpoint_identity, shard_index, shard,
+        )
+        if path.exists():
+            results[shard_index] = _read_shard_checkpoint(
+                path, digest, shard_index,
+            )
+        else:
+            pending.append(shard_index)
+    if checkpoint_dir is not None:
+        print(json.dumps({
+            "stage": "relational_checkpoint_resume",
+            "shards": len(shards),
+            "completed": len(shards) - len(pending),
+            "pending": len(pending),
+        }), flush=True)
+
+    for wave_start in range(0, len(pending), workers):
         active = []
         try:
-            for shard_index in range(
-                wave_start, min(len(shards), wave_start + workers)
-            ):
+            for shard_index in pending[wave_start:wave_start + workers]:
                 parent, child = context.Pipe(duplex=False)
                 process = context.Process(
                     target=_reasoner_shard_process,
@@ -314,7 +550,20 @@ def _run_isolated_reasoner_shards(
                         f"PeTTa relational shard {shard_index} failed "
                         f"[{error_type}]: {message}\n{error_traceback}"
                     )
-                results[shard_index] = payload[1]
+                result = payload[1]
+                if checkpoint_dir is not None:
+                    path, digest = _shard_checkpoint_path(
+                        checkpoint_dir, checkpoint_identity,
+                        shard_index, shards[shard_index],
+                    )
+                    _write_shard_checkpoint(path, digest, shard_index, result)
+                results[shard_index] = result
+                print(json.dumps({
+                    "stage": "relational_shard_complete",
+                    "shard": shard_index + 1,
+                    "shards": len(shards),
+                    "proof_roots": result.get("proof_roots"),
+                }), flush=True)
         except BaseException:
             for _shard_index, parent, process in active:
                 parent.close()
@@ -336,6 +585,7 @@ def build_relational_projection(
     query_steps=2_000,
     shard_root_size=5_000,
     shard_workers=1,
+    checkpoint_dir=None,
 ):
     """Return a preserved replay plus proof-derived relational observations."""
 
@@ -346,6 +596,19 @@ def build_relational_projection(
     shard_workers = _positive_integer(shard_workers, "shard_workers")
     total_started = time.perf_counter()
     original, source_hash, source_kind = _read(source)
+    checkpoint_identity = {
+        "projection_schema": RELATIONAL_PROJECTION_SCHEMA,
+        "source_sha256": source_hash,
+        "source_kind": source_kind,
+        "structural_rules_sha256": hashlib.sha256(json.dumps(
+            sorted(RELATIONAL_STRUCTURAL_RULES), ensure_ascii=False,
+            separators=(",", ":"), allow_nan=False,
+        ).encode("utf-8")).hexdigest(),
+        "add_batch_size": add_batch_size,
+        "query_batch_size": query_batch_size,
+        "query_steps": query_steps,
+        "shard_root_size": shard_root_size,
+    }
     metadata = original.get("metadata")
     if original.get("relational_proof_ledger") is not None or (
         isinstance(metadata, Mapping) and metadata.get("relational_workspace") is not None
@@ -370,6 +633,7 @@ def build_relational_projection(
         if any(feature in context for feature in (
             *RELATIONAL_WORKSPACE_FEATURES,
             REL_ENTITY_CONTINUITY_PROOF_IDS,
+            REL_ENTITY_PATH_MULTIPLICITY_PROOF_IDS,
             REL_CONCEPT_CONTINUITY_PROOF_IDS,
         )):
             raise ValueError("source already contains relational observation fields")
@@ -386,6 +650,9 @@ def build_relational_projection(
         coverage[split]["complete_entity_evidence_contexts"] += int(entity_plan.complete_entity_evidence)
         coverage[split]["incomplete_entity_evidence_contexts"] += int(not entity_plan.complete_entity_evidence)
         coverage[split]["queryable_entity_contexts"] += int(entity_plan.requires_query)
+        coverage[split]["entity_path_multiplicity_query_contexts"] += int(
+            entity_plan.requires_entity_path_multiplicity_query
+        )
         coverage[split]["complete_concept_evidence_contexts"] += int(concept_plan.complete_concept_evidence)
         coverage[split]["incomplete_concept_evidence_contexts"] += int(not concept_plan.complete_concept_evidence)
         coverage[split]["queryable_concept_contexts"] += int(concept_plan.requires_query)
@@ -395,11 +662,12 @@ def build_relational_projection(
     # bounded workspaces below; no production reasoner receives this union.
     statement_sources = list(RELATIONAL_STRUCTURAL_RULES)
     for entity_plan, concept_plan in planned.values():
-        # Complete no-path plans reduce to explicit ``none`` and incomplete
-        # plans abstain as ``unknown``. Neither needs to occupy the temporary
-        # proof AtomSpace. Only load plans whose label-free overlap prefilter
-        # says a proof path can exist; PeTTa must still prove every such root.
-        if entity_plan.requires_query:
+        # Exact continuity only loads plans whose label-free overlap prefilter
+        # says a path can exist. Multiplicity is different: every complete
+        # entity snapshot is loaded so PeTTa can prove ``none`` from the case
+        # anchor as well as ``one``/``two_plus`` from origin paths.
+        if (entity_plan.requires_query
+                or entity_plan.requires_entity_path_multiplicity_query):
             statement_sources.extend(entity_plan.statements)
         if concept_plan.requires_query:
             statement_sources.extend(concept_plan.statements)
@@ -411,17 +679,36 @@ def build_relational_projection(
     queryable = [
         plan for pair in planned.values() for plan in pair if plan.requires_query
     ]
-    query_roots = [
-        (plan, root)
+    exact_query_roots = [
+        (
+            plan,root.query,"exact",
+            f"{root.origin_id}/{root.matched_value_id}",
+        )
         for plan in queryable
         for root in plan.proof_roots
     ]
     if any(not plan.proof_roots for plan in queryable):
         raise RuntimeError("a queryable relational plan has no specific proof roots")
 
+    multiplicity_queries = [
+        (
+            entity_plan,entity_plan.entity_path_multiplicity_query,
+            "entity_path_multiplicity",f"{entity_plan.case_id}/category",
+        )
+        for entity_plan, _concept_plan in planned.values()
+        if entity_plan.requires_entity_path_multiplicity_query
+    ]
+    multiplicity_no_path_queries = sum(
+        not plan.proof_roots
+        for plan, _query, _kind, _diagnostic in multiplicity_queries
+    )
+    multiplicity_positive_path_queries = (
+        len(multiplicity_queries) - multiplicity_no_path_queries
+    )
+    query_roots = [*exact_query_roots,*multiplicity_queries]
     indexed_roots = tuple(
-        (index, plan, root)
-        for index, (plan, root) in enumerate(query_roots)
+        (index,plan,query,kind,diagnostic)
+        for index,(plan,query,kind,diagnostic) in enumerate(query_roots)
     )
     # ``reasoner=`` intentionally preserves the original one-workspace seam
     # for deterministic fake reasoners and semantic equivalence tests. Normal
@@ -438,11 +725,22 @@ def build_relational_projection(
         shard_policy = "spawned-root-batch-preserving-workspaces-v1"
 
     proof_results = {plan.case_id: [] for plan in queryable}
+    multiplicity_proof_results = {
+        plan.case_id: [] for plan,_query,_kind,_diagnostic in multiplicity_queries
+    }
     indexed_proof_results = {}
     query_batches = 0
+    exact_query_calls = 0
+    multiplicity_query_calls = 0
+    multiplicity_no_path_query_calls = 0
+    multiplicity_positive_path_query_calls = 0
     proof_rows_returned = 0
     insertion_seconds = 0.0
     query_seconds = 0.0
+    exact_query_seconds = 0.0
+    multiplicity_query_seconds = 0.0
+    multiplicity_no_path_query_seconds = 0.0
+    multiplicity_positive_path_query_seconds = 0.0
     shard_audit = []
     shard_execution_started = time.perf_counter()
     if reasoner is not None:
@@ -456,7 +754,7 @@ def build_relational_projection(
         effective_shard_workers = 1
     else:
         effective_shard_workers = min(shard_workers, len(shards)) if shards else 0
-        if effective_shard_workers <= 1:
+        if effective_shard_workers <= 1 and checkpoint_dir is None:
             shard_results = [
                 _run_isolated_reasoner_shard(
                     shard, add_batch_size=add_batch_size,
@@ -466,9 +764,11 @@ def build_relational_projection(
             ]
         else:
             shard_results = _run_isolated_reasoner_shards(
-                shards, workers=effective_shard_workers,
+                shards, workers=max(1, effective_shard_workers),
                 add_batch_size=add_batch_size,
                 query_batch_size=query_batch_size, query_steps=query_steps,
+                checkpoint_dir=checkpoint_dir,
+                checkpoint_identity=checkpoint_identity,
             )
     for index, result in enumerate(shard_results):
         for root_index, proofs in result.pop("root_results"):
@@ -481,12 +781,34 @@ def build_relational_projection(
         insertion_seconds += result.pop("insertion_seconds")
         query_seconds += result.pop("query_seconds")
         query_batches += result["query_batches"]
+        exact_query_calls += result["exact_query_calls"]
+        multiplicity_query_calls += result[
+            "entity_path_multiplicity_query_calls"
+        ]
+        multiplicity_no_path_query_calls += result[
+            "entity_path_multiplicity_no_path_query_calls"
+        ]
+        multiplicity_positive_path_query_calls += result[
+            "entity_path_multiplicity_positive_path_query_calls"
+        ]
+        exact_query_seconds += result.pop("exact_query_seconds")
+        multiplicity_query_seconds += result.pop(
+            "entity_path_multiplicity_query_seconds"
+        )
+        multiplicity_no_path_query_seconds += result.pop(
+            "entity_path_multiplicity_no_path_query_seconds"
+        )
+        multiplicity_positive_path_query_seconds += result.pop(
+            "entity_path_multiplicity_positive_path_query_seconds"
+        )
         proof_rows_returned += result["proof_rows_returned"]
         shard_audit.append({"index": index, **result})
     if set(indexed_proof_results) != set(range(len(query_roots))):
         raise RuntimeError("PeTTa shards did not return every proof-root index")
-    for root_index, (plan, _root) in enumerate(query_roots):
-        proof_results[plan.case_id].extend(indexed_proof_results[root_index])
+    for root_index, (plan,_query,kind,_diagnostic) in enumerate(query_roots):
+        destination=(multiplicity_proof_results
+                     if kind=="entity_path_multiplicity" else proof_results)
+        destination[plan.case_id].extend(indexed_proof_results[root_index])
     shard_execution_wall_seconds = time.perf_counter() - shard_execution_started
     reasoner_names = sorted({item["reasoner"] for item in shard_audit})
     if not reasoner_names and reasoner is not None:
@@ -511,15 +833,36 @@ def build_relational_projection(
                 if proof_id in ledger and ledger[proof_id] != record:
                     raise RuntimeError("stable relational proof ID collision")
                 ledger[proof_id] = record
+        multiplicity_facts,multiplicity_records=(
+            reduce_entity_path_multiplicity_proofs(
+                entity_plan,
+                multiplicity_proof_results.get(entity_plan.case_id,()),
+            )
+        )
+        entity_facts=reductions[entity_plan.case_id]
+        if set(entity_facts).intersection(multiplicity_facts):
+            raise RuntimeError("relational reductions produced duplicate fields")
+        entity_facts.update(multiplicity_facts)
+        for proof_id,record in multiplicity_records.items():
+            if proof_id in ledger and ledger[proof_id]!=record:
+                raise RuntimeError("stable relational proof ID collision")
+            ledger[proof_id]=record
     for context, entity_plan, concept_plan, split in bindings:
         entity_facts = reductions[entity_plan.case_id]
         concept_facts = reductions[concept_plan.case_id]
         context.update(copy.deepcopy(entity_facts))
         context.update(copy.deepcopy(concept_facts))
         coverage[split][f"entity_scope_{entity_facts[REL_ENTITY_CONTINUITY_SCOPE]}"] += 1
+        multiplicity=entity_facts.get(REL_ENTITY_PATH_MULTIPLICITY)
+        coverage[split][
+            f"entity_path_multiplicity_{multiplicity or 'unknown'}"
+        ] += 1
         coverage[split][f"concept_scope_{concept_facts[REL_CONCEPT_CONTINUITY_SCOPE]}"] += 1
         coverage[split]["entity_proof_origin_references"] += len(
             entity_facts[REL_ENTITY_CONTINUITY_PROOF_IDS]
+        )
+        coverage[split]["entity_path_multiplicity_proof_references"] += len(
+            entity_facts.get(REL_ENTITY_PATH_MULTIPLICITY_PROOF_IDS,())
         )
         coverage[split]["concept_proof_origin_references"] += len(
             concept_facts[REL_CONCEPT_CONTINUITY_PROOF_IDS]
@@ -540,10 +883,16 @@ def build_relational_projection(
         "history_policy": "explicit row-local preceding click histories only; oldest to newest; no latest-profile reconstruction",
         "relations": {
             "wikidata_entity_continuity": "exact shared MIND Wikidata ID between candidate and a preceding clicked article",
+            "wikidata_entity_path_multiplicity": (
+                "PeTTa-derived degree bucket over distinct preceding-click "
+                "origins connected to the candidate by exact Wikidata entities"
+            ),
             "canonical_concept_continuity": "exact shared provenance-anchored canonical concept ID between candidate and a preceding clicked article",
         },
         "inference": (
-            "two PeTTaChainer implications for exact-entity continuity; "
+            "PeTTaChainer proves exact-entity continuity, folds distinct "
+            "interaction-origin path nodes into a graph degree, and classifies "
+            "that degree as none/one/two_plus; "
             "canonical-concept continuity first grounds each named source "
             "annotation through a canonical mapping, then applies the same "
             "origin and continuity implications"
@@ -554,6 +903,12 @@ def build_relational_projection(
         "structural_rule_ids": [
             "rel_v1_derive_engaged_entity_origin",
             "rel_v1_derive_entity_continuity",
+            ENTITY_PATH_CASE_NODE_RULE_ID,
+            ENTITY_PATH_ORIGIN_NODE_RULE_ID,
+            ENTITY_PATH_COUNT_RULE_ID,
+            ENTITY_PATH_NONE_RULE_ID,
+            ENTITY_PATH_ONE_RULE_ID,
+            ENTITY_PATH_TWO_PLUS_RULE_ID,
             CANONICAL_CONCEPT_BRIDGE_RULE_ID,
             "rel_v1_derive_engaged_concept_origin",
             "rel_v1_derive_concept_continuity",
@@ -564,11 +919,22 @@ def build_relational_projection(
         "reasoner": reasoner_name,
         "query_steps": query_steps,
         "query_steps_per_root": query_steps,
-        "query_step_budget_policy": "per-root budget multiplied by roots in each query_many batch",
-        "total_query_step_budget": query_steps * len(query_roots),
-        "maximum_batch_query_step_budget": (
-            query_steps * min(query_batch_size, len(query_roots))
-            if query_roots else 0
+        "entity_path_multiplicity_query_steps_per_root": (
+            ENTITY_PATH_MULTIPLICITY_QUERY_STEPS
+        ),
+        "query_step_budget_policy": (
+            "exact roots share a per-root-multiplied batch budget; every "
+            "entity-path multiplicity FoldAll root has an independent fixed budget"
+        ),
+        "total_query_step_budget": (
+            query_steps * len(exact_query_roots)
+            + ENTITY_PATH_MULTIPLICITY_QUERY_STEPS * len(multiplicity_queries)
+        ),
+        "maximum_batch_query_step_budget": max(
+            query_steps * min(query_batch_size, len(exact_query_roots))
+            if exact_query_roots else 0,
+            ENTITY_PATH_MULTIPLICITY_QUERY_STEPS
+            if multiplicity_queries else 0,
         ),
         "add_batch_size": add_batch_size,
         "query_batch_size": query_batch_size,
@@ -607,10 +973,26 @@ def build_relational_projection(
             len(concept_plan.proof_roots)
             for _entity_plan, concept_plan in planned.values()
         ),
+        "expected_entity_path_multiplicity_queries": len(multiplicity_queries),
+        "expected_entity_path_multiplicity_no_path_queries": (
+            multiplicity_no_path_queries
+        ),
+        "expected_entity_path_multiplicity_positive_path_queries": (
+            multiplicity_positive_path_queries
+        ),
         "queries_submitted": len(query_roots),
-        "wildcard_queries_submitted": 0,
-        "complete_proof_roots": len(query_roots),
+        "wildcard_queries_submitted": len(multiplicity_queries),
+        "complete_proof_roots": len(exact_query_roots),
+        "complete_entity_path_multiplicity_queries": len(multiplicity_queries),
         "query_batches": query_batches,
+        "exact_query_calls": exact_query_calls,
+        "entity_path_multiplicity_query_calls": multiplicity_query_calls,
+        "entity_path_multiplicity_no_path_query_calls": (
+            multiplicity_no_path_query_calls
+        ),
+        "entity_path_multiplicity_positive_path_query_calls": (
+            multiplicity_positive_path_query_calls
+        ),
         "proof_rows_returned": proof_rows_returned,
         "source_statements": len(ordered_source_statements),
         "source_statements_sha256": hashlib.sha256(json.dumps(
@@ -634,6 +1016,16 @@ def build_relational_projection(
             "planning": planning_seconds,
             "atomspace_insertion": insertion_seconds,
             "petta_queries": query_seconds,
+            "petta_exact_queries": exact_query_seconds,
+            "petta_entity_path_multiplicity_queries": (
+                multiplicity_query_seconds
+            ),
+            "petta_entity_path_multiplicity_no_path_queries": (
+                multiplicity_no_path_query_seconds
+            ),
+            "petta_entity_path_multiplicity_positive_path_queries": (
+                multiplicity_positive_path_query_seconds
+            ),
             "shard_execution_wall": shard_execution_wall_seconds,
             "reduction_and_ledger_serialization": reduction_and_serialization_seconds,
             "total_projection": time.perf_counter() - total_started,
@@ -666,6 +1058,13 @@ def main(argv=None):
         "--shard-workers", type=int, default=1,
         help="Maximum concurrently running one-shot PeTTa shard processes",
     )
+    parser.add_argument(
+        "--checkpoint-dir", type=Path,
+        help=(
+            "Optional directory for deterministic completed-shard checkpoints; "
+            "matching checkpoints are resumed on a later invocation"
+        ),
+    )
     args = parser.parse_args(argv)
     output = args.output.resolve()
     if output.exists() or args.output.is_symlink():
@@ -677,6 +1076,7 @@ def main(argv=None):
         query_steps=args.query_steps,
         shard_root_size=args.shard_root_size,
         shard_workers=args.shard_workers,
+        checkpoint_dir=args.checkpoint_dir,
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = None

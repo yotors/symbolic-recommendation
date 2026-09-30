@@ -8,12 +8,16 @@ from recommendation.features.relational_workspace import (
     RELATIONAL_STRUCTURAL_RULES,
     REL_CONCEPT_CONTINUITY_SCOPE,
     REL_ENTITY_CONTINUITY_SCOPE,
+    REL_ENTITY_PATH_MULTIPLICITY,
+    REL_ENTITY_PATH_MULTIPLICITY_PROOF_IDS,
     build_relational_plans,
     reduce_concept_relational_proofs,
     reduce_relational_proofs,
 )
-from recommendation.pipelines.relational_data import _new_reasoner
-from recommendation.pipelines.relational_data import build_relational_projection
+from recommendation.pipelines.relational_data import (
+    _run_isolated_query_workspace,
+    build_relational_projection,
+)
 
 
 def annotation(article_id, *lexicals):
@@ -91,8 +95,19 @@ class RelationalPeTTaProofTest(unittest.TestCase):
             one["metadata"]["relational_workspace"]["workspace_shard_count"], 1,
         )
         self.assertEqual(
-            many["metadata"]["relational_workspace"]["workspace_shard_count"], 2,
+            many["metadata"]["relational_workspace"]["workspace_shard_count"], 3,
         )
+        self.assertEqual(
+            one["events"][0][REL_ENTITY_PATH_MULTIPLICITY],"one",
+        )
+        proof_id=one["events"][0][REL_ENTITY_PATH_MULTIPLICITY_PROOF_IDS][0]
+        proof=one["relational_proof_ledger"][proof_id]
+        self.assertEqual(
+            proof["relation_family"],"wikidata_entity_path_multiplicity",
+        )
+        self.assertEqual(proof["value"],"one")
+        self.assertEqual(len(proof["origin_ids"]),1)
+        self.assertIn("foldall-proof",proof["proof_metta"])
 
     def test_entity_and_concept_continuity_are_real_nested_proofs(self):
         articles = {
@@ -106,15 +121,14 @@ class RelationalPeTTaProofTest(unittest.TestCase):
         entity_plan, concept_plan = build_relational_plans(
             "candidate", ["history"], articles, annotations, user_id="user",
         )
-        engine = _new_reasoner()
-        engine.add_atoms_no_check(sorted({
+        statements=sorted({
             *RELATIONAL_STRUCTURAL_RULES,
             *entity_plan.statements,
             *concept_plan.statements,
-        }))
-        results = engine.query_many(
-            [entity_plan.query, concept_plan.query], steps=2_000, timeout_sec=0,
-        )
+        })
+        results=_run_isolated_query_workspace(
+            statements,[((entity_plan.query,concept_plan.query),2_000)],
+        )[0]
         entity_facts, entity_ledger = reduce_relational_proofs(
             entity_plan, results[0],
         )
@@ -133,10 +147,13 @@ class RelationalPeTTaProofTest(unittest.TestCase):
         self.assertIn(CANONICAL_CONCEPT_BRIDGE_RULE_ID, concept_record["proof_metta"])
         self.assertEqual(
             concept_record["annotation_anchor_fact_ids"],
-            [
-                "anchor_candidate", "anchor_candidate_1",
-                "anchor_history", "anchor_history_1",
-            ],
+            sorted({
+                path.annotation_anchor_fact_id
+                for path in (
+                    *concept_plan.origins[0].candidate_bridge_paths,
+                    *concept_plan.origins[0].history_bridge_paths,
+                )
+            }),
         )
         self.assertEqual(len(concept_record["canonical_mapping_fact_ids"]), 4)
         self.assertTrue(all(
@@ -172,13 +189,18 @@ class RelationalPeTTaProofTest(unittest.TestCase):
         self.assertEqual(len(plan.proof_queries), 20)
         self.assertEqual(len(set(plan.proof_queries)), 20)
 
-        engine = _new_reasoner()
-        engine.add_atoms_no_check(sorted({
+        statements=sorted({
             *RELATIONAL_STRUCTURAL_RULES, *plan.statements,
-        }))
-        results = engine.query_many(
-            plan.proof_queries, steps=32 * len(plan.proof_queries), timeout_sec=0,
+        })
+        wildcard_steps=(8,16,32,64,128,256)
+        all_results=_run_isolated_query_workspace(
+            statements,
+            [
+                (plan.proof_queries,32*len(plan.proof_queries)),
+                *[((plan.query,),steps) for steps in wildcard_steps],
+            ],
         )
+        results=all_results[0]
         self.assertEqual(len(results), 20)
         self.assertTrue(all(results))
         facts, ledger = reduce_relational_proofs(
@@ -194,8 +216,8 @@ class RelationalPeTTaProofTest(unittest.TestCase):
         )
 
         prefix = None
-        for steps in (8, 16, 32, 64, 128, 256):
-            candidate = engine.query(plan.query, steps=steps, timeout_sec=0)
+        for candidate_result in all_results[1:]:
+            candidate=candidate_result[0]
             if 0 < len(candidate) < len(plan.proof_roots):
                 prefix = candidate
                 break
