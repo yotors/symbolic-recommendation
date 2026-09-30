@@ -239,7 +239,7 @@ class LabTest(unittest.TestCase):
         LAB._semantic_preview_cache_bytes=0
         with (
             patch.object(LAB.semantic_client,"parse_article",return_value=converted) as parse,
-            patch("recommendation.app.server.time.monotonic",
+            patch("recommendation.app.lab_serving.time.monotonic",
                   side_effect=[0.0,10.0,20.0,SEMANTIC_CACHE_TTL_SECONDS+5.0]),
         ):
             LAB.preview_semantics(first_article)

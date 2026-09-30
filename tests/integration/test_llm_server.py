@@ -563,7 +563,7 @@ class LLMLabTest(unittest.TestCase):
                 self.assertEqual(enriched[key], value, key)
 
     def test_strict_symbolic_strips_every_llm_field_and_still_mines_and_reasons(self):
-        with patch("recommendation.app.server.build_llm_workspace_facts",
+        with patch("recommendation.app.lab_serving.build_llm_workspace_facts",
                    side_effect=AssertionError("strict mode used LLM observations")):
             strict = Lab(self.data, symbolic_only=True, config={
                 "min_support": 2, "pair_min_support": 2, "max_rules": 8, "pair_max_rules": 8,
