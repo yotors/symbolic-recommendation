@@ -96,12 +96,13 @@ aggregate counters. Put TLS, authentication, rate limiting, and durable event
 storage in the platform ingress/data plane; the bundled gateway intentionally
 owns only local inference orchestration.
 
-On the current 20k-event MIND workspace, the 2026-09-19 process-cold frozen
-model reached readiness in `22.3s`. A fresh 40-candidate, 780-comparison first
-page took `624.6ms`; its next queued infinite-scroll page took `6.8ms`.
+On the current 20k-event MIND workspace, the optimized frozen scorer produced
+a fresh 40-candidate, 780-comparison page in `205.3ms` median across 12 users
+(`159.6–295.5ms`). Its next queued infinite-scroll page took `6.1ms`.
 Incremental proof-backed skip feedback reranked 39 remaining candidates in
-`256.8ms`, recomputing 15 point cases while replaying the existing pair proofs.
-These are single-machine engineering measurements, not capacity percentiles.
+`133.3ms`, recomputing only affected point cases while replaying the existing
+pair proofs. These are single-machine engineering measurements, not capacity
+percentiles.
 
 ## Current measured result
 
@@ -124,14 +125,15 @@ causal, transfer, or SOTA evidence. Exact direct reconstruction matched every
 PeTTaChainer slate order and score signature, establishing faithful execution
 of implemented proof semantics.
 
-The retained production-pool probe measured 450 uncached fresh-user first-page
-requests across two isolated scorers. At concurrency 1/2/4/8, p50 latency was
-`344 / 439 / 565 / 939 ms`; p95 was
-`901 / 913 / 1,384 / 2,202 ms`. Peak throughput was `4.06 requests/s`, with
-zero failures. A separate full process-tree run measured `3.00 GiB` peak RSS,
-`136%` mean CPU, and `373%` peak CPU. Worker termination, automatic restart,
-readiness recovery, and browser-session reset were verified against the live
-gateway.
+The latest bounded production-pool probe measured 75 uncached fresh-user
+first-page requests across two isolated scorers. At concurrency 1/2/4/8, p50
+latency was `220 / 216 / 337 / 671 ms`; p95 was
+`345 / 425 / 736 / 1,288 ms`. Peak throughput was `6.09 requests/s`, with zero
+failures. Against the preceding retained probe, p50 improved by `36% / 51% /
+40% / 29%` and peak throughput improved by `50%`. The earlier full process-tree
+run measured `3.00 GiB` peak RSS, `136%` mean CPU, and `373%` peak CPU. Worker
+termination, automatic restart, readiness recovery, and browser-session reset
+remain covered by the gateway tests.
 
 Machine-readable evidence is retained in `results/benchmark-summary.json`.
 The summary records SHA-256 identities for the full local artifacts, which stay

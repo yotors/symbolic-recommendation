@@ -85,6 +85,33 @@
       "readiness_recovery_verified": true,
       "browser_session_reset_verified": true,
       "model_divergence_guard": true
+    },
+    "optimization_probe": {
+      "measured_at": "2026-10-01",
+      "serving_artifact_sha256": "d87484dc3920d83f8f168eb3c3489797d439e125fd26bfa5243f1e63afd55af3",
+      "sequential_fresh_users": {
+        "requests": 12,
+        "first_page_p50_ms": 205.285,
+        "first_page_min_ms": 159.618,
+        "first_page_max_ms": 295.451,
+        "queued_scroll_ms": 6.130,
+        "feedback_rerank_ms": 133.306,
+        "feedback_candidates_reranked": 39,
+        "feedback_positions_changed": 34,
+        "feedback_pairwise_proofs_reused": true
+      },
+      "scope": "Uncached fresh-user first-page requests through two immutable isolated scorers; 5 synchronized rounds per concurrency level",
+      "requests": 75,
+      "levels": [
+        {"concurrency": 1, "requests": 5, "failures": 0, "p50_ms": 220.335, "p95_ms": 345.491, "requests_per_second": 4.258306},
+        {"concurrency": 2, "requests": 10, "failures": 0, "p50_ms": 215.556, "p95_ms": 425.442, "requests_per_second": 5.943858},
+        {"concurrency": 4, "requests": 20, "failures": 0, "p50_ms": 337.004, "p95_ms": 735.672, "requests_per_second": 5.976281},
+        {"concurrency": 8, "requests": 40, "failures": 0, "p50_ms": 670.694, "p95_ms": 1287.545, "requests_per_second": 6.086749}
+      ],
+      "comparison_to_2026_09_19": {
+        "p50_improvement_percent": {"1": 36.01, "2": 50.94, "4": 40.37, "8": 28.59},
+        "peak_throughput_improvement_percent": 50.01
+      }
     }
   },
   "limitations": [
