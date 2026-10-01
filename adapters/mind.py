@@ -971,6 +971,9 @@ def _entity_similarity_evidence(
     source_article: str,
     history: Iterable[str],
     article_vectors: dict[str, Any],
+    *,
+    need_recent: bool = True,
+    need_long: bool = True,
 ) -> tuple[float | None, float | None]:
     """Compute recent-maximum and long-mean cosine in one history pass."""
 
@@ -984,7 +987,9 @@ def _entity_similarity_evidence(
     recent_start = max(0, len(history_ids) - 5)
     all_similarities: list[float] = []
     recent_similarities: list[float] = []
-    for index, history_id in enumerate(history_ids):
+    selected=(history_ids if need_long else history_ids[recent_start:])
+    start_index=0 if need_long else recent_start
+    for index, history_id in enumerate(selected,start_index):
         previous = article_vectors.get(history_id)
         prepared_previous = (
             None if previous is None else _prepared_vector(previous)
@@ -996,15 +1001,17 @@ def _entity_similarity_evidence(
         )
         if similarity is None:
             continue
-        all_similarities.append(similarity)
-        if index >= recent_start:
+        if need_long:
+            all_similarities.append(similarity)
+        if need_recent and index >= recent_start:
             recent_similarities.append(similarity)
     recent = (
-        None if not recent_similarities else round(max(recent_similarities), 8)
+        None if not need_recent or not recent_similarities
+        else round(max(recent_similarities), 8)
     )
     long_mean = (
         None
-        if not all_similarities
+        if not need_long or not all_similarities
         else round(math.fsum(all_similarities) / len(all_similarities), 8)
     )
     return recent, long_mean
@@ -1115,6 +1122,7 @@ def history_feature_context(
     transition_model: dict[str, Any] | None = None,
     hour: object = None,
     workspace: HistoryFeatureWorkspace | None = None,
+    needed: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Build the same causal history facts for replay and live serving.
 
@@ -1156,9 +1164,16 @@ def history_feature_context(
                                      prepared.subcategory_known)
     recent_subcategories=list(prepared.recent_subcategories)
 
+    selected=None if needed is None else frozenset(needed)
+    wants=lambda feature: selected is None or feature in selected
     vectors=entity_vectors or {}
+    need_recent_entity=wants("entity_recent_top1_similarity")
+    need_long_entity=wants("entity_long_mean_similarity")
     recent_entity_similarity,long_entity_similarity=(
-        _entity_similarity_evidence(candidate_id,history_ids,vectors)
+        _entity_similarity_evidence(
+            candidate_id,history_ids,vectors,
+            need_recent=need_recent_entity,need_long=need_long_entity,
+        ) if need_recent_entity or need_long_entity else (None,None)
     )
 
     context=_feature_context(
@@ -1167,29 +1182,36 @@ def history_feature_context(
         recent_known=recent_known,hour=hour,exposures=Counter(),clicks=Counter(),
         first_seen={},sequence=0,subcategories=subcategories,
         subcategory_known=subcategory_known,
-        title_history_idf_jaccard=title_history_idf_jaccard(
+        title_history_idf_jaccard=(title_history_idf_jaccard(
             candidate, history_ids, normalized_articles, title_idf_model
-        ),
+        ) if wants("title_history_idf_jaccard") else None),
         entity_recent_top1_similarity=recent_entity_similarity,
         entity_long_mean_similarity=long_entity_similarity,
-        recent_subcategory_transition_score=subcategory_transition_score(
+        recent_subcategory_transition_score=(subcategory_transition_score(
             candidate.get("subcategory"),recent_subcategories,transition_model
-        ),
+        ) if wants("recent_subcategory_transition_score") else None),
     )
-    multi_interest = build_multi_interest_facts(
+    multi_interest = (build_multi_interest_facts(
         candidate,
         history_ids,
         normalized_articles,
         semantic_vectors=vectors,
         prepared_history=prepared.multi_interest,
-    )
-    text_semantic = build_semantic_match_facts(
+    ) if selected is None or any(feature.startswith("mi_")
+                                  for feature in selected) else {})
+    text_semantic = (build_semantic_match_facts(
         candidate_id,
         history_ids,
         text_semantic_vectors or {},
         prefix="text_semantic",
         prepared_history=prepared.text_semantic,
-    )
+        needed=selected,
+    ) if selected is None or any(
+        feature.startswith("text_semantic_")
+        and not feature.startswith("text_semantic_centered_")
+        and not feature.startswith("text_semantic_recency_")
+        for feature in selected
+    ) else {})
     return {"topic":candidate["topic"],
             "format":candidate.get("format",_format_bucket(str(candidate.get("title","")))),
             "recent_history_subcategories":recent_subcategories,

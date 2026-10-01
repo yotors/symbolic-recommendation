@@ -210,6 +210,17 @@ class MultiInterestFactsTest(unittest.TestCase):
             for value in facts.values()
         ))
 
+        needed={
+            "semantic_match_top1_similarity",
+            "semantic_match_recent5_max_similarity",
+        }
+        selective=build_semantic_match_facts(
+            "candidate-secret",
+            ["missing-secret", "opposite-secret", "orthogonal-secret", "same-secret"],
+            vectors,recency_decay=0.5,needed=needed,
+        )
+        self.assertEqual(selective,{key:facts[key] for key in needed})
+
     def test_generic_semantic_match_reports_missing_and_rejects_bad_options(self):
         facts = build_semantic_match_facts(
             "missing-candidate", ["known"], {"known":[1.0, 0.0]}

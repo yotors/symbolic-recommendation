@@ -13,8 +13,13 @@ from ..adapters.mind import (
     history_feature_context, prepare_history_feature_workspace,
     subcategory_transition_score,
 )
-from ..features.lexical_workspace import build_lexical_workspace_facts
-from ..features.llm_workspace import LLM_WORKSPACE_FEATURES, build_llm_workspace_facts
+from ..features.lexical_workspace import (
+    LEXICAL_FEATURES, build_lexical_workspace_facts,
+)
+from ..features.llm_workspace import (
+    LLM_WORKSPACE_FEATURES, build_llm_workspace_facts,
+    prewarm_llm_workspace_cache,
+)
 from ..features.recency_workspace import (
     RECENCY_WORKSPACE_FEATURES, build_recency_workspace_facts,
 )
@@ -23,7 +28,9 @@ from ..features.relational_workspace import (
     build_relational_plans, reduce_concept_relational_proofs,
     reduce_relational_proofs,
 )
-from ..features.semantic_workspace import build_semantic_workspace_facts
+from ..features.semantic_workspace import (
+    SEMANTIC_WORKSPACE_FEATURES, build_semantic_workspace_facts,
+)
 from ..integrations.engine import (
     EXPECTED_NL2PLN_CONTRACT, RECOMMENDATION_PREDICATE_SCHEMA,
     PeTTaChainerConfigurationError,
@@ -45,6 +52,7 @@ def make_serving_mixin(
     LIVE_NEGATIVE_FEATURE,
     LIVE_NEGATIVE_GENERALIZATION_WINDOW,
     LIVE_NEGATIVE_RULE_IDS,
+    pair_candidate_source_features,
     RELATIONAL_LIVE_HISTORY_LIMIT,
     RELATIONAL_PROOF_FIELDS,
     RELATIONAL_QUERY_STEPS_PER_ROOT,
@@ -104,7 +112,7 @@ def make_serving_mixin(
         def public_article(self, aid):
             """Article content plus non-ranking metadata safe for the browser."""
             article=dict(self.article(aid))
-            presentation=self._article_presentation.get(str(aid))
+            presentation=getattr(self,"_article_presentation",{}).get(str(aid))
             if presentation:
                 article["presentation"]=presentation
             return article
@@ -223,7 +231,8 @@ def make_serving_mixin(
                     match="none"
             return {LIVE_NEGATIVE_FEATURE:match}
 
-        def features(self,user,article,history_workspace=None):
+        def features(self,user,article,history_workspace=None,needed=None):
+            needed=None if needed is None else frozenset(needed)
             topic=article.get("topic",article.get("category","unknown"))
             article_format=article.get("format",article.get("subcategory","article"))
             profile=self.data["users"].get(user,{})
@@ -236,24 +245,38 @@ def make_serving_mixin(
                     title_idf_model=self._title_idf_model,
                     transition_model=self.data.get("subcategory_transition_model"),
                     workspace=history_workspace,
+                    needed=needed,
                 )
-                if self._lexical_idf_model:
+                if (self._lexical_idf_model and (
+                        needed is None or needed.intersection(
+                            LEXICAL_FEATURES
+                        ))):
                     attrs.update(build_lexical_workspace_facts(
                         article, (self._articles.get(aid,{}) for aid in history),
                         self._lexical_idf_model,
                     ))
-                if self._semantic_workspace_model:
+                if (self._semantic_workspace_model and (
+                        needed is None or needed.intersection(
+                            SEMANTIC_WORKSPACE_FEATURES
+                        ))):
                     attrs.update(build_semantic_workspace_facts(
                         str(article["id"]),history,self._article_text_vectors,
                         self._semantic_workspace_model,
                     ))
-                if self._recency_workspace:
+                if (self._recency_workspace and (
+                        needed is None or needed.intersection(
+                            RECENCY_WORKSPACE_FEATURES
+                        ))):
                     attrs.update(build_recency_workspace_facts(
                         str(article["id"]),history,self._article_text_vectors,
                     ))
-                if self._llm_workspace:
+                if (self._llm_workspace and (
+                        needed is None or needed.intersection(
+                            LLM_WORKSPACE_FEATURES
+                        ))):
                     attrs.update(build_llm_workspace_facts(
                         str(article["id"]),history,self._llm_article_annotations,
+                        needed=needed,
                     ))
                 attrs.update(self._negative_feedback_features(user,article))
                 return attrs
@@ -286,7 +309,7 @@ def make_serving_mixin(
                     **self._negative_feedback_features(user,article)}
 
         def contextual_features(self,user,article,context=None,
-                                history_workspace=None):
+                                history_workspace=None,needed=None):
             # A persisted pre-impression snapshot is authoritative, including
             # missing values. Never fill its absent evidence from a later live
             # profile: that can import future history into cold-start replay.
@@ -297,7 +320,8 @@ def make_serving_mixin(
                        "format":article.get("format","article")}
             else:
                 attrs=self.features(
-                    user,article,history_workspace=history_workspace
+                    user,article,history_workspace=history_workspace,
+                    needed=needed,
                 )
             if context:
                 attrs.update({
@@ -1236,6 +1260,7 @@ def make_serving_mixin(
             # candidate identity (and therefore a new PeTTa query) for every
             # impression.
             active=set(FEATURE_PROFILES[self.config["feature_profile"]])
+            needed=self._serving_candidate_features()
             # A persisted replay value is authoritative even when it is
             # ``unknown``. Derive only fields absent from the supplied historical
             # context; this prevents current live history leaking into replay.
@@ -1271,6 +1296,7 @@ def make_serving_mixin(
                 raw_attrs=self.contextual_features(
                     user,self.article(aid),contexts.get(aid),
                     history_workspace=history_workspace,
+                    needed=needed,
                 )
                 for feature,value in live_relational.get(str(aid),{}).items():
                     if feature not in supplied:
@@ -1326,6 +1352,26 @@ def make_serving_mixin(
                 "candidates":len(specs),
             }
             return specs
+
+        def _serving_candidate_features(self):
+            """Candidate facts consumed by the promoted point/pair proof graph."""
+            if getattr(self,"pair_rules",()):
+                self._compile_pair_rule_matcher()
+            needed={predicate for rule in getattr(self,"mined_rules",())
+                    for predicate,_value in rule.get("premises",())}
+            needed.update(pair_candidate_source_features(
+                getattr(self,"_pair_active_predicates",())
+            ))
+            needed.update(("topic","subcategory","format",LIVE_NEGATIVE_FEATURE))
+            return frozenset(needed)
+
+        def _prewarm_candidate_content_cache(self):
+            if not self._llm_workspace:
+                return {"records":0,"fields":0}
+            return prewarm_llm_workspace_cache(
+                self._llm_article_annotations,
+                needed=self._serving_candidate_features(),
+            )
 
 
     return ServingMixin

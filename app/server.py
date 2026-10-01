@@ -1,6 +1,6 @@
 """Live MeTTa-miner -> PeTTaChainer recommendation lab."""
 from __future__ import annotations
-import argparse, gzip, hashlib, hmac, html as html_lib, ipaddress, json, math, multiprocessing as mp, os, re, sys, threading, uuid
+import argparse, gc, gzip, hashlib, hmac, html as html_lib, ipaddress, json, math, multiprocessing as mp, os, re, sys, threading, time, uuid
 from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -864,6 +864,26 @@ def _pair_feature_execution_plan(needed):
     }
 
 
+def _pair_candidate_source_features(predicates):
+    """Return candidate facts required to ground promoted pair predicates."""
+    selected=frozenset(predicates)
+    plan=_pair_feature_execution_plan(tuple(sorted(selected)))
+    sources={source for family in (
+        "lexical","semantic_workspace","ordered","direct_numeric",
+        "multi_interest",
+    ) for _predicate,source in plan[family]}
+    sources.update(source for source,_predicate in plan["quantile"])
+    if "pair_history_scope" in selected:
+        sources.add("history_size_bucket")
+    if "pair_stable_dominance" in selected:
+        sources.update(PAIR_STABLE_DOMINANCE_SOURCES.values())
+    if selected & {
+        "pair_left_llm_format","pair_right_llm_format",
+    }:
+        sources.add("llm_format")
+    return frozenset(sources)
+
+
 MINER_LOCK = threading.RLock()
 MINING_WORKSPACE_SCHEMA_VERSION = 1
 MINING_WORKSPACE_MODE = "incremental_fpminer_support_full_population_ctv_estimation"
@@ -963,6 +983,7 @@ ServingMixin = make_serving_mixin(
     LIVE_NEGATIVE_FEATURE=LIVE_NEGATIVE_FEATURE,
     LIVE_NEGATIVE_GENERALIZATION_WINDOW=LIVE_NEGATIVE_GENERALIZATION_WINDOW,
     LIVE_NEGATIVE_RULE_IDS=LIVE_NEGATIVE_RULE_IDS,
+    pair_candidate_source_features=_pair_candidate_source_features,
     RELATIONAL_LIVE_HISTORY_LIMIT=RELATIONAL_LIVE_HISTORY_LIMIT,
     RELATIONAL_PROOF_FIELDS=RELATIONAL_PROOF_FIELDS,
     RELATIONAL_QUERY_STEPS_PER_ROOT=RELATIONAL_QUERY_STEPS_PER_ROOT,
@@ -1430,10 +1451,23 @@ class Lab(
         ))
 
     def _ensure_candidate_specs(self,specs,*,timeout_sec=None):
+        """Materialize only candidate facts consumed by the selected proof path.
+
+        Weighted point scoring uses alpha-normalized rule-channel templates, so its
+        ordinary mined proofs never read the per-user candidate atoms.  Live
+        feedback is deliberately case-specific and still needs the grounded
+        ``recent_negative_match`` fact.  Shared-target aggregation continues to
+        materialize every candidate because its Engagement query consumes them.
+        """
+        started=time.perf_counter()
         timeout_sec=(self._serving_reasoner_timeout()
                      if timeout_sec is None else float(timeout_sec))
         facts=[]; missing=set()
-        for aid,case,attrs,_raw_attrs in specs:
+        factorized=self.config["aggregation"]=="weighted"
+        for aid,case,attrs,raw_attrs in specs:
+            if (factorized
+                    and raw_attrs.get(LIVE_NEGATIVE_FEATURE,"none")=="none"):
+                continue
             if case in self._loaded_candidates or case in missing: continue
             missing.add(case)
             for predicate,value in attrs.items():
@@ -1448,6 +1482,13 @@ class Lab(
             )
         if facts: self.engine.add_atoms_no_check(facts,timeout_sec=timeout_sec)
         self._loaded_candidates.update(missing)
+        self._last_point_materialization_profile={
+            "factorized_channels":factorized,
+            "candidate_cases_requested":len(specs),
+            "candidate_cases_materialized":len(missing),
+            "candidate_atoms_inserted":len(facts),
+            "total_seconds":time.perf_counter()-started,
+        }
 
     @staticmethod
     def point_channel_case(rule_id,channel,premises):
@@ -1464,6 +1505,21 @@ class Lab(
     def _point_channel_topology(self):
         """Validate the compiler-issued isolated point-channel contract."""
         sources=getattr(self,"_point_channel_sources",None)
+        signature=(
+            tuple(sources) if isinstance(sources,list) else None,
+            tuple((
+                rule.get("id"),rule.get("target"),
+                tuple(tuple(item) for item in rule.get("premises",())),
+                rule.get("strength"),rule.get("confidence"),
+                rule.get("negative_strength"),rule.get("negative_confidence"),
+                rule.get("point_proof_channel_id"),
+                rule.get("point_variant_id"),rule.get("point_decision_id"),
+                json.dumps(rule.get("point_proof_factorization",{}),
+                           sort_keys=True,separators=(",",":")),
+            ) for rule in self.mined_rules),
+        )
+        if signature==getattr(self,"_point_topology_signature",None):
+            return self._point_topology_cache
         if (not isinstance(sources,list)
                 or len(sources)!=2*len(self.mined_rules)
                 or not all(isinstance(source,str) for source in sources)
@@ -1550,7 +1606,10 @@ class Lab(
             raise RuntimeError(
                 "compiled isolated point-channel source set contains unknown rules"
             )
-        return tuple(sorted(topology,key=lambda item:(item[0],item[1])))
+        topology=tuple(sorted(topology,key=lambda item:(item[0],item[1])))
+        self._point_topology_signature=signature
+        self._point_topology_cache=topology
+        return topology
 
     def _weighted_point_proofs(self,specs,*,batch,cache_limit,timeout_sec):
         """Return every active PeTTa-proven isolated point channel."""
@@ -2844,6 +2903,12 @@ def main():
         print(f"Serving model: {args.export_serving_model}")
     if args.export_only:
         LAB.close(); LAB=None; return
+    if args.serving_only:
+        # The dataset, frozen model and compiled proof topology are immutable for
+        # this process. Move that large object graph out of later cyclic-GC scans;
+        # request/session objects remain normally reference-counted and collected.
+        gc.collect()
+        gc.freeze()
     print(f"Recommendation lab: http://{args.host}:{args.port}")
     server=ProductionHTTPServer((args.host,args.port),Handler)
     try: server.serve_forever()

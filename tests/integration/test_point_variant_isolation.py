@@ -119,6 +119,28 @@ class _RecordingEngine:
 
 
 class WeightedPointChannelTest(unittest.TestCase):
+    def test_weighted_channels_only_materialize_live_feedback_cases(self):
+        engine=_RecordingEngine()
+        lab,_shared,_channels=_bare_lab(engine=engine)
+        lab._loaded_candidates=set()
+
+        lab._ensure_candidate_specs([
+            ("article_1","candidate_1",{"feature_1":"active"},
+             {"recent_negative_match":"none"}),
+        ])
+        self.assertEqual(engine.added,[])
+        self.assertEqual(
+            lab._last_point_materialization_profile["candidate_atoms_inserted"],0
+        )
+
+        lab._ensure_candidate_specs([
+            ("article_1","candidate_2",{"recent_negative_match":"topic"},
+             {"recent_negative_match":"topic"}),
+        ])
+        self.assertTrue(engine.added)
+        self.assertTrue(any("Recent_Negative_Match" in atom
+                            for atom in engine.added))
+
     def test_seven_simultaneously_active_rules_are_all_petta_proven(self):
         engine=IsolatedPeTTaChainer()
         self.addCleanup(engine.close)

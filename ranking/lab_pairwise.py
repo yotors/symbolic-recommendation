@@ -62,6 +62,18 @@ def make_pairwise_ranking_mixin(
                 for token,rule_indices in inverted.items()
             }
             self._pair_matcher_required=tuple(map(len,premises))
+            active_predicates={predicate for rule in premises
+                               for predicate,_value in rule}
+            # Categorical sides are grounded as an inseparable observed pair.
+            # Asking the feature builder for only the referenced side would make
+            # the bounding step abstain because its companion side was absent.
+            # Recover categorical pairs from the supplied reverse map without
+            # coupling this module to the server's family table.
+            for predicate in tuple(active_predicates):
+                companion=PAIR_SIDE_PREDICATE_SWAP.get(predicate)
+                if companion is not None:
+                    active_predicates.add(companion)
+            self._pair_active_predicates=frozenset(active_predicates)
 
         def _matching_pair_rule_premises(self,attrs):
             """Return active premises in original rule order via the compiled join."""
@@ -114,7 +126,7 @@ def make_pairwise_ranking_mixin(
             started=time.perf_counter()
             forward_raw=self._pair_features(
                 left_attrs,right_attrs,left_article,right_article,
-                needed=self._pair_feature_vocabulary,
+                needed=self._pair_active_predicates,
             )
             feature_seconds=time.perf_counter()-started
             started=time.perf_counter()
@@ -184,7 +196,7 @@ def make_pairwise_ranking_mixin(
             attrs=self._bounded_pair_features(
                 self._pair_features(
                     left_attrs,right_attrs,left_article,right_article,
-                    needed=self._pair_feature_vocabulary,
+                    needed=self._pair_active_predicates,
                 )
             )
             # Active rules can only distinguish their own premise match vector.
@@ -868,6 +880,10 @@ def make_pairwise_ranking_mixin(
                 "unordered_comparisons":len(comparisons),
                 "oriented_pair_cases":len(pair_specs),
                 "unique_activation_cases_in_slate":len(activation_case_cache),
+                "active_pair_predicates":len(self._pair_active_predicates),
+                "mining_pair_predicates":len(getattr(
+                    self,"_pair_feature_vocabulary",{}
+                )),
                 "comparison_graph_seconds":graph_seconds,
                 "pair_feature_derivation_seconds":feature_seconds,
                 "reverse_orientation_derivation_seconds":reverse_seconds,
@@ -1375,6 +1391,12 @@ def make_pairwise_ranking_mixin(
                 "pair_ranking_seconds":round(rank_seconds,6),
                 "total_seconds":round(time.perf_counter()-score_started,6),
                 "point_reasoner_query_calls":_calls,
+                "point_materialization":{
+                    key:(round(value,6) if isinstance(value,float) else value)
+                    for key,value in getattr(
+                        self,"_last_point_materialization_profile",{}
+                    ).items()
+                },
                 "candidate_plan":{
                     key:(round(value,6) if isinstance(value,float) else value)
                     for key,value in getattr(

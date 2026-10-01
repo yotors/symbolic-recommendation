@@ -373,6 +373,7 @@ def build_semantic_match_facts(
     prefix: str = "semantic_match",
     recency_decay: float = 0.85,
     prepared_history: PreparedSemanticHistory | None = None,
+    needed: Iterable[str] | None = None,
 ) -> dict[str, str | float]:
     """Build generic candidate-relative vector facts from prior history.
 
@@ -396,6 +397,8 @@ def build_semantic_match_facts(
         raise ValueError("prefix must be a non-empty string without whitespace")
     if not 0.0<recency_decay<=1.0:
         raise ValueError("recency_decay must be in (0, 1]")
+    selected=None if needed is None else frozenset(needed)
+    wants=lambda suffix: selected is None or f"{prefix}_{suffix}" in selected
 
     prepared=(prepared_history or prepare_semantic_history(
         history,semantic_vectors
@@ -454,7 +457,8 @@ def build_semantic_match_facts(
             if total else 0.0
         )
 
-    if _np is not None and compatible:
+    need_centroid=wants("centroid_similarity") or wants("centroid_available")
+    if need_centroid and _np is not None and compatible:
         centroid=_np.vstack(compatible).mean(axis=0)
         centroid_norm=float(_np.linalg.norm(centroid))
         centroid=(centroid/centroid_norm if centroid_norm>0.0 else None)
@@ -462,17 +466,21 @@ def build_semantic_match_facts(
             max(0.0,min(1.0,(float(candidate_vector@centroid)+1.0)/2.0))
             if centroid is not None else None
         )
-    else:
+    elif need_centroid:
         centroid=_vector_centroid(compatible)
         centroid_similarity=_unit_cosine(candidate_vector,centroid)
+    else:
+        centroid_similarity=None
 
-    recent_resolved=resolved[-5:]
-    recent=[
-        vector for vector in recent_resolved
-        if (vector is not None and candidate_vector is not None
-            and len(vector)==len(candidate_vector))
-    ]
-    if _np is not None and recent:
+    need_recent=any(wants(suffix) for suffix in (
+        "recent5_available","recent5_centroid_similarity",
+        "recent5_max_similarity",
+    ))
+    recent_resolved=resolved[-5:] if need_recent else ()
+    recent=[vector for vector in recent_resolved
+            if (vector is not None and candidate_vector is not None
+                and len(vector)==len(candidate_vector))]
+    if need_recent and _np is not None and recent:
         recent_matrix=_np.vstack(recent)
         recent_similarities=_np.clip(
             (recent_matrix@candidate_vector+1.0)/2.0,0.0,1.0
@@ -484,7 +492,7 @@ def build_semantic_match_facts(
                 float(candidate_vector@(recent_centroid/recent_norm))+1.0
             )/2.0)) if recent_norm>0.0 else None
         )
-    else:
+    elif need_recent:
         recent_similarities=[
             similarity for similarity in (
                 _unit_cosine(candidate_vector,vector) for vector in recent
@@ -493,8 +501,12 @@ def build_semantic_match_facts(
         recent_centroid_similarity=_unit_cosine(
             candidate_vector,_vector_centroid(recent)
         )
+    else:
+        recent_similarities=[]; recent_centroid_similarity=None
 
-    last20_resolved=resolved[-20:]
+    need_last20=(wants("last20_available")
+                 or wants("last20_recency_decayed_similarity"))
+    last20_resolved=resolved[-20:] if need_last20 else ()
     weighted=[]
     window_size=len(last20_resolved)
     for position,vector in enumerate(last20_resolved):
@@ -541,7 +553,8 @@ def build_semantic_match_facts(
         ),
         f"{prefix}_last20_recency_decayed_similarity":bounded(recency_decayed),
     }
-    return facts
+    return (facts if selected is None else
+            {key:value for key,value in facts.items() if key in selected})
 
 
 def _semantic_prototypes(

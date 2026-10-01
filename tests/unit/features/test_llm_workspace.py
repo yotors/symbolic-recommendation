@@ -34,15 +34,22 @@ class LLMWorkspaceTest(unittest.TestCase):
         self.assertTrue(all(facts[key] is None for key in LLM_NUMERIC_FEATURES))
 
     def test_affinity_peak_and_novelty_have_distinct_formulas(self):
-        facts = build_llm_workspace_facts("c", ["h1", "h2"], {
+        records = {
             "c": {"concepts": ["a", "b", "c", "d"]},
             "h1": {"concepts": ["a", "b"]},
             "h2": {"concepts": ["b"]},
-        })
+        }
+        facts = build_llm_workspace_facts("c", ["h1", "h2"], records)
         self.assertEqual(facts["llm_concept_affinity"], 0.375)
         self.assertEqual(facts["llm_recent_concept_affinity"], 0.375)
         self.assertEqual(facts["llm_concept_peak_overlap"], 0.5)
         self.assertEqual(facts["llm_concept_novelty"], 0.5)
+
+        needed={"llm_concept_peak_overlap", "llm_concept_novelty"}
+        selective=build_llm_workspace_facts(
+            "c", ["h1", "h2"], records, needed=needed,
+        )
+        self.assertEqual(selective,{key:facts[key] for key in needed})
 
     def test_known_disjoint_concepts_are_zero_match_and_complete_novelty(self):
         facts = build_llm_workspace_facts("c", ["h"], {

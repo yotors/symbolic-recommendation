@@ -2185,6 +2185,7 @@ def make_model_lifecycle_mixin(
             identity can be served as user evidence.
             """
             started=time.perf_counter()
+            content_cache=self._prewarm_candidate_content_cache()
             point_specs=[]
             for index,rule in enumerate(self.mined_rules):
                 attrs=dict(rule["premises"])
@@ -2193,6 +2194,10 @@ def make_model_lifecycle_mixin(
                     attrs,attrs,
                 ))
             if point_specs:
+                # Shared-target modes consume grounded candidate atoms. Weighted
+                # mode is factorized and intentionally skips this mutation.
+                if self.config.get("aggregation")!="weighted":
+                    self._ensure_candidate_specs(point_specs)
                 self._proofs_for_specs(point_specs)
 
             pair_specs=[]
@@ -2212,6 +2217,7 @@ def make_model_lifecycle_mixin(
                 "pair_channels":len(self._pair_channel_proof_cache),
                 "point_reasoner_query_calls":self._point_query_calls,
                 "pair_reasoner_query_calls":self._pair_query_calls,
+                "content_cache":content_cache,
             }
             self._proof_cache.clear()
             self._pair_proof_cache.clear()
@@ -2228,6 +2234,7 @@ def make_model_lifecycle_mixin(
             self._pair_channel_activations=0
             self._pair_reused_channel_activations=0
             self._startup_prewarm=audit
+            return audit
 
         def _rebuild_tie_break_stats(self,indexed_events=None):
             """Build safe, training-only priors used only for exact proof ties.
@@ -2860,6 +2867,7 @@ def make_model_lifecycle_mixin(
                 workspace_prune={
                     **self._prune_mining_workspace_cache(),"deferred":False,
                 }
+            serving_prewarm=self._prewarm_serving_channels()
             result={"rules":len(rules),"cases":len(training_events),"source_cases":n,
                     "positives":sample_target_total,"negatives":len(training_events)-sample_target_total,
                     "source_positives":target_total,"source_negatives":n-target_total,
@@ -2906,6 +2914,7 @@ def make_model_lifecycle_mixin(
                     "target_support_unit":("raw_point_case"
                                            if strategy=="target_aware" else None),
                     "target_search":target_search,"pairwise":pair_mining,
+                    "serving_prewarm":serving_prewarm,
                     "seconds":round(time.perf_counter()-started,3),"version":self.version}
             self.last_mining=result
             return result
