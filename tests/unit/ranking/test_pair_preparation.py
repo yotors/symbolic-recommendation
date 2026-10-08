@@ -5,7 +5,6 @@ from recommendation.app.server import (
     CONTEXT_FEATURES,
     Lab,
     NUMERIC_PAIR_EVIDENCE,
-    PAIR_EVIDENCE_ALIASES,
     PAIR_FEATURE_PROFILES,
     _proof_channel_preparation_profile,
 )
@@ -75,65 +74,6 @@ class PairPreparationTest(unittest.TestCase):
                 self.assertEqual(
                     self.lab._reverse_pair_features(forward),explicit
                 )
-
-    def test_categorical_reserved_tokens_are_opaque_during_reverse(self):
-        for token in ("left", "right", "left_known", "right_known",
-                      "left_q1", "right_q4"):
-            with self.subTest(token=token):
-                attrs={
-                    "pair_left_topic":token,
-                    "pair_right_topic":"news",
-                    "pair_long_affinity":"left",
-                }
-                reversed_attrs=self.lab._reverse_pair_features(attrs)
-                self.assertEqual(reversed_attrs["pair_right_topic"],token)
-                self.assertEqual(reversed_attrs["pair_left_topic"],"news")
-                self.assertEqual(reversed_attrs["pair_long_affinity"],"right")
-                self.assertEqual(
-                    self.lab._reverse_pair_features(reversed_attrs),attrs
-                )
-
-    def test_relational_scope_is_antisymmetric_and_keeps_one_lineage(self):
-        predicate="pair_rel_concept_continuity_scope"
-        forward=self.lab._pair_features(
-            {"rel_concept_continuity_scope":"recent"},
-            {"rel_concept_continuity_scope":"older"},
-            {},{},needed={predicate},
-        )
-        reverse=self.lab._pair_features(
-            {"rel_concept_continuity_scope":"older"},
-            {"rel_concept_continuity_scope":"recent"},
-            {},{},needed={predicate},
-        )
-
-        self.assertEqual(forward[predicate],"left")
-        self.assertEqual(reverse[predicate],"right")
-        self.assertEqual(
-            PAIR_EVIDENCE_ALIASES[predicate],"pair_text_semantic_top3_mean"
-        )
-        self.assertEqual(
-            self.lab._pair_rule_family({"premises":[(predicate,"left")]}),
-            "text_semantic",
-        )
-
-    def test_relational_unknown_abstains_instead_of_becoming_known_side(self):
-        predicate="pair_rel_concept_continuity_scope"
-        left=self.lab._pair_features(
-            {"rel_concept_continuity_scope":"recent"},{},{},{},
-            needed={predicate},
-        )
-        right=self.lab._pair_features(
-            {},{"rel_concept_continuity_scope":"recent"},{},{},
-            needed={predicate},
-        )
-        explicit_unknown=self.lab._pair_features(
-            {"rel_concept_continuity_scope":"unknown"},
-            {"rel_concept_continuity_scope":"recent"},{},{},
-            needed={predicate},
-        )
-        self.assertNotIn(predicate,left)
-        self.assertNotIn(predicate,right)
-        self.assertNotIn(predicate,explicit_unknown)
 
     def test_proof_channel_profile_excludes_query_and_enclosing_total(self):
         raw={

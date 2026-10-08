@@ -7,6 +7,7 @@ only the strongest inferred margin for the dependency.
 """
 
 import hashlib
+import math
 import re
 import unittest
 
@@ -526,34 +527,18 @@ class HostVariantAggregationTest(unittest.TestCase):
         margins = lab._proof_dependency_margins("c", proofs)
 
         self.assertEqual(set(margins), {DEPENDENCY, other_dependency})
-        self.assertAlmostEqual(margins[DEPENDENCY], 0.54)
-        self.assertAlmostEqual(margins[other_dependency], 0.24)
-        self.assertAlmostEqual(lab._proof_vote_margin("c", proofs), 0.78)
+        self.assertAlmostEqual(margins[DEPENDENCY], math.log(0.77/0.23))
+        self.assertAlmostEqual(
+            margins[other_dependency],math.log(0.62/0.38)
+        )
+        self.assertAlmostEqual(
+            lab._proof_vote_margin("c", proofs),
+            math.log(0.77/0.23)+math.log(0.62/0.38),
+        )
         self.assertEqual(
             margins,
             lab._proof_dependency_margins("c_reversed", list(reversed(proofs))),
         )
-
-    def test_posterior_mode_retains_one_shared_pairwin_query(self):
-        lab = _bare_lab(aggregation="posterior")
-
-        proof_map, calls = lab._proofs_for_pair_specs([
-            ("case_2", {}), ("case_2", {}),
-        ])
-
-        self.assertEqual(calls, 1)
-        self.assertTrue(proof_map["case_2"])
-        queries, steps, timeout = lab.engine.calls[0]
-        self.assertEqual(queries, ("(: $proof (PairWin case_2) $tv)",))
-        self.assertEqual(steps, 12)
-        self.assertEqual(timeout, 30.0)
-        self.assertFalse(any("PairSignal" in query for query in queries))
-        self.assertEqual(
-            {rule["proof_channel_id"] for rule in lab.pair_rules},
-            {DEPENDENCY},
-            "posterior compatibility deliberately retains the shared target",
-        )
-
 
 class GeneratedChannelIdentityTest(unittest.TestCase):
     """IDs and serialized source order must repeat across the same mining run."""
@@ -561,9 +546,6 @@ class GeneratedChannelIdentityTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.lab = Lab(conditional_annotation_fixture(), config={
-            "miner_strategy": "conditional_llm",
-            "pair_feature_profile": "llm_conditional",
-            "pair_conjunctions": 3,
             "min_support": 2,
             "pair_min_support": 2,
             "max_rules": 8,

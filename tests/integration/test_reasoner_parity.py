@@ -17,9 +17,7 @@ class PairReasonerParityIntegrationTest(unittest.TestCase):
             "max_rules": 8,
             "pair_max_rules": 8,
             "conjunctions": 2,
-            "pair_conjunctions": 2,
-            "pair_aggregation": "proof_margin",
-            "pair_margin_transform": "linear",
+            "pair_conjunctions": 3,
             "pair_margin_power": 1.0,
         })
         cls.addClassCleanup(cls.lab.engine.close)

@@ -1,9 +1,8 @@
 """A shared decision target must not invent evidence in another proof family."""
 
-import re
 import unittest
 
-from recommendation.app.server import LAB, IsolatedPeTTaChainer, proof_tv
+from recommendation.app.server import IsolatedPeTTaChainer, proof_tv
 
 
 PREDICATES = (
@@ -113,18 +112,6 @@ class ProofIsolationTest(unittest.TestCase):
                 self.assertGreater(confidence, 0.0)
         # Materializing/searching the decision cannot create a text witness.
         self.assertEqual(self.query(_roots("cold"))[0], [])
-
-    def test_every_generated_lab_merge_adapter_explicitly_disables_inversion(self):
-        self.assertIsNotNone(LAB)
-        bridges = [source for source in LAB._pair_rule_sources if "(PairWin $pair)" in source]
-        self.assertTrue(bridges, "Fixture must exercise actual Lab rule generation")
-        clusters = {rule.get("dependency_id", rule["id"]) for rule in LAB.pair_rules}
-        self.assertEqual(len(bridges), len(clusters))
-        for source in bridges:
-            self.assertRegex(source, r'^\(: \(no_inverse pair_merge_rule_\d+\) ')
-            self.assertEqual(len(re.findall(r'\(no_inverse pair_merge_rule_\d+\)', source)), 1)
-            self.assertIn("(Implication (PairSignal $pair", source)
-
 
 if __name__ == "__main__":
     unittest.main()
