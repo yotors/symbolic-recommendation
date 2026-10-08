@@ -82,74 +82,19 @@
   </aside>
   <aside class="card research-only">
     <h2>Experiment controls</h2>
+    <p class="muted">The architecture is fixed to the validated champion: conditional LLM-seeded fpMiner rules, PeTTaChainer proof margins and balanced family ranks. Only bounded training and serving parameters are configurable.</p>
     <div class="controls">
-      <label>Mining strategy
-        <select id="minerStrategy">
-          <option value="fixed_combinations" selected>Fixed combinations (champion)</option>
-          <option value="target_aware">Target-aware expansion (experimental)</option>
-          <option value="conditional_llm">LLM-seeded conditional expansion</option>
-          <option value="conditional_llm_seed_only">LLM conditional children (seed-only)</option>
-          <option value="petta_conditional_seed_only">PeTTa target-aware conditional (experimental)</option>
-          <option value="petta_mdl_seed_only">PeTTa MDL selection (experimental)</option>
-          <option value="petta_hierarchical_seed_only">PeTTa hierarchical shrinkage (experimental)</option>
-        </select>
-      </label>
       <label>Min support <input id="min" type="number" value="16" min="1"></label>
       <label>Max rules <input id="max" type="number" value="30" min="1"></label>
-      <label title="Miner depth includes the engagement outcome: depth 3 mines two-premise interactions while retaining one-premise rules.">Max rule atoms <input id="conjunctions" type="number" value="2" min="2" max="4"></label>
       <label>Chain steps/context <input id="chainSteps" type="number" value="10" min="1"></label>
-      <label>Decision scorer
-        <select id="aggregation">
-        <option value="weighted" selected>Proof-gated weighted (best)</option>
-          <option value="hybrid">PeTTaChainer hybrid STV + evidence</option>
-          <option value="max">PeTTaChainer canonical STV</option>
-        </select>
-      </label>
-      <label title="This controls pointwise evidence. With pairwise weight 1, final ordering comes from the separate Pair evidence profile below.">Point evidence profile
-        <select id="featureProfile">
-          <option value="symbolic_only">Structured point facts (no neural predicates)</option>
-          <option value="core">Core (fast)</option>
-          <option value="accuracy">Accuracy (fast)</option>
-          <option value="accuracy_plus">Accuracy + format (experimental)</option>
-          <option value="accuracy_detail" selected>Accuracy detail (recommended for AUC)</option>
-          <option value="accuracy_sequence">Accuracy + ordered-history recency</option>
-          <option value="accuracy_content">Accuracy + title overlap (experimental)</option>
-          <option value="accuracy_rich">Accuracy rich (slow/experimental)</option>
-          <option value="all">All (slow/experimental)</option>
-        </select>
-      </label>
       <label title="Number of skipped impression candidates sampled for each clicked article during mining; 0 keeps all skips.">Negatives per positive <input id="negativeRatio" type="number" value="4" min="0" step="1"></label>
-      <label>Ranking layer
-        <select id="rankingMode">
-          <option value="pairwise" selected>Pairwise ProofRank</option>
-          <option value="pointwise">Pointwise proof score</option>
-        </select>
-      </label>
-      <label title="Blend between PeTTaChainer pairwise tournament score and the pointwise proof order.">Pairwise weight <input id="pairwiseWeight" type="number" value="1" min="0" max="1" step="0.05"></label>
-      <label>Pair fusion
-        <select id="pairwiseFusion"><option value="rank" selected>Borda rank (scale stable)</option><option value="probability">Raw proof probability</option></select>
-      </label>
-      <label>Pair proof aggregation
-        <select id="pairAggregation"><option value="proof_margin" selected>PeTTa STV proof margin</option><option value="posterior">Merged root posterior</option></select>
-      </label>
-      <label>Proof family weighting
-        <select id="pairFamilyFusion"><option value="flat_margin">Calibrated margins</option><option value="balanced_margin">Confidence-aware family margins</option><option value="symbolic_balanced">Balance words, interests and transitions</option><option value="balanced_rank">Legacy text/structured balance</option></select>
-      </label>
-      <label>Pair proof margin
-        <select id="pairMarginTransform"><option value="log_odds" selected>Confidence-shrunk log odds</option><option value="linear">Linear STV margin</option></select>
-      </label>
-      <label title="Positive power applied to each dependency's signed PeTTa proof margin. 1 keeps the proof margin unchanged; values below 1 temper differences between evidence families.">Pair margin power <input id="pairMarginPower" type="number" value="1" min="0.05" max="4" step="0.05"></label>
       <label title="PeTTa input-evidence scale K in confidence n/(n+K). Changing it requires re-mining and must be compared on a held-out gate.">CTV evidence K <input id="ctvEvidenceK" type="number" value="800" min="0.000001" max="1000000000" step="50"></label>
-      <label>Pair evidence profile
-        <select id="pairFeatureProfile"><option value="symbolic_baseline">Symbolic baseline</option><option value="symbolic_precision">Symbolic precise interests</option><option value="symbolic_lexical">Symbolic lexical match</option><option value="symbolic_coverage">Symbolic word coverage</option><option value="symbolic_rich">Symbolic rich workspace</option><option value="stable_multi_interest" selected>Stable multi-interest (legacy embeddings)</option><option value="sequence_multi_interest">Ordered-history multi-interest (challenger)</option><option value="semantic_consensus">Semantic consensus (experimental)</option><option value="text_semantic_attention_t8">T8 semantic comparator</option><option value="text_semantic_attention_t8_quantile">T8 magnitude comparator</option><option value="text_semantic_attention_t8_magnitude_backoff">T8 + strong-magnitude backoff</option><option value="scoped_taxonomy">T8 + scoped taxonomy</option><option value="llm_content">T8 + LLM content facts</option><option value="llm_content_quantile">T8 + LLM magnitude facts</option><option value="llm_conditional">T8 + LLM conditional facts</option><option value="llm_conditional_quantile">T8 + conditional LLM magnitudes</option><option value="llm_conditional_magnitude_backoff">T8/LLM magnitude backoff</option><option value="llm_conditional_scoped_taxonomy">LLM + scoped taxonomy</option><option value="normalized_interest">Normalized-interest quantiles</option><option value="full_quantile">All numeric quantiles</option><option value="all">All predicates (ablation)</option></select>
-      </label>
       <label>Pair min support <input id="pairMinSupport" type="number" value="12" min="1"></label>
       <label title="Minimum click-preference lift required in every usable temporal fold.">Pair min stable effect <input id="pairMinEffect" type="number" value="0.03" min="0" max="1" step="0.01"></label>
       <label>Pair rule cap <input id="pairMaxRules" type="number" value="40" min="1"></label>
       <label title="Same-impression skips paired with each click; 0 keeps every pair.">Pair negatives/click <input id="pairNegativeRatio" type="number" value="8" min="0"></label>
-      <label title="3 enables two-predicate rules; 4 permits a semantic seed plus two stable context gates.">Pair max rule atoms <input id="pairConjunctions" type="number" value="2" min="2" max="4"></label>
       <label title="Training-only quantile resolution for continuous pair evidence.">Numeric evidence bins <input id="pairNumericBins" type="number" value="4" min="1" max="8"></label>
-      <label title="Proof-ranked opponents per candidate; 0 runs the full quadratic tournament.">Pair opponents <input id="pairwiseOpponents" type="number" value="0" min="0"></label>
+      <label title="Confidence scale used while selecting pair rules.">Pair selection K <input id="pairSelectionK" type="number" value="20" min="0.000001"></label>
       <label>Pair chain steps/context <input id="pairChainSteps" type="number" value="12" min="2"></label>
       <label>Top K <input id="top" type="number" value="5" min="1"></label>
       <label>Feed arrival window <input id="feedWindow" type="number" value="40" min="1"></label>
@@ -157,23 +102,13 @@
       <label>Candidate cap <input id="candidateLimit" type="number" value="0" min="0" title="0 keeps every candidate in the original impression"></label>
       <label title="0 uses all loaded impressions; otherwise selects a seed-stable, label-blind subset.">Benchmark impression cap <input id="evalCaseLimit" type="number" value="0" min="0"></label>
       <label>Random seed <input id="seed" type="number" value="7" min="0"></label>
-      <label title="Metric selected by the held-out tuner; AUC evaluates the pairwise ranking signal.">Tune objective
-        <select id="tuneObjective">
-          <option value="auc" selected>AUC (recommended)</option>
-          <option value="ndcg_at_10">nDCG@10</option>
-          <option value="mrr">MRR</option>
-        </select>
-      </label>
-      <label title="During auto-tuning, models this close to the best selected objective are treated as tied and the simpler rule set wins.">Tune objective tolerance <input id="ndcgTolerance" type="number" value="0.0025" min="0" step="0.0005"></label>
     </div>
-    <div class="muted">Pairwise ProofRank mines click-vs-exposure preferences—including entity and recent-subcategory transitions—and asks PeTTaChainer to prove predicates → MinedPairPreference → PairSignal. Pair opponents 0 runs all pairs; a positive value uses a balanced cyclic graph.</div>
-    <div id="featureWarning" class="muted">Accuracy uses the bounded semantic and temporal features most useful for ranking.</div>
+    <div class="muted">Every candidate pair is compared by the same bounded ProofRank tournament. Changing a mining parameter rebuilds the immutable rule snapshot.</div>
     <label><input id="remineBenchmark" type="checkbox" checked> Re-mine the selected training cases before benchmark</label>
     <div class="actions">
       <button id="applyConfig" type="button">Apply</button>
       <button id="mineNow" type="button">Mine now</button>
       <button id="runBenchmark" type="button">Run replay benchmark</button>
-      <button id="autoTune" type="button">Auto-tune held-out</button>
     </div>
     <h3>Latest result</h3>
     <pre id="result" class="muted"></pre>
@@ -237,63 +172,36 @@ function showMessage(message, error = false) {
   $('datasetStatus').className = error ? 'muted status-error' : 'muted status-ok';
 }
 
-function ensureTargetAwareDepths() {
-  if (!['target_aware','conditional_llm','conditional_llm_seed_only','petta_conditional_seed_only','petta_mdl_seed_only','petta_hierarchical_seed_only'].includes($('minerStrategy').value)) return;
-  if (finite($('conjunctions').value, 2) < 3) $('conjunctions').value = 3;
-  if (finite($('pairConjunctions').value, 2) < 3) $('pairConjunctions').value = 3;
-}
-
-function configPayload() {
-  ensureTargetAwareDepths();
-  return {
-    miner_strategy: $('minerStrategy').value || 'fixed_combinations',
+function configPayload(includeBenchmark = false) {
+  const config = {
     min_support: finite($('min').value, 16),
     max_rules: finite($('max').value, 30),
-    conjunctions: finite($('conjunctions').value, 2),
     chain_steps: finite($('chainSteps').value, 10),
-    aggregation: $('aggregation').value || 'weighted',
-    feature_profile: $('featureProfile').value || 'accuracy_detail',
     negative_ratio: finite($('negativeRatio').value, 4),
-    ranking_mode: $('rankingMode').value || 'pairwise',
-    pairwise_weight: finite($('pairwiseWeight').value, 1),
-    pairwise_fusion: $('pairwiseFusion').value || 'rank',
-    pair_aggregation: $('pairAggregation').value || 'proof_margin',
-    pair_margin_transform: $('pairMarginTransform').value || 'log_odds',
-    pair_margin_power: finite($('pairMarginPower').value, 1),
     ctv_evidence_k: finite($('ctvEvidenceK').value, 800),
-    pair_feature_profile: $('pairFeatureProfile').value || 'stable_multi_interest',
-    pair_family_fusion: $('pairFamilyFusion').value || 'flat_margin',
     pair_min_support: finite($('pairMinSupport').value, 12),
     pair_min_effect: finite($('pairMinEffect').value, 0.03),
     pair_max_rules: finite($('pairMaxRules').value, 40),
     pair_negative_ratio: finite($('pairNegativeRatio').value, 8),
-    pair_conjunctions: finite($('pairConjunctions').value, 2),
     pair_numeric_bins: finite($('pairNumericBins').value, 4),
-    pairwise_opponents: finite($('pairwiseOpponents').value, 0),
+    pair_rule_selection_k: finite($('pairSelectionK').value, 20),
     pair_chain_steps: finite($('pairChainSteps').value, 12),
     top_k: finite($('top').value, 5),
     feed_window: finite($('feedWindow').value, 40),
     mine_interval: finite($('interval').value, 8),
-    max_train_cases: finite($('trainCases').value, 20000),
-    max_eval_impressions: finite($('evalImpressions').value, 500),
     max_candidates: finite($('candidateLimit').value, 0),
-    eval_case_limit: finite($('evalCaseLimit').value, 0),
-    random_seed: finite($('seed').value, 7),
-    objective: $('tuneObjective').value || 'auc',
-    objective_tolerance: finite($('ndcgTolerance').value, 0.0025),
-    ndcg_tolerance: finite($('ndcgTolerance').value, 0.0025),
-    remine: $('remineBenchmark').checked
+    random_seed: finite($('seed').value, 7)
   };
+  if (includeBenchmark) {
+    config.eval_case_limit = finite($('evalCaseLimit').value, 0);
+    config.remine = $('remineBenchmark').checked;
+  }
+  return config;
 }
 
 function syncControls() {
   const config = state.config || {};
-  for (const [value, label] of Object.entries({workspace_attention:'Frozen embedding evidence', workspace_centered:'Background-corrected embedding evidence', workspace_contextual:'Semantic support + context (experimental)'})) {
-    if (!Array.from($('pairFeatureProfile').options).some(option => option.value === value)) {
-      $('pairFeatureProfile').add(new Option(label, value));
-    }
-  }
-  const map = {miner_strategy:'minerStrategy', min_support:'min', max_rules:'max', conjunctions:'conjunctions', chain_steps:'chainSteps', aggregation:'aggregation', feature_profile:'featureProfile', negative_ratio:'negativeRatio', ranking_mode:'rankingMode', pairwise_weight:'pairwiseWeight', pairwise_fusion:'pairwiseFusion', pair_aggregation:'pairAggregation', pair_margin_transform:'pairMarginTransform', pair_margin_power:'pairMarginPower', ctv_evidence_k:'ctvEvidenceK', pair_feature_profile:'pairFeatureProfile', pair_min_support:'pairMinSupport', pair_min_effect:'pairMinEffect', pair_max_rules:'pairMaxRules', pair_negative_ratio:'pairNegativeRatio', pair_conjunctions:'pairConjunctions', pair_numeric_bins:'pairNumericBins', pairwise_opponents:'pairwiseOpponents', pair_chain_steps:'pairChainSteps', top_k:'top', feed_window:'feedWindow', mine_interval:'interval', max_train_cases:'trainCases', max_eval_impressions:'evalImpressions', max_candidates:'candidateLimit', random_seed:'seed'};
+  const map = {min_support:'min', max_rules:'max', chain_steps:'chainSteps', negative_ratio:'negativeRatio', ctv_evidence_k:'ctvEvidenceK', pair_min_support:'pairMinSupport', pair_min_effect:'pairMinEffect', pair_max_rules:'pairMaxRules', pair_negative_ratio:'pairNegativeRatio', pair_numeric_bins:'pairNumericBins', pair_rule_selection_k:'pairSelectionK', pair_chain_steps:'pairChainSteps', top_k:'top', feed_window:'feedWindow', mine_interval:'interval', max_candidates:'candidateLimit', random_seed:'seed'};
   for (const [key, id] of Object.entries(map)) if (config[key] !== undefined) {
     const control = $(id);
     if (control.tagName === 'SELECT' && !Array.from(control.options).some(option => option.value === String(config[key]))) {
@@ -301,15 +209,6 @@ function syncControls() {
     }
     control.value = config[key];
   }
-  $('pairFamilyFusion').value = config.pair_family_fusion || 'flat_margin';
-  for (const id of ['featureProfile', 'pairFeatureProfile']) {
-    for (const option of $(id).options) {
-      option.disabled = Boolean(state.engine?.symbolic_only) && !option.value.startsWith('symbolic_');
-      if (option.value.startsWith('workspace_') && !state.engine?.semantic_workspace) option.disabled = true;
-      if (option.value.startsWith('llm_') && !state.engine?.llm_workspace) option.disabled = true;
-    }
-  }
-  updateFeatureWarning();
   const dataset = state.dataset || loadedDataset || {};
   if (dataset.path || dataset.directory) $('datasetPath').value = dataset.path || dataset.directory;
 }
@@ -435,23 +334,6 @@ async function pollMiningState() {
     trace.className = 'mining-trace failed research-only';
     trace.textContent = `Could not read mining state: ${error.message}`;
   } finally { miningPollBusy = false; }
-}
-
-function updateFeatureWarning() {
-  const profile = $('featureProfile').value;
-  const messages = {
-    symbolic_only: 'Point rules use editorial metadata and preceding interactions. The pair-rule profile determines additional semantic evidence; strict no-NN mode is a separate policy.',
-    core: 'Core uses topic, format and coarse affinity for the fastest mining pass.',
-    accuracy: 'Accuracy uses the bounded semantic and temporal features most useful for ranking.',
-    accuracy_plus: 'Accuracy + format adds title-length format to improve candidate resolution; validate its latency and replay metrics.',
-    accuracy_detail: 'Accuracy detail is the recommended AUC profile: absolute/recent topic counts plus fine entity overlap (slower replay).',
-    accuracy_sequence: 'Accuracy + ordered-history recency lets the miner test whether the most recently matched topic or subcategory predicts engagement.',
-    accuracy_content: 'Accuracy + title overlap is a content-similarity experiment; validate on the full replay because it can overfit a small slice.',
-    accuracy_rich: 'Accuracy rich adds subcategory, absolute topic-history count, and fine entity overlap; it is intended for accuracy experiments.',
-    all: 'Performance warning: All mines every available content and temporal feature, increasing mining and proof latency substantially.'
-  };
-  $('featureWarning').textContent = messages[profile] || messages.accuracy;
-  $('featureWarning').className = profile === 'all' ? 'muted status-error' : 'muted';
 }
 
 function optimizationSummary(result = {}) {
@@ -733,6 +615,7 @@ async function eventOf(article, action, displayed = {}) {
       // Keep the server-issued cursor/session, but replace all already-seen
       // cards with the first page of the newly proof-ranked unserved queue.
       $('feed').innerHTML = '';
+      feedSeen = new Set();
       feedContext.clear();
       feedError = null;
       feedHasMore = true;
@@ -803,46 +686,13 @@ async function loadDataset() {
 async function bench() {
   setButtonBusy('runBenchmark', true, 'Running replay…');
   try {
-    const result = await api('/api/benchmark', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(configPayload())});
+    const result = await api('/api/benchmark', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(configPayload(true))});
     $('result').textContent = JSON.stringify({...result, optimization:optimizationSummary(result)}, null, 2);
     state = await api('/api/state');
     renderState();
     await refresh();
   } catch (error) { $('result').textContent = error.message; }
   finally { setButtonBusy('runBenchmark', false); }
-}
-
-async function tune() {
-  setButtonBusy('autoTune', true, 'Tuning held-out…');
-  $('result').textContent = 'Searching configurations on held-out impressions…';
-  try {
-    const result = await api('/api/tune', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(configPayload())});
-    $('result').textContent = JSON.stringify({
-      best_config: result.best_config ?? null,
-      tuning_results: result.tuning_results ?? result.results ?? [],
-      heldout_result: result.heldout_result ?? result.heldout ?? null,
-      split: result.split ?? null,
-      objective: result.objective ?? null,
-      objective_metric: result.objective_metric ?? null,
-      objective_tolerance: result.objective_tolerance ?? result.ndcg_tolerance ?? null,
-      ndcg_tolerance: result.ndcg_tolerance ?? null,
-      active_optimization: optimizationSummary(result.heldout_result ?? result.heldout ?? {})
-    }, null, 2);
-    state = result.state || await api('/api/state');
-    syncControls();
-    renderState();
-    await refresh();
-  } catch (error) {
-    $('result').textContent = `Auto-tune failed: ${error.message}`;
-    try {
-      state = await api('/api/state');
-      syncControls();
-      renderState();
-      await refresh();
-    } catch {}
-  } finally {
-    setButtonBusy('autoTune', false);
-  }
 }
 
 function renderRuns() {
@@ -909,9 +759,6 @@ $('labToggle').addEventListener('click', () => {
 $('applyConfig').addEventListener('click', apply);
 $('mineNow').addEventListener('click', mine);
 $('runBenchmark').addEventListener('click', bench);
-$('autoTune').addEventListener('click', tune);
 $('loadDataset').addEventListener('click', loadDataset);
-$('featureProfile').addEventListener('change', updateFeatureWarning);
-$('minerStrategy').addEventListener('change', ensureTargetAwareDepths);
 init();
 </script>
