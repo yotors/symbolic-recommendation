@@ -1,6 +1,6 @@
 """Live MeTTa-miner -> PeTTaChainer recommendation lab."""
 from __future__ import annotations
-import argparse, gc, gzip, hashlib, hmac, html as html_lib, ipaddress, json, math, multiprocessing as mp, os, re, sys, threading, time, uuid
+import argparse, gc, gzip, hashlib, html as html_lib, json, math, multiprocessing as mp, os, re, sys, threading, time, uuid
 from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -10,25 +10,14 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from ..integrations.engine import (
-    PeTTaChainerClient, PeTTaChainerConfigurationError,
-    PeTTaChainerInputError, PeTTaChainerProtocolError,
-    PeTTaChainerTimeoutError, PeTTaChainerUpstreamError,
+    PeTTaChainerClient, PeTTaChainerConfigurationError, PeTTaChainerInputError,
+    PeTTaChainerProtocolError, PeTTaChainerTimeoutError,
+    PeTTaChainerUpstreamError,
 )
 from ..adapters.mind import load_mind
 from ..core.ctv_calibration import DEFAULT_EVIDENCE_K
 from ..features.text_embeddings import load_text_embedding_sidecar, _canonical_corpus
-from ..features.lexical_workspace import LEXICAL_FEATURES
-from ..features.semantic_workspace import SEMANTIC_WORKSPACE_FEATURES
-from ..features.recency_workspace import RECENCY_WORKSPACE_FEATURES, RECENCY_WORKSPACE_SCHEMA
 from ..features.llm_workspace import LLM_NUMERIC_FEATURES, LLM_WORKSPACE_FEATURES, LLM_WORKSPACE_SCHEMA
-from ..features.relational_workspace import (
-    RELATIONAL_WORKSPACE_SCHEMA,
-    REL_CONCEPT_CONTINUITY_PROOF_IDS,
-    REL_CONCEPT_CONTINUITY_SCOPE,
-    REL_ENTITY_CONTINUITY_PROOF_IDS,
-    REL_ENTITY_CONTINUITY_SCOPE,
-    validate_relational_projection,
-)
 from ..mining.lab_lifecycle import make_model_lifecycle_mixin
 from ..mining.petta_workspace import PeTTaWorkspaceCache
 from ..mining.incremental_fpminer import IncrementalFpMinerCache
@@ -63,10 +52,7 @@ except ImportError as exc:
     raise RuntimeError("Run with PeTTaChainer/.venv; see recommendation/README.md") from exc
 
 from .reasoner import IsolatedPeTTaChainer
-from ..mining.rule_parser import (
-    FEATURES, POSITIVE, STV_RE, balanced_forms, parse_petta_target_rules,
-    parse_rules, proof_tv,
-)
+from ..mining.rule_parser import FEATURES, POSITIVE, parse_rules, proof_tv
 
 LIVE_NEGATIVE_FEATURE = "recent_negative_match"
 LIVE_NEGATIVE_CONCLUSION = "Live_Feedback_Click"
@@ -74,12 +60,6 @@ LIVE_NEGATIVE_CHAIN_STEPS = 4
 LIVE_NEGATIVE_LEVELS = ("exact", "subcategory", "topic", "none")
 LIVE_NEGATIVE_HISTORY_LIMIT = 20
 LIVE_NEGATIVE_GENERALIZATION_WINDOW = 5
-RELATIONAL_LIVE_HISTORY_LIMIT = 50
-RELATIONAL_QUERY_STEPS_PER_ROOT = 32
-RELATIONAL_PROOF_FIELDS = {
-    REL_ENTITY_CONTINUITY_SCOPE: REL_ENTITY_CONTINUITY_PROOF_IDS,
-    REL_CONCEPT_CONTINUITY_SCOPE: REL_CONCEPT_CONTINUITY_PROOF_IDS,
-}
 # A normal cursor request acknowledges the preceding page, so only one entry
 # remains in steady state.  Keep a bounded tail for malformed/retried clients;
 # the newest page is always retained and the HTTP page-size ceiling bounds it.
@@ -105,473 +85,51 @@ LIVE_NEGATIVE_RULE_SOURCES = tuple(
     f'(CTV (STV {strength} {confidence}) (STV 0.5 0.0)))'
     for rule_id, level, strength, confidence in LIVE_NEGATIVE_RULES
 )
-MULTI_INTEREST_NUMERIC_FEATURES = (
-    "mi_topic_candidate_affinity_score",
-    "mi_topic_candidate_recency_score",
-    "mi_subcategory_candidate_affinity_score",
-    "mi_subcategory_candidate_recency_score",
-    "mi_entity_candidate_affinity_score",
-    "mi_entity_candidate_recency_score",
-    "mi_semantic_top1_similarity",
-    "mi_semantic_topk_mean_similarity",
-    "mi_semantic_weighted_similarity",
-    "mi_semantic_attention_score",
-)
-TEXT_SEMANTIC_NUMERIC_FEATURES = (
-    "text_semantic_coverage",
-    "text_semantic_top1_similarity",
-    "text_semantic_top3_mean_similarity",
-    "text_semantic_top5_mean_similarity",
-    "text_semantic_attention_t8_similarity",
-    "text_semantic_attention_t12_similarity",
-    "text_semantic_centroid_similarity",
-    "text_semantic_recent5_centroid_similarity",
-    "text_semantic_recent5_max_similarity",
-    "text_semantic_last20_recency_decayed_similarity",
-)
+# Only facts consumed by the champion point and pair models are materialized.
+# The embedding is an observation source; all prediction remains mined MeTTa
+# evidence proved by PeTTaChainer.
 CONTEXT_FEATURES = (
-    *FEATURES, LIVE_NEGATIVE_FEATURE, "topic_affinity", "recent_topic_affinity",
-    "subcategory_affinity_score", "entity_recent_top1_similarity",
-    "entity_long_mean_similarity", "title_history_idf_jaccard",
-    "recent_subcategory_transition_score", "recent_subcategory_affinity_score",
-    "topic_recency_score", "subcategory_recency_score",
-    *MULTI_INTEREST_NUMERIC_FEATURES,
-    *TEXT_SEMANTIC_NUMERIC_FEATURES,
-    *LEXICAL_FEATURES,
-    *SEMANTIC_WORKSPACE_FEATURES,
-    *RECENCY_WORKSPACE_FEATURES,
+    *FEATURES, LIVE_NEGATIVE_FEATURE,
+    "entity_recent_top1_similarity",
+    "recent_subcategory_transition_score",
+    "text_semantic_attention_t8_similarity",
     *LLM_WORKSPACE_FEATURES,
 )
 LLM_QUANTILE_PAIR_PREDICATES = tuple(
     f"pair_{name}_quantile" for name in LLM_NUMERIC_FEATURES
 )
-PAIR_CATEGORICAL_SIDE_FAMILIES = {
-    "topic": ("pair_left_topic", "pair_right_topic"),
-    "subcategory": ("pair_left_subcategory", "pair_right_subcategory"),
-    "llm_format": ("pair_left_llm_format", "pair_right_llm_format"),
-}
-PAIR_CATEGORICAL_SIDE_PREDICATES = frozenset(
-    predicate
-    for predicates in PAIR_CATEGORICAL_SIDE_FAMILIES.values()
-    for predicate in predicates
-)
-PAIR_FEATURES = (
-    *(f"pair_{name}" for name in LLM_NUMERIC_FEATURES),
-    *LLM_QUANTILE_PAIR_PREDICATES,
-    *sorted(PAIR_CATEGORICAL_SIDE_PREDICATES),
-    "pair_history_scope",
-    *(f"pair_{name}" for name in LEXICAL_FEATURES),
-    *(f"pair_{name}" for name in SEMANTIC_WORKSPACE_FEATURES),
-    *(f"pair_{name}" for name in RECENCY_WORKSPACE_FEATURES),
-    "pair_affinity", "pair_recent_affinity", "pair_long_affinity",
-    "pair_entity_overlap", "pair_rel_entity_continuity_scope",
-    "pair_rel_concept_continuity_scope",
-    "pair_history_topic_count",
-    "pair_recent_topic_count", "pair_topic_rank",
-    "pair_subcategory_affinity", "pair_title_overlap", "pair_ctr",
-    "pair_freshness", "pair_format", "pair_same_topic",
-    "pair_same_subcategory", "pair_stable_dominance",
-    "pair_entity_recent_top1_similarity",
-    "pair_recent_subcategory_transition",
-    "pair_entity_recent_top1_similarity_quantile",
-    "pair_recent_subcategory_transition_quantile",
-    "pair_long_topic_share_quantile", "pair_recent_topic_share_quantile",
-    "pair_subcategory_share_quantile",
-    "pair_title_history_idf_jaccard", "pair_entity_long_mean_similarity",
-    "pair_recent_subcategory_affinity", "pair_topic_recency",
-    "pair_subcategory_recency",
-    "pair_recent_subcategory_affinity_quantile", "pair_topic_recency_quantile",
-    "pair_subcategory_recency_quantile",
-    "pair_mi_topic_affinity", "pair_mi_topic_recency",
-    "pair_mi_subcategory_affinity", "pair_mi_subcategory_recency",
-    "pair_mi_entity_affinity", "pair_mi_entity_recency",
-    "pair_mi_semantic_top1", "pair_mi_semantic_topk_mean",
-    "pair_mi_semantic_weighted", "pair_mi_semantic_attention",
-    "pair_mi_topic_affinity_quantile", "pair_mi_topic_recency_quantile",
-    "pair_mi_subcategory_affinity_quantile", "pair_mi_subcategory_recency_quantile",
-    "pair_mi_entity_affinity_quantile", "pair_mi_entity_recency_quantile",
-    "pair_mi_semantic_top1_quantile", "pair_mi_semantic_topk_mean_quantile",
-    "pair_mi_semantic_weighted_quantile", "pair_mi_semantic_attention_quantile",
-    "pair_text_semantic_top1", "pair_text_semantic_top3_mean",
-    "pair_text_semantic_top5_mean", "pair_text_semantic_attention_t8",
-    "pair_text_semantic_attention_t12", "pair_text_semantic_centroid",
-    "pair_text_semantic_recent5_centroid", "pair_text_semantic_recent5_max",
-    "pair_text_semantic_last20_decay",
-    "pair_text_semantic_top1_quantile", "pair_text_semantic_top3_mean_quantile",
-    "pair_text_semantic_top5_mean_quantile",
-    "pair_text_semantic_attention_t8_quantile",
-    "pair_text_semantic_attention_t12_quantile",
-    "pair_text_semantic_centroid_quantile",
-    "pair_text_semantic_recent5_centroid_quantile",
-    "pair_text_semantic_recent5_max_quantile",
-    "pair_text_semantic_last20_decay_quantile",
-)
 NUMERIC_PAIR_EVIDENCE = {
     **{name:f"pair_{name}_quantile" for name in LLM_NUMERIC_FEATURES},
-    "entity_recent_top1_similarity":"pair_entity_recent_top1_similarity_quantile",
-    "recent_subcategory_transition_score":"pair_recent_subcategory_transition_quantile",
-    "topic_affinity":"pair_long_topic_share_quantile",
-    "recent_topic_affinity":"pair_recent_topic_share_quantile",
-    "subcategory_affinity_score":"pair_subcategory_share_quantile",
-    "recent_subcategory_affinity_score":
-        "pair_recent_subcategory_affinity_quantile",
-    "topic_recency_score":"pair_topic_recency_quantile",
-    "subcategory_recency_score":"pair_subcategory_recency_quantile",
-    "mi_topic_candidate_affinity_score":"pair_mi_topic_affinity_quantile",
-    "mi_topic_candidate_recency_score":"pair_mi_topic_recency_quantile",
-    "mi_subcategory_candidate_affinity_score":"pair_mi_subcategory_affinity_quantile",
-    "mi_subcategory_candidate_recency_score":"pair_mi_subcategory_recency_quantile",
-    "mi_entity_candidate_affinity_score":"pair_mi_entity_affinity_quantile",
-    "mi_entity_candidate_recency_score":"pair_mi_entity_recency_quantile",
-    "mi_semantic_top1_similarity":"pair_mi_semantic_top1_quantile",
-    "mi_semantic_topk_mean_similarity":"pair_mi_semantic_topk_mean_quantile",
-    "mi_semantic_weighted_similarity":"pair_mi_semantic_weighted_quantile",
-    "mi_semantic_attention_score":"pair_mi_semantic_attention_quantile",
-    "text_semantic_top1_similarity":"pair_text_semantic_top1_quantile",
-    "text_semantic_top3_mean_similarity":"pair_text_semantic_top3_mean_quantile",
-    "text_semantic_top5_mean_similarity":"pair_text_semantic_top5_mean_quantile",
-    "text_semantic_attention_t8_similarity":
-        "pair_text_semantic_attention_t8_quantile",
-    "text_semantic_attention_t12_similarity":
-        "pair_text_semantic_attention_t12_quantile",
-    "text_semantic_centroid_similarity":"pair_text_semantic_centroid_quantile",
-    "text_semantic_recent5_centroid_similarity":
-        "pair_text_semantic_recent5_centroid_quantile",
-    "text_semantic_recent5_max_similarity":
-        "pair_text_semantic_recent5_max_quantile",
-    "text_semantic_last20_recency_decayed_similarity":
-        "pair_text_semantic_last20_decay_quantile",
 }
-PAIR_REDUNDANT_INTEREST = frozenset({
-    "pair_affinity", "pair_recent_affinity", "pair_long_affinity",
-    "pair_history_topic_count", "pair_recent_topic_count", "pair_topic_rank",
-    "pair_topic_recency",
-})
 PAIR_EVIDENCE_ALIASES = {
-    # Descriptors are correlated views of the same article text/history, not
-    # independent votes. Share the text dependency with the frozen encoder.
     **{f"pair_{name}":"pair_text_semantic_top3_mean" for name in LLM_NUMERIC_FEATURES},
     **{predicate:"pair_text_semantic_top3_mean"
        for predicate in LLM_QUANTILE_PAIR_PREDICATES},
-    "pair_left_topic":"pair_long_affinity",
-    "pair_right_topic":"pair_long_affinity",
-    "pair_left_subcategory":"pair_subcategory_affinity",
-    "pair_right_subcategory":"pair_subcategory_affinity",
-    "pair_left_llm_format":"pair_text_semantic_top3_mean",
-    "pair_right_llm_format":"pair_text_semantic_top3_mean",
-    # All word-overlap summaries describe one lexical evidence source.
-    **{f"pair_{name}":"pair_title_overlap" for name in LEXICAL_FEATURES},
-    # Centering and concentration are views of the same frozen text encoder,
-    # not additional independent witnesses for proof revision.
-    **{f"pair_{name}":"pair_text_semantic_top3_mean" for name in (*SEMANTIC_WORKSPACE_FEATURES,*RECENCY_WORKSPACE_FEATURES)},
-    "pair_entity_recent_top1_similarity_quantile":
-        "pair_entity_recent_top1_similarity",
-    "pair_recent_subcategory_transition_quantile":
-        "pair_recent_subcategory_transition",
-    "pair_long_topic_share_quantile":"pair_long_affinity",
-    "pair_recent_topic_share_quantile":"pair_recent_affinity",
-    "pair_subcategory_share_quantile":"pair_subcategory_affinity",
-    "pair_recent_subcategory_affinity":"pair_subcategory_affinity",
-    "pair_subcategory_recency":"pair_subcategory_affinity",
-    "pair_topic_recency":"pair_long_affinity",
-    "pair_title_history_idf_jaccard":"pair_title_overlap",
-    "pair_recent_subcategory_affinity_quantile":
-        "pair_recent_subcategory_affinity",
-    "pair_topic_recency_quantile":"pair_topic_recency",
-    "pair_subcategory_recency_quantile":"pair_subcategory_recency",
-    # Recent-max and long-mean are two summaries of the same article-entity
-    # embedding evidence.  Keep them in one dependency lineage so the proof
-    # merger cannot count them as independent witnesses.
-    "pair_entity_long_mean_similarity":
-        "pair_entity_recent_top1_similarity",
-    # Exact entity continuity refines the existing entity-overlap source with
-    # a causal occurrence and recency.  It is not an independent witness.
-    "pair_rel_entity_continuity_scope":"pair_entity_overlap",
-    # Canonical concepts come from the same versioned content extraction as
-    # the other LLM descriptors and therefore share its evidence owner.
-    "pair_rel_concept_continuity_scope":"pair_text_semantic_top3_mean",
-    "pair_mi_topic_affinity_quantile":"pair_mi_topic_affinity",
-    "pair_mi_topic_recency_quantile":"pair_mi_topic_recency",
-    "pair_mi_subcategory_affinity_quantile":"pair_mi_subcategory_affinity",
-    "pair_mi_subcategory_recency_quantile":"pair_mi_subcategory_recency",
-    "pair_mi_entity_affinity_quantile":"pair_mi_entity_affinity",
-    "pair_mi_entity_recency_quantile":"pair_mi_entity_recency",
-    "pair_mi_semantic_top1_quantile":"pair_mi_semantic_top1",
-    "pair_mi_semantic_topk_mean_quantile":"pair_mi_semantic_top1",
-    "pair_mi_semantic_weighted_quantile":"pair_mi_semantic_top1",
-    "pair_mi_semantic_attention_quantile":"pair_mi_semantic_top1",
-    "pair_mi_semantic_topk_mean":"pair_mi_semantic_top1",
-    "pair_mi_semantic_weighted":"pair_mi_semantic_top1",
-    "pair_mi_semantic_attention":"pair_mi_semantic_top1",
-    "pair_mi_topic_recency":"pair_mi_topic_affinity",
-    "pair_mi_subcategory_recency":"pair_mi_subcategory_affinity",
-    "pair_mi_entity_recency":"pair_mi_entity_affinity",
-    "pair_text_semantic_top1_quantile":"pair_text_semantic_top3_mean",
-    "pair_text_semantic_top3_mean_quantile":"pair_text_semantic_top3_mean",
-    "pair_text_semantic_top5_mean_quantile":"pair_text_semantic_top3_mean",
-    "pair_text_semantic_attention_t8_quantile":"pair_text_semantic_top3_mean",
-    "pair_text_semantic_attention_t12_quantile":"pair_text_semantic_top3_mean",
-    "pair_text_semantic_centroid_quantile":"pair_text_semantic_top3_mean",
-    "pair_text_semantic_recent5_centroid_quantile":"pair_text_semantic_top3_mean",
-    "pair_text_semantic_recent5_max_quantile":"pair_text_semantic_top3_mean",
-    "pair_text_semantic_last20_decay_quantile":"pair_text_semantic_top3_mean",
-    "pair_text_semantic_top1":"pair_text_semantic_top3_mean",
-    "pair_text_semantic_top5_mean":"pair_text_semantic_top3_mean",
     "pair_text_semantic_attention_t8":"pair_text_semantic_top3_mean",
-    "pair_text_semantic_attention_t12":"pair_text_semantic_top3_mean",
-    "pair_text_semantic_centroid":"pair_text_semantic_top3_mean",
-    "pair_text_semantic_recent5_centroid":"pair_text_semantic_top3_mean",
-    "pair_text_semantic_recent5_max":"pair_text_semantic_top3_mean",
-    "pair_text_semantic_last20_decay":"pair_text_semantic_top3_mean",
 }
-PAIR_FEATURE_PROFILES = {
-    **{f"text_semantic_recency_h{half_life}": (
-        "pair_long_affinity", "pair_subcategory_affinity", "pair_title_overlap",
-        "pair_entity_recent_top1_similarity", "pair_recent_subcategory_transition",
-        f"pair_text_semantic_recency_attention_h{half_life}_similarity",
-        "pair_same_topic", "pair_same_subcategory",
-    ) for half_life in (8,16)},
-    # Encoders observe content; only learned, proved implications can affect
-    # recommendation. These profiles deliberately need no source entity model.
-    "workspace_attention": (
-        "pair_long_affinity", "pair_subcategory_affinity", "pair_title_overlap",
-        "pair_recent_subcategory_transition", "pair_text_semantic_attention_t8",
-        "pair_same_topic", "pair_same_subcategory",
-    ),
-    "workspace_centered": (
-        "pair_long_affinity", "pair_subcategory_affinity", "pair_title_overlap",
-        "pair_recent_subcategory_transition",
-        "pair_text_semantic_centered_attention_t8_similarity",
-        "pair_same_topic", "pair_same_subcategory",
-    ),
-    "workspace_contextual": (
-        "pair_long_affinity", "pair_subcategory_affinity", "pair_title_overlap",
-        "pair_recent_subcategory_transition",
-        "pair_text_semantic_centered_attention_t8_similarity",
-        "pair_text_semantic_effective_support_ratio", "pair_history_scope",
-        "pair_same_topic", "pair_same_subcategory",
-    ),
-    # These profiles use only literal words, categorical metadata and causal
-    # interaction counts. No source entity annotations or embedding evidence.
-    "symbolic_baseline": (
-        "pair_long_affinity", "pair_subcategory_affinity", "pair_title_overlap",
-        "pair_recent_subcategory_transition", "pair_same_topic", "pair_same_subcategory",
-    ),
-    "symbolic_precision": (
-        "pair_long_topic_share_quantile", "pair_subcategory_share_quantile",
-        "pair_title_history_idf_jaccard", "pair_recent_subcategory_transition",
-        "pair_same_topic", "pair_same_subcategory",
-    ),
-    "symbolic_lexical": (
-        "pair_long_affinity", "pair_subcategory_affinity",
-        "pair_lexical_peak_match", "pair_recent_subcategory_transition",
-        "pair_same_topic", "pair_same_subcategory",
-    ),
-    "symbolic_coverage": (
-        "pair_long_affinity", "pair_subcategory_affinity",
-        "pair_lexical_history_coverage", "pair_recent_subcategory_transition",
-        "pair_same_topic", "pair_same_subcategory",
-    ),
-    "symbolic_rich": (
-        "pair_long_topic_share_quantile", "pair_subcategory_share_quantile",
-        "pair_lexical_peak_match", "pair_lexical_history_coverage",
-        "pair_recent_subcategory_transition", "pair_same_topic", "pair_same_subcategory",
-    ),
-    "symbolic_contextual": (
-        "pair_long_affinity", "pair_subcategory_affinity",
-        "pair_lexical_history_coverage", "pair_recent_subcategory_transition",
-        "pair_history_scope", "pair_same_topic", "pair_same_subcategory",
-    ),
-    # Causally portable signals: long-term interest, fine-grained interest,
-    # lexical title overlap and recent-entity semantic proximity. CTR/freshness
-    # are intentionally excluded
-    # because training uses causal per-impression priors while MIND validation
-    # necessarily sees the end-of-training prior, creating a measured shift.
-    "stable_multi_interest": (
-        "pair_long_affinity", "pair_subcategory_affinity",
-        "pair_title_overlap", "pair_entity_recent_top1_similarity",
-        "pair_recent_subcategory_transition",
-        "pair_same_topic", "pair_same_subcategory",
-    ),
-    # Candidate-aware sequence facts retain where the matching topic and
-    # subcategory occurred in ordered pre-impression history.  This is a
-    # challenger rather than a hard-coded preference: fpMiner still has to
-    # discover the direction and PeTTaChainer still has to prove it.
-    "sequence_multi_interest": (
-        "pair_long_affinity", "pair_subcategory_affinity",
-        "pair_title_overlap", "pair_entity_recent_top1_similarity",
-        "pair_recent_subcategory_transition",
-        "pair_recent_subcategory_affinity", "pair_topic_recency",
-        "pair_subcategory_recency",
-        "pair_same_topic", "pair_same_subcategory",
-    ),
-    # Train-only quantiles refine ties inside coarse affinity buckets without
-    # introducing dataset-specific category names.  Kept as an explicit
-    # promotion candidate until its held-out proof AUC beats the stable view.
-    "normalized_interest": (
-        "pair_long_affinity", "pair_subcategory_affinity",
-        "pair_title_overlap", "pair_entity_recent_top1_similarity",
-        "pair_recent_subcategory_transition",
-        "pair_long_topic_share_quantile",
-        "pair_recent_topic_share_quantile",
-        "pair_subcategory_share_quantile",
-        "pair_recent_subcategory_affinity_quantile",
-        "pair_topic_recency_quantile", "pair_subcategory_recency_quantile",
-        "pair_same_topic", "pair_same_subcategory",
-    ),
-    "full_quantile": (
-        "pair_long_affinity", "pair_subcategory_affinity",
-        "pair_title_overlap", "pair_entity_recent_top1_similarity",
-        "pair_recent_subcategory_transition",
-        "pair_entity_recent_top1_similarity_quantile",
-        "pair_recent_subcategory_transition_quantile",
-        "pair_long_topic_share_quantile",
-        "pair_recent_topic_share_quantile",
-        "pair_subcategory_share_quantile",
-        "pair_recent_subcategory_affinity_quantile",
-        "pair_topic_recency_quantile", "pair_subcategory_recency_quantile",
-        "pair_same_topic", "pair_same_subcategory",
-    ),
-    "semantic_consensus": (
-        "pair_long_affinity", "pair_subcategory_affinity",
-        "pair_title_history_idf_jaccard",
-        "pair_entity_recent_top1_similarity",
-        "pair_entity_long_mean_similarity",
-        "pair_recent_subcategory_transition",
-        "pair_same_topic", "pair_same_subcategory",
-    ),
-    "candidate_aware_multi_interest": (
-        "pair_long_affinity", "pair_subcategory_affinity",
-        "pair_title_overlap", "pair_entity_recent_top1_similarity",
-        "pair_recent_subcategory_transition",
-        "pair_mi_topic_affinity", "pair_mi_topic_recency",
-        "pair_mi_subcategory_affinity", "pair_mi_subcategory_recency",
-        "pair_mi_entity_affinity", "pair_mi_entity_recency",
-        "pair_mi_semantic_top1", "pair_mi_semantic_topk_mean",
-        "pair_mi_semantic_weighted", "pair_mi_semantic_attention",
-        "pair_same_topic", "pair_same_subcategory",
-    ),
-    "candidate_aware_sparse": (
-        "pair_long_affinity", "pair_subcategory_affinity",
-        "pair_title_overlap", "pair_entity_recent_top1_similarity",
-        "pair_recent_subcategory_transition",
-        "pair_mi_semantic_top1", "pair_mi_subcategory_recency",
-        "pair_same_topic", "pair_same_subcategory",
-    ),
-    "candidate_aware_quantile": (
-        "pair_long_affinity", "pair_subcategory_affinity",
-        "pair_title_overlap", "pair_recent_subcategory_transition",
-        "pair_mi_topic_affinity_quantile", "pair_mi_topic_recency_quantile",
-        "pair_mi_subcategory_affinity_quantile",
-        "pair_mi_subcategory_recency_quantile",
-        "pair_mi_entity_affinity_quantile", "pair_mi_entity_recency_quantile",
-        "pair_mi_semantic_top1_quantile",
-        "pair_mi_semantic_topk_mean_quantile",
-        "pair_mi_semantic_weighted_quantile",
-        "pair_mi_semantic_attention_quantile",
-        "pair_same_topic", "pair_same_subcategory",
-    ),
-    # Frozen sentence embeddings are observations, not a hidden recommender.
-    # fpMiner must discover whether their candidate-relative direction predicts
-    # the target, and PeTTaChainer must prove the grounded preference.
-    "text_semantic_top3": (
-        "pair_long_affinity", "pair_subcategory_affinity",
-        "pair_title_overlap", "pair_entity_recent_top1_similarity",
-        "pair_recent_subcategory_transition",
-        "pair_text_semantic_top3_mean",
-        "pair_same_topic", "pair_same_subcategory",
-    ),
-    "text_semantic_attention": (
-        "pair_long_affinity", "pair_subcategory_affinity",
-        "pair_title_overlap", "pair_entity_recent_top1_similarity",
-        "pair_recent_subcategory_transition",
-        "pair_text_semantic_attention_t8",
-        "pair_text_semantic_attention_t12",
-        "pair_same_topic", "pair_same_subcategory",
-    ),
-    # The T=8 sensor was the stronger confirmation-split challenger and keeps
-    # the proof graph compact: one semantic dependency plus the five stable
-    # symbolic dependencies.  The two-temperature profile above remains an
-    # explicit ablation, not the serving default.
-    "text_semantic_attention_t8": (
-        "pair_long_affinity", "pair_subcategory_affinity",
-        "pair_title_overlap", "pair_entity_recent_top1_similarity",
-        "pair_recent_subcategory_transition",
-        "pair_text_semantic_attention_t8",
-        "pair_same_topic", "pair_same_subcategory",
-    ),
-    "text_semantic_multi_interest": (
-        "pair_long_affinity", "pair_subcategory_affinity",
-        "pair_title_overlap", "pair_entity_recent_top1_similarity",
-        "pair_recent_subcategory_transition",
-        "pair_text_semantic_top1", "pair_text_semantic_top3_mean",
-        "pair_text_semantic_attention_t8", "pair_text_semantic_attention_t12",
-        "pair_text_semantic_centroid", "pair_text_semantic_recent5_max",
-        "pair_text_semantic_last20_decay",
-        "pair_same_topic", "pair_same_subcategory",
-    ),
-    "all": PAIR_FEATURES,
-}
-PAIR_FEATURE_PROFILES["text_semantic_attention_t8_no_lexical"] = tuple(
-    predicate for predicate in PAIR_FEATURE_PROFILES["text_semantic_attention_t8"]
-    if predicate != "pair_title_overlap"
-)
-PAIR_FEATURE_PROFILES["text_semantic_attention_t8_quantile"] = tuple(
-    "pair_text_semantic_attention_t8_quantile"
-    if predicate=="pair_text_semantic_attention_t8" else predicate
-    for predicate in PAIR_FEATURE_PROFILES["text_semantic_attention_t8"]
-)
-PAIR_FEATURE_PROFILES["text_semantic_attention_t8_magnitude_backoff"] = (
-    *PAIR_FEATURE_PROFILES["text_semantic_attention_t8"],
-    "pair_text_semantic_attention_t8_quantile",
-)
-PAIR_FEATURE_PROFILES["text_semantic_attention_t8_relational"] = (
-    *PAIR_FEATURE_PROFILES["text_semantic_attention_t8"],
-    "pair_rel_concept_continuity_scope",
-)
-PAIR_FEATURE_PROFILES["llm_content"] = (
-    *PAIR_FEATURE_PROFILES["text_semantic_attention_t8"],
-    *(f"pair_{name}" for name in LLM_NUMERIC_FEATURES),
-)
-PAIR_FEATURE_PROFILES["llm_content_no_lexical"] = (
-    *PAIR_FEATURE_PROFILES["text_semantic_attention_t8_no_lexical"],
-    *(f"pair_{name}" for name in LLM_NUMERIC_FEATURES),
-)
-PAIR_FEATURE_PROFILES["llm_only"] = tuple(f"pair_{name}" for name in LLM_NUMERIC_FEATURES)
-PAIR_FEATURE_PROFILES["llm_content_quantile"] = (
-    *PAIR_FEATURE_PROFILES["text_semantic_attention_t8"],
+# The production model has one evidence profile. Every predicate is a
+# dataset-agnostic relation between a candidate and the user's causal history.
+# Content models create observations only; fpMiner learns their behavioral
+# direction and PeTTaChainer proves the resulting preference.
+CHAMPION_PAIR_FEATURES = (
+    "pair_long_affinity",
+    "pair_subcategory_affinity",
+    "pair_title_overlap",
+    "pair_entity_recent_top1_similarity",
+    "pair_recent_subcategory_transition",
+    "pair_text_semantic_attention_t8",
+    "pair_same_topic",
+    "pair_same_subcategory",
     *LLM_QUANTILE_PAIR_PREDICATES,
-)
-# Conditional mining needs orientation-invariant context.  History scope is
-# deliberately absent from the ordinary LLM profile: by itself it cannot say
-# whether the left or right candidate should win, but it can safely gate a
-# semantic direction discovered by the real miner.
-PAIR_FEATURE_PROFILES["llm_conditional"] = (
-    *PAIR_FEATURE_PROFILES["llm_content"], "pair_history_scope",
-)
-PAIR_FEATURE_PROFILES["llm_conditional_quantile"] = (
-    *PAIR_FEATURE_PROFILES["llm_content_quantile"], "pair_history_scope",
-)
-PAIR_FEATURE_PROFILES["llm_conditional_quantile_relational"] = (
-    *PAIR_FEATURE_PROFILES["llm_conditional_quantile"],
-    "pair_rel_concept_continuity_scope",
-)
-PAIR_FEATURE_PROFILES["llm_conditional_magnitude_backoff"] = (
-    *PAIR_FEATURE_PROFILES["llm_conditional_quantile"],
-    "pair_text_semantic_attention_t8_quantile",
-)
-PAIR_FEATURE_PROFILES["scoped_taxonomy"] = (
-    *PAIR_FEATURE_PROFILES["text_semantic_attention_t8"],
     "pair_history_scope",
-    "pair_left_topic", "pair_right_topic",
-    "pair_left_subcategory", "pair_right_subcategory",
 )
-PAIR_FEATURE_PROFILES["llm_conditional_scoped_taxonomy"] = (
-    *PAIR_FEATURE_PROFILES["llm_conditional_magnitude_backoff"],
-    "pair_left_topic", "pair_right_topic",
-    "pair_left_subcategory", "pair_right_subcategory",
-    "pair_left_llm_format", "pair_right_llm_format",
-)
+PAIR_FEATURE_PROFILES = {
+    "llm_conditional_quantile": CHAMPION_PAIR_FEATURES,
+}
+PAIR_FEATURES = tuple(dict.fromkeys((
+    *(f"pair_{name}" for name in LLM_NUMERIC_FEATURES),
+    *CHAMPION_PAIR_FEATURES,
+)))
 LLM_PAIR_PREDICATES = frozenset(
     (*(f"pair_{name}" for name in LLM_NUMERIC_FEATURES),
      *LLM_QUANTILE_PAIR_PREDICATES)
@@ -579,8 +137,6 @@ LLM_PAIR_PREDICATES = frozenset(
 CONDITIONAL_LLM_CONTEXT_PREDICATES = frozenset({
     "pair_history_scope", "pair_same_topic", "pair_same_subcategory",
 })
-PAIR_MARGIN_POWER_MIN = 0.05
-PAIR_MARGIN_POWER_MAX = 4.0
 CTV_EVIDENCE_K_DEFAULT = DEFAULT_EVIDENCE_K
 DEFAULT_SERVING_REASONER_TIMEOUT_SECONDS = 30.0
 DEFAULT_BENCHMARK_REASONER_TIMEOUT_SECONDS = 600.0
@@ -595,252 +151,58 @@ DEFAULT_MAX_TOTAL_PAIR_COMPARISONS = 1_000_000
 HARD_MAX_TOTAL_PAIR_COMPARISONS = 5_000_000
 DEFAULT_MAX_PROOF_CACHE_ENTRIES = 250_000
 HARD_MAX_PROOF_CACHE_ENTRIES = 1_000_000
-# Architecture comparisons intentionally accept a narrow, audited override
-# surface.  Evaluation cohort controls and unrelated serving settings remain
-# frozen from the active champion.
-CHALLENGER_CONFIG_KEYS = frozenset({
-    "miner_strategy", "conjunctions", "pair_conjunctions",
-    "pair_feature_profile", "pair_margin_power", "pair_max_rules",
-    "ctv_evidence_k",
-    "pair_ctv_mode", "pair_rule_selection_k", "pair_ctv_evidence_k",
-    "pair_dependency_mode", "pair_family_fusion",
-    "relational_evidence_mode",
-})
 MINING_CONFIG_KEYS = frozenset({
-    "miner_strategy", "min_support", "max_rules", "conjunctions", "negative_ratio",
-    "rule_rank", "max_feature_values", "feature_profile", "random_seed",
+    "min_support", "max_rules", "negative_ratio", "max_feature_values", "random_seed",
     "ctv_evidence_k",
     "pair_min_support", "pair_max_rules", "pair_negative_ratio",
-    "pair_conjunctions", "pair_numeric_bins", "pair_min_effect",
-    "pair_feature_profile",
-    "pair_ctv_mode", "pair_rule_selection_k", "pair_ctv_evidence_k",
-    "pair_dependency_mode",
-    "relational_evidence_mode",
+    "pair_numeric_bins", "pair_min_effect", "pair_rule_selection_k",
+    "pair_ctv_evidence_k",
     "mining_retention_max_units", "mining_retention_max_cases",
 })
-FEATURE_PROFILES = {
-    "symbolic_only": ("topic", "recent_affinity", "long_affinity",
-                      "history_topic_count_bucket", "recent_topic_count_bucket"),
-    "core": ("topic","format","affinity"),
-    "accuracy": ("topic","recent_affinity","long_affinity","entity_overlap"),
-    # Useful experimental ablation: title-length format adds candidate
-    # resolution, but the full replay should decide whether its extra proofs
-    # justify the latency for a given dataset.
-    "accuracy_plus": ("topic","format","recent_affinity","long_affinity","entity_overlap"),
-    "accuracy_detail": ("topic","recent_affinity","long_affinity","entity_overlap",
-                         "entity_overlap_detail","history_topic_count_bucket",
-                         "recent_topic_count_bucket"),
-    "accuracy_detail_relational": (
-        "topic","recent_affinity","long_affinity","entity_overlap",
-        "entity_overlap_detail","history_topic_count_bucket",
-        "recent_topic_count_bucket","rel_concept_continuity_scope",
-    ),
-    "accuracy_sequence": ("topic","recent_affinity","long_affinity","entity_overlap",
-                            "entity_overlap_detail","history_topic_count_bucket",
-                            "recent_topic_count_bucket","topic_recency_bucket",
-                            "subcategory_recency_bucket"),
-    # Source impression position is available only in offline MIND replay.
-    # It is deliberately opt-in because a live candidate has no historical
-    # position and would otherwise receive an uninformative ``unknown`` fact.
-    "accuracy_position": ("topic","recent_affinity","long_affinity","entity_overlap",
-                           "position_bucket"),
-    "accuracy_content": ("topic","recent_affinity","long_affinity","entity_overlap",
-                          "entity_overlap_detail","history_topic_count_bucket",
-                          "recent_topic_count_bucket","title_overlap_detail"),
-    "accuracy_rich": ("topic","subcategory","format","recent_affinity","long_affinity",
-                      "entity_overlap","entity_overlap_detail","history_topic_count_bucket",
-                      "recent_topic_count_bucket","topic_rank_bucket","subcategory_affinity"),
-    "candidate_aware": (
-        "topic", "subcategory", "recent_affinity", "long_affinity",
-        "entity_overlap_detail", "mi_topic_candidate_match_rank",
-        "mi_subcategory_candidate_match_rank", "mi_entity_candidate_match_rank",
-    ),
-    "all": FEATURES,
-}
-
-# Entity and canonical-concept continuity can be derived from the same
-# historical click.  Until the final scorer can fuse dependencies by their
-# shared origin key, activating both families would let one observation vote
-# through two independently mined channels.  Keep this invariant at the
-# effective point+pair profile boundary; checking only each profile in
-# isolation would miss a point-entity / pair-concept combination.
-RELATIONAL_ENTITY_SCORE_PREDICATES = frozenset({
-    "rel_entity_continuity_scope",
-    "pair_rel_entity_continuity_scope",
-})
-RELATIONAL_CONCEPT_SCORE_PREDICATES = frozenset({
-    "rel_concept_continuity_scope",
-    "pair_rel_concept_continuity_scope",
-})
-
-
-def _validate_relational_score_dependencies(
-        point_predicates, pair_predicates):
-    """Reject relational families that can reuse one interaction as two votes."""
-    active=frozenset((*point_predicates,*pair_predicates))
-    active_entity=RELATIONAL_ENTITY_SCORE_PREDICATES.intersection(active)
-    active_concept=RELATIONAL_CONCEPT_SCORE_PREDICATES.intersection(active)
-    if active_entity and active_concept:
-        raise ValueError(
-            "entity and concept relational scoring features cannot be active "
-            "together until shared-origin dependency-aware fusion is "
-            "implemented"
-        )
-
-
-INTERACTION_PAIRS = (
-    ("topic","affinity"), ("format","affinity"),
-    ("topic","affinity_level"), ("subcategory","affinity_level"),
-    ("topic","recent_affinity"), ("topic","long_affinity"),
-    ("recent_affinity","long_affinity"), ("entity_overlap","affinity_level"),
-    ("ctr_bucket","freshness_bucket"), ("topic","time_bucket"),
-    ("history_size_bucket","affinity_level"), ("format","affinity_level"),
-    ("entity_overlap","recent_affinity"), ("ctr_bucket","recent_affinity"),
-    ("history_size_bucket","recent_affinity"),
-    ("topic","history_topic_count_bucket"), ("topic","recent_topic_count_bucket"),
-    ("entity_overlap_detail","recent_topic_count_bucket"),
-    ("entity_overlap_detail","history_topic_count_bucket"),
-    ("title_overlap_detail","topic"),
-    ("title_overlap_detail","recent_topic_count_bucket"),
-    ("recent_topic_count_bucket","long_affinity"),
-    ("subcategory_affinity","topic"),
-    ("rel_entity_continuity_scope","recent_affinity"),
-    ("rel_entity_continuity_scope","long_affinity"),
-    ("rel_concept_continuity_scope","recent_affinity"),
-    ("rel_concept_continuity_scope","long_affinity"),
+# Point proofs provide a stable backoff and live-feedback channel.
+CHAMPION_POINT_FEATURES = (
+    "topic",
+    "recent_affinity",
+    "long_affinity",
+    "entity_overlap",
+    "entity_overlap_detail",
+    "history_topic_count_bucket",
+    "recent_topic_count_bucket",
 )
-INTERACTION_TRIPLES = (
-    ("topic","recent_affinity","long_affinity"),
-    ("topic","entity_overlap","affinity_level"),
-    ("topic","ctr_bucket","freshness_bucket"),
-    ("subcategory","entity_overlap","affinity_level"),
-)
-PAIR_INTERACTIONS = (
-    ("pair_recent_affinity", "pair_long_affinity"),
-    ("pair_recent_affinity", "pair_entity_overlap"),
-    ("pair_long_affinity", "pair_history_topic_count"),
-    ("pair_entity_overlap", "pair_title_overlap"),
-    ("pair_recent_topic_count", "pair_topic_rank"),
-    ("pair_subcategory_affinity", "pair_entity_overlap"),
-    ("pair_ctr", "pair_freshness"),
-    ("pair_same_topic", "pair_recent_affinity"),
-    ("pair_long_affinity", "pair_title_overlap"),
-    ("pair_long_affinity", "pair_subcategory_affinity"),
-    ("pair_title_overlap", "pair_subcategory_affinity"),
-    ("pair_entity_recent_top1_similarity", "pair_long_affinity"),
-    ("pair_entity_recent_top1_similarity", "pair_subcategory_affinity"),
-    ("pair_entity_recent_top1_similarity", "pair_title_overlap"),
-    ("pair_recent_subcategory_transition", "pair_long_affinity"),
-    ("pair_recent_subcategory_transition", "pair_subcategory_affinity"),
-    ("pair_recent_subcategory_transition", "pair_title_overlap"),
-    ("pair_subcategory_recency", "pair_recent_subcategory_transition"),
-    ("pair_subcategory_recency", "pair_subcategory_affinity"),
-    ("pair_topic_recency", "pair_long_affinity"),
-    ("pair_recent_subcategory_affinity", "pair_subcategory_affinity"),
-    ("pair_title_history_idf_jaccard", "pair_long_affinity"),
-    ("pair_title_history_idf_jaccard", "pair_subcategory_affinity"),
-    ("pair_entity_long_mean_similarity", "pair_long_affinity"),
-    ("pair_entity_long_mean_similarity", "pair_subcategory_affinity"),
-    ("pair_entity_long_mean_similarity", "pair_title_history_idf_jaccard"),
-    ("pair_text_semantic_top3_mean", "pair_long_affinity"),
-    ("pair_text_semantic_top3_mean", "pair_subcategory_affinity"),
-    ("pair_text_semantic_top3_mean", "pair_recent_subcategory_transition"),
-    ("pair_text_semantic_top3_mean", "pair_entity_recent_top1_similarity"),
-    ("pair_text_semantic_attention_t8", "pair_long_affinity"),
-    ("pair_text_semantic_attention_t8", "pair_subcategory_affinity"),
-    ("pair_text_semantic_attention_t8", "pair_recent_subcategory_transition"),
-    ("pair_text_semantic_attention_t8", "pair_entity_recent_top1_similarity"),
-    ("pair_text_semantic_attention_t12", "pair_long_affinity"),
-    ("pair_text_semantic_attention_t12", "pair_subcategory_affinity"),
-    ("pair_text_semantic_attention_t12", "pair_recent_subcategory_transition"),
-    ("pair_text_semantic_attention_t12", "pair_entity_recent_top1_similarity"),
-    ("pair_rel_entity_continuity_scope", "pair_long_affinity"),
-    ("pair_rel_entity_continuity_scope", "pair_subcategory_affinity"),
-    ("pair_rel_entity_continuity_scope", "pair_text_semantic_attention_t8"),
-    ("pair_rel_concept_continuity_scope", "pair_long_affinity"),
-    ("pair_rel_concept_continuity_scope", "pair_subcategory_affinity"),
-    ("pair_rel_concept_continuity_scope", "pair_text_semantic_attention_t8"),
-)
+FEATURE_PROFILES = {"accuracy_detail": CHAMPION_POINT_FEATURES}
+
+
 PAIR_ORDERS = {
-    "affinity": ("low", "high"),
-    "recent_affinity": ("none", "low", "medium", "high"),
     "long_affinity": ("none", "low", "medium", "high"),
-    "entity_overlap_detail": ("none", "one", "two", "three_plus"),
-    "rel_entity_continuity_scope": ("none", "older", "recent"),
-    "rel_concept_continuity_scope": ("none", "older", "recent"),
-    "history_topic_count_bucket": ("zero", "one", "two", "three_plus"),
-    "recent_topic_count_bucket": ("zero", "one", "two", "three_plus"),
-    "topic_rank_bucket": ("none", "secondary", "top"),
     "subcategory_affinity": ("none", "low", "medium", "high"),
     "title_overlap_detail": ("none", "one", "two", "three_plus"),
-    "ctr_bucket": ("cold", "low", "medium", "high"),
-    "freshness_bucket": ("established", "recent", "new"),
-    "format": ("short", "medium", "long"),
-    "topic_recency_bucket": ("none", "older", "recent", "immediate"),
-    "subcategory_recency_bucket": ("none", "older", "recent", "immediate"),
 }
 # Immutable pair-feature plans. These used to be rebuilt inside
 # ``_pair_features`` for every orientation of every comparison.
 PAIR_ORDERED_COMPARISONS = {
-    "pair_affinity":"affinity", "pair_recent_affinity":"recent_affinity",
-    "pair_long_affinity":"long_affinity", "pair_entity_overlap":"entity_overlap_detail",
-    "pair_rel_entity_continuity_scope":"rel_entity_continuity_scope",
-    "pair_rel_concept_continuity_scope":"rel_concept_continuity_scope",
-    "pair_history_topic_count":"history_topic_count_bucket",
-    "pair_recent_topic_count":"recent_topic_count_bucket",
-    "pair_topic_rank":"topic_rank_bucket",
-    "pair_subcategory_affinity":"subcategory_affinity",
-    "pair_title_overlap":"title_overlap_detail", "pair_ctr":"ctr_bucket",
-    "pair_freshness":"freshness_bucket", "pair_format":"format",
-}
-PAIR_LEXICAL_COMPARISONS = {
-    f"pair_{source}":source for source in LEXICAL_FEATURES
-}
-PAIR_SEMANTIC_WORKSPACE_COMPARISONS = {
-    f"pair_{source}":source for source in SEMANTIC_WORKSPACE_FEATURES
-}
-PAIR_DIRECT_NUMERIC_COMPARISONS = {
-    "pair_entity_recent_top1_similarity":"entity_recent_top1_similarity",
-    "pair_recent_subcategory_transition":"recent_subcategory_transition_score",
-    "pair_recent_subcategory_affinity":"recent_subcategory_affinity_score",
-    "pair_topic_recency":"topic_recency_score",
-    "pair_subcategory_recency":"subcategory_recency_score",
-    "pair_entity_long_mean_similarity":"entity_long_mean_similarity",
-    "pair_title_history_idf_jaccard":"title_history_idf_jaccard",
-}
-PAIR_MULTI_INTEREST_COMPARISONS = {
-    **{f"pair_{name}":name for name in LLM_NUMERIC_FEATURES},
-    **{f"pair_{name}":name for name in RECENCY_WORKSPACE_FEATURES},
-    "pair_mi_topic_affinity":"mi_topic_candidate_affinity_score",
-    "pair_mi_topic_recency":"mi_topic_candidate_recency_score",
-    "pair_mi_subcategory_affinity":"mi_subcategory_candidate_affinity_score",
-    "pair_mi_subcategory_recency":"mi_subcategory_candidate_recency_score",
-    "pair_mi_entity_affinity":"mi_entity_candidate_affinity_score",
-    "pair_mi_entity_recency":"mi_entity_candidate_recency_score",
-    "pair_mi_semantic_top1":"mi_semantic_top1_similarity",
-    "pair_mi_semantic_topk_mean":"mi_semantic_topk_mean_similarity",
-    "pair_mi_semantic_weighted":"mi_semantic_weighted_similarity",
-    "pair_mi_semantic_attention":"mi_semantic_attention_score",
-    "pair_text_semantic_top1":"text_semantic_top1_similarity",
-    "pair_text_semantic_top3_mean":"text_semantic_top3_mean_similarity",
-    "pair_text_semantic_top5_mean":"text_semantic_top5_mean_similarity",
-    "pair_text_semantic_attention_t8":"text_semantic_attention_t8_similarity",
-    "pair_text_semantic_attention_t12":"text_semantic_attention_t12_similarity",
-    "pair_text_semantic_centroid":"text_semantic_centroid_similarity",
-    "pair_text_semantic_recent5_centroid":"text_semantic_recent5_centroid_similarity",
-    "pair_text_semantic_recent5_max":"text_semantic_recent5_max_similarity",
-    "pair_text_semantic_last20_decay":"text_semantic_last20_recency_decayed_similarity",
-}
-PAIR_STABLE_DOMINANCE_SOURCES = {
     "pair_long_affinity":"long_affinity",
     "pair_subcategory_affinity":"subcategory_affinity",
     "pair_title_overlap":"title_overlap_detail",
 }
-PAIR_SIDE_PREDICATE_SWAP = {
-    left:right for left,right in PAIR_CATEGORICAL_SIDE_FAMILIES.values()
-} | {
-    right:left for left,right in PAIR_CATEGORICAL_SIDE_FAMILIES.values()
+PAIR_DIRECT_NUMERIC_COMPARISONS = {
+    "pair_entity_recent_top1_similarity":"entity_recent_top1_similarity",
+    "pair_recent_subcategory_transition":"recent_subcategory_transition_score",
+    "pair_text_semantic_attention_t8":"text_semantic_attention_t8_similarity",
 }
+PAIR_LLM_COMPARISONS = {
+    **{f"pair_{name}":name for name in LLM_NUMERIC_FEATURES},
+}
+# Empty compatibility sets keep the mixin boundary explicit while the champion
+# path has no categorical-side, relational, or fixed interaction expansion.
+PAIR_CATEGORICAL_SIDE_FAMILIES = {}
+PAIR_CATEGORICAL_SIDE_PREDICATES = frozenset()
+PAIR_REDUNDANT_INTEREST = frozenset()
+PAIR_STABLE_DOMINANCE_SOURCES = {}
+RELATIONAL_PROOF_FIELDS = {}
+INTERACTION_PAIRS = ()
+INTERACTION_TRIPLES = ()
+PAIR_INTERACTIONS = ()
+PAIR_SIDE_PREDICATE_SWAP = {}
 
 
 @lru_cache(maxsize=128)
@@ -852,11 +214,9 @@ def _pair_feature_execution_plan(needed):
         if selected is None or predicate in selected
     )
     return {
-        "lexical":choose(PAIR_LEXICAL_COMPARISONS),
-        "semantic_workspace":choose(PAIR_SEMANTIC_WORKSPACE_COMPARISONS),
         "ordered":choose(PAIR_ORDERED_COMPARISONS),
         "direct_numeric":choose(PAIR_DIRECT_NUMERIC_COMPARISONS),
-        "multi_interest":choose(PAIR_MULTI_INTEREST_COMPARISONS),
+        "llm":choose(PAIR_LLM_COMPARISONS),
         "quantile":tuple(
             (source,predicate) for source,predicate in NUMERIC_PAIR_EVIDENCE.items()
             if selected is None or predicate in selected
@@ -869,18 +229,11 @@ def _pair_candidate_source_features(predicates):
     selected=frozenset(predicates)
     plan=_pair_feature_execution_plan(tuple(sorted(selected)))
     sources={source for family in (
-        "lexical","semantic_workspace","ordered","direct_numeric",
-        "multi_interest",
+        "ordered","direct_numeric","llm",
     ) for _predicate,source in plan[family]}
     sources.update(source for source,_predicate in plan["quantile"])
     if "pair_history_scope" in selected:
         sources.add("history_size_bucket")
-    if "pair_stable_dominance" in selected:
-        sources.update(PAIR_STABLE_DOMINANCE_SOURCES.values())
-    if selected & {
-        "pair_left_llm_format","pair_right_llm_format",
-    }:
-        sources.add("llm_format")
     return frozenset(sources)
 
 
@@ -958,12 +311,12 @@ def first_paint_feed(page):
 
 
 BenchmarkMixin = make_benchmark_mixin(
-    CHALLENGER_CONFIG_KEYS=CHALLENGER_CONFIG_KEYS,
+    CHALLENGER_CONFIG_KEYS=frozenset(),
     CONTEXT_FEATURES=CONTEXT_FEATURES,
     MINING_CONFIG_KEYS=MINING_CONFIG_KEYS,
     PAIR_FEATURE_PROFILES=PAIR_FEATURE_PROFILES,
-    PAIR_MARGIN_POWER_MAX=PAIR_MARGIN_POWER_MAX,
-    PAIR_MARGIN_POWER_MIN=PAIR_MARGIN_POWER_MIN,
+    PAIR_MARGIN_POWER_MAX=1.0,
+    PAIR_MARGIN_POWER_MIN=1.0,
 )
 PairwiseRankingMixin = make_pairwise_ranking_mixin(
     CONTEXT_FEATURES=CONTEXT_FEATURES,
@@ -984,9 +337,9 @@ ServingMixin = make_serving_mixin(
     LIVE_NEGATIVE_GENERALIZATION_WINDOW=LIVE_NEGATIVE_GENERALIZATION_WINDOW,
     LIVE_NEGATIVE_RULE_IDS=LIVE_NEGATIVE_RULE_IDS,
     pair_candidate_source_features=_pair_candidate_source_features,
-    RELATIONAL_LIVE_HISTORY_LIMIT=RELATIONAL_LIVE_HISTORY_LIMIT,
+    RELATIONAL_LIVE_HISTORY_LIMIT=0,
     RELATIONAL_PROOF_FIELDS=RELATIONAL_PROOF_FIELDS,
-    RELATIONAL_QUERY_STEPS_PER_ROOT=RELATIONAL_QUERY_STEPS_PER_ROOT,
+    RELATIONAL_QUERY_STEPS_PER_ROOT=0,
     SEMANTIC_CACHE_MAX_BYTES=SEMANTIC_CACHE_MAX_BYTES,
     SEMANTIC_CACHE_MAX_ENTRIES=SEMANTIC_CACHE_MAX_ENTRIES,
     SEMANTIC_CACHE_TTL_SECONDS=SEMANTIC_CACHE_TTL_SECONDS,
@@ -1091,51 +444,44 @@ class Lab(
             max_workers=self._candidate_feature_workers,
             thread_name_prefix=f"recommendation-features-{self.instance_id[:8]}",
         ) if self._candidate_feature_workers>1 else None)
-        self.config = {"miner_strategy":"fixed_combinations",
-                       "min_support":16,"max_rules":30,"top_k":5,"conjunctions":2,"chain_steps":10,
-                       "mine_interval":8,"max_candidates":0,"random_seed":7,"query_batch_size":512,
-                       "mining_retention_max_units":DEFAULT_RETENTION_MAX_UNITS,
-                       "mining_retention_max_cases":DEFAULT_RETENTION_MAX_CASES,
-                       "serving_reasoner_timeout_seconds":DEFAULT_SERVING_REASONER_TIMEOUT_SECONDS,
-                       "benchmark_reasoner_timeout_seconds":DEFAULT_BENCHMARK_REASONER_TIMEOUT_SECONDS,
-                       "feed_window":40,"negative_ratio":4,"aggregation":"weighted",
-                       "rule_rank":"quality","max_feature_values":24,
-                       "ctv_evidence_k":CTV_EVIDENCE_K_DEFAULT,
-                       "feature_profile":"accuracy_detail",
-                       "relational_evidence_mode":"disabled",
-                       "ranking_mode":"pairwise","pairwise_weight":1.0,
-                       "pairwise_fusion":"rank",
-                       "pair_aggregation":"proof_margin",
-                       "pair_family_fusion":"flat_margin",
-                       "pair_margin_transform":"log_odds",
-                       "pair_margin_power":1.0,
-                       "pair_feature_profile":"stable_multi_interest",
-                       "pair_min_support":12,"pair_max_rules":40,
-                       "pair_negative_ratio":8,"pair_conjunctions":2,
-                       "pair_numeric_bins":4,
-                       "pairwise_opponents":0,"pair_chain_steps":12,
-                       "max_pair_comparisons":DEFAULT_MAX_PAIR_COMPARISONS,
-                       "max_total_pair_comparisons":(
-                           DEFAULT_MAX_TOTAL_PAIR_COMPARISONS
-                       ),
-                       "max_proof_cache_entries":(
-                           DEFAULT_MAX_PROOF_CACHE_ENTRIES
-                       ),
-                       "pair_min_effect":0.03}
-        self.config.update(
-            pair_ctv_mode="raw_pairs",
-            pair_rule_selection_k=20.0,
-            # Deprecated configuration alias retained so frozen experiment
-            # artifacts remain loadable. It is never a PeTTa CTV evidence K.
-            pair_ctv_evidence_k=20.0,
-            pair_dependency_mode="clustered",
-        )
-        if self.symbolic_only:
-            self.config.update(feature_profile="symbolic_only",
-                               pair_feature_profile="symbolic_baseline")
-        elif self._semantic_workspace_model:
-            self.config.update(feature_profile="symbolic_only",
-                               pair_feature_profile="workspace_attention")
+        self.config = {
+            # Fixed champion architecture (MIND-small development AUC 0.6891).
+            "miner_strategy":"conditional_llm_seed_only",
+            "aggregation":"weighted",
+            "rule_rank":"quality",
+            "feature_profile":"accuracy_detail",
+            "relational_evidence_mode":"disabled",
+            "ranking_mode":"pairwise",
+            "pairwise_weight":1.0,
+            "pairwise_fusion":"rank",
+            "pair_aggregation":"proof_margin",
+            "pair_family_fusion":"balanced_rank",
+            "pair_margin_transform":"log_odds",
+            "pair_margin_power":1.0,
+            "pair_feature_profile":"llm_conditional_quantile",
+            "pair_ctv_mode":"impression_macro",
+            "pair_dependency_mode":"clustered",
+            # Bounded operational and mining parameters.
+            "min_support":16,"max_rules":30,"top_k":5,
+            "conjunctions":2,"chain_steps":10,"mine_interval":8,
+            "max_candidates":0,"random_seed":7,"query_batch_size":512,
+            "mining_retention_max_units":DEFAULT_RETENTION_MAX_UNITS,
+            "mining_retention_max_cases":DEFAULT_RETENTION_MAX_CASES,
+            "serving_reasoner_timeout_seconds":DEFAULT_SERVING_REASONER_TIMEOUT_SECONDS,
+            "benchmark_reasoner_timeout_seconds":DEFAULT_BENCHMARK_REASONER_TIMEOUT_SECONDS,
+            "feed_window":40,"negative_ratio":4,"max_feature_values":24,
+            "ctv_evidence_k":800.0,
+            "pair_min_support":12,"pair_max_rules":40,
+            "pair_negative_ratio":8,"pair_conjunctions":3,
+            "pair_numeric_bins":4,"pairwise_opponents":0,
+            "pair_chain_steps":12,
+            "max_pair_comparisons":DEFAULT_MAX_PAIR_COMPARISONS,
+            "max_total_pair_comparisons":DEFAULT_MAX_TOTAL_PAIR_COMPARISONS,
+            "max_proof_cache_entries":DEFAULT_MAX_PROOF_CACHE_ENTRIES,
+            "pair_min_effect":0.03,
+            "pair_rule_selection_k":20.0,
+            "pair_ctv_evidence_k":20.0,
+        }
         self.runs=[]; self.pending_events=0; self.version=0; self.feed_cache=OrderedDict(); self.last_mined_at=None
         # Cumulative observability counters distinguish a real scoring pass
         # from an HTTP response served by the final ranked-feed cache.  They do
@@ -2011,429 +1357,117 @@ class Lab(
                 }}
 
     def configure(self,values):
-        minimums={"min_support":1,"max_rules":1,"top_k":1,"conjunctions":2,"chain_steps":1,
-                  "mine_interval":1,"max_candidates":0,"random_seed":0,"query_batch_size":1,
-                  "feed_window":1,"negative_ratio":0,"max_feature_values":2,
-                  "pair_min_support":1,"pair_max_rules":1,"pair_negative_ratio":0,
-                  "pair_conjunctions":2,"pair_numeric_bins":1,
-                  "pairwise_opponents":0,"pair_chain_steps":2,
-                  "max_pair_comparisons":1,
-                  "max_proof_cache_entries":1,
-                  "max_total_pair_comparisons":1,
-                  "mining_retention_max_units":1,
-                  "mining_retention_max_cases":1}
-        updates={key:int(value) for key,value in values.items() if key in minimums}
-        for key,value in updates.items():
-            if value<minimums[key]: raise ValueError(f"{key} must be >= {minimums[key]}")
-        if updates.get("conjunctions",self.config["conjunctions"])>4:
-            raise ValueError("conjunctions must be <= 4 for the bounded rich feature miner")
-        if updates.get("pair_conjunctions",self.config["pair_conjunctions"])>4:
-            raise ValueError("pair_conjunctions must be <= 4")
-        if updates.get("pair_numeric_bins",self.config["pair_numeric_bins"])>8:
-            raise ValueError("pair_numeric_bins must be <= 8")
-        # The independently checked shallow topology is deliberately bounded
-        # to 1,024 compiled point rules and 1,024 pair channels. Reject an
-        # impossible configuration at the API boundary instead of allowing an
-        # unbounded rule snapshot or letting a post-ranking diagnostic abort
-        # only after the expensive proof pass.
-        if updates.get("max_rules",self.config["max_rules"])>1024:
-            raise ValueError("max_rules must be <= 1024")
-        if updates.get("pair_max_rules",self.config["pair_max_rules"])>1024:
-            raise ValueError("pair_max_rules must be <= 1024")
-        if updates.get(
-            "max_proof_cache_entries",self.config["max_proof_cache_entries"]
-        )>HARD_MAX_PROOF_CACHE_ENTRIES:
-            raise ValueError(
-                f"max_proof_cache_entries must be <= "
-                f"{HARD_MAX_PROOF_CACHE_ENTRIES}"
-            )
-        if updates.get(
-                "max_pair_comparisons",
-                self.config["max_pair_comparisons"],
-        )>HARD_MAX_PAIR_COMPARISONS:
-            raise ValueError(
-                f"max_pair_comparisons must be <= {HARD_MAX_PAIR_COMPARISONS}"
-            )
-        if updates.get(
-                "max_total_pair_comparisons",
-                self.config["max_total_pair_comparisons"],
-        )>HARD_MAX_TOTAL_PAIR_COMPARISONS:
-            raise ValueError(
-                "max_total_pair_comparisons must be <= "
-                f"{HARD_MAX_TOTAL_PAIR_COMPARISONS}"
-            )
-        if updates.get(
-                "mining_retention_max_units",
-                self.config["mining_retention_max_units"],
-        )>HARD_RETENTION_MAX_UNITS:
-            raise ValueError(
-                "mining_retention_max_units must be <= "
-                f"{HARD_RETENTION_MAX_UNITS}"
-            )
-        if updates.get(
-                "mining_retention_max_cases",
-                self.config["mining_retention_max_cases"],
-        )>HARD_RETENTION_MAX_CASES:
-            raise ValueError(
-                "mining_retention_max_cases must be <= "
-                f"{HARD_RETENTION_MAX_CASES}"
-            )
-        string_updates={}
-        if "miner_strategy" in values:
-            miner_strategy=str(values["miner_strategy"])
-            if miner_strategy not in {
-                    "fixed_combinations","target_aware","conditional_llm",
-                    "conditional_llm_seed_only",
-                    "petta_conditional_seed_only","petta_mdl_seed_only",
-                    "petta_hierarchical_seed_only"}:
+        """Apply bounded parameters without changing the champion architecture."""
+        fixed={
+            "miner_strategy":"conditional_llm_seed_only",
+            "aggregation":"weighted",
+            "rule_rank":"quality",
+            "feature_profile":"accuracy_detail",
+            "relational_evidence_mode":"disabled",
+            "ranking_mode":"pairwise",
+            "pairwise_weight":1.0,
+            "pairwise_fusion":"rank",
+            "pair_aggregation":"proof_margin",
+            "pair_family_fusion":"balanced_rank",
+            "pair_margin_transform":"log_odds",
+            "pair_margin_power":1.0,
+            "pair_feature_profile":"llm_conditional_quantile",
+            "pair_ctv_mode":"impression_macro",
+            "pair_dependency_mode":"clustered",
+        }
+        for key,expected in fixed.items():
+            if key in values and values[key]!=expected:
                 raise ValueError(
-                    "miner_strategy must be fixed_combinations, target_aware "
-                    "conditional_llm, conditional_llm_seed_only or "
-                    "petta_conditional_seed_only/petta_mdl_seed_only"
-                    "/petta_hierarchical_seed_only"
+                    f"{key} is fixed to {expected!r} by the champion architecture"
                 )
-            string_updates["miner_strategy"]=miner_strategy
-        effective_strategy=string_updates.get(
-            "miner_strategy",self.config["miner_strategy"]
-        )
-        effective_point_depth=updates.get(
-            "conjunctions",self.config["conjunctions"]
-        )
-        effective_pair_depth=updates.get(
-            "pair_conjunctions",self.config["pair_conjunctions"]
-        )
-        if (effective_strategy=="target_aware"
-                and max(effective_point_depth,effective_pair_depth)<3):
-            raise ValueError(
-                "target_aware requires conjunctions >= 3 or "
-                "pair_conjunctions >= 3 so it can expand beyond fpMiner unaries"
-            )
-        if (effective_strategy in {
-                "conditional_llm","conditional_llm_seed_only",
-                "petta_conditional_seed_only","petta_mdl_seed_only",
-                "petta_hierarchical_seed_only"}
-                and effective_pair_depth<3):
-            raise ValueError(
-                "conditional LLM mining requires pair_conjunctions >= 3 so it can "
-                "test a semantic seed with an invariant context gate"
-            )
-        if "aggregation" in values:
-            aggregation=str(values["aggregation"])
-            if aggregation not in {"max","weighted","hybrid"}: raise ValueError("aggregation must be max, weighted, or hybrid")
-            string_updates["aggregation"]=aggregation
-        if "rule_rank" in values:
-            rule_rank=str(values["rule_rank"])
-            if rule_rank not in {"support","quality"}: raise ValueError("rule_rank must be support or quality")
-            string_updates["rule_rank"]=rule_rank
-        if "feature_profile" in values:
-            feature_profile=str(values["feature_profile"])
-            if feature_profile not in FEATURE_PROFILES:
-                raise ValueError(
-                    "feature_profile must be one of: "
-                    + ", ".join(sorted(FEATURE_PROFILES))
-                )
-            string_updates["feature_profile"]=feature_profile
-        if "ranking_mode" in values:
-            ranking_mode=str(values["ranking_mode"])
-            if ranking_mode not in {"pointwise","pairwise"}:
-                raise ValueError("ranking_mode must be pointwise or pairwise")
-            string_updates["ranking_mode"]=ranking_mode
-        if "pairwise_fusion" in values:
-            pairwise_fusion=str(values["pairwise_fusion"])
-            if pairwise_fusion not in {"rank","probability"}:
-                raise ValueError("pairwise_fusion must be rank or probability")
-            string_updates["pairwise_fusion"]=pairwise_fusion
-        if "pair_aggregation" in values:
-            pair_aggregation=str(values["pair_aggregation"])
-            if pair_aggregation not in {"proof_margin","posterior"}:
-                raise ValueError("pair_aggregation must be proof_margin or posterior")
-            string_updates["pair_aggregation"]=pair_aggregation
-        if "pair_family_fusion" in values:
-            pair_family_fusion=str(values["pair_family_fusion"])
-            if pair_family_fusion not in {
-                    "flat_margin","balanced_rank","balanced_margin",
-                    "symbolic_balanced"}:
-                raise ValueError(
-                    "pair_family_fusion must be flat_margin, balanced_rank, "
-                    "balanced_margin or symbolic_balanced"
-                )
-            string_updates["pair_family_fusion"]=pair_family_fusion
-        if "pair_ctv_mode" in values:
-            pair_ctv_mode=str(values["pair_ctv_mode"])
-            if pair_ctv_mode not in {
-                    "raw_pairs","impression_macro",
-                    "raw_strength_effective_confidence",
-                    "conditional_effective_backoff"}:
-                raise ValueError(
-                    "pair_ctv_mode must be raw_pairs, impression_macro or "
-                    "raw_strength_effective_confidence or "
-                    "conditional_effective_backoff"
-                )
-            string_updates["pair_ctv_mode"]=pair_ctv_mode
-        if "pair_dependency_mode" in values:
-            pair_dependency_mode=str(values["pair_dependency_mode"])
-            if pair_dependency_mode not in {"clustered","residual_hypergraph"}:
-                raise ValueError(
-                    "pair_dependency_mode must be clustered or residual_hypergraph"
-                )
-            string_updates["pair_dependency_mode"]=pair_dependency_mode
-        if "pair_margin_transform" in values:
-            pair_margin_transform=str(values["pair_margin_transform"])
-            if pair_margin_transform not in {"linear","log_odds"}:
-                raise ValueError("pair_margin_transform must be linear or log_odds")
-            string_updates["pair_margin_transform"]=pair_margin_transform
-        if "pair_feature_profile" in values:
-            pair_feature_profile=str(values["pair_feature_profile"])
-            if pair_feature_profile not in PAIR_FEATURE_PROFILES:
-                raise ValueError(
-                    "pair_feature_profile must be one of: "
-                    + ", ".join(sorted(PAIR_FEATURE_PROFILES))
-                )
-            string_updates["pair_feature_profile"]=pair_feature_profile
-        if "relational_evidence_mode" in values:
-            relational_mode=str(values["relational_evidence_mode"])
-            if relational_mode not in {"disabled","facts_only","chained"}:
-                raise ValueError(
-                    "relational_evidence_mode must be disabled, facts_only, "
-                    "or chained"
-                )
-            string_updates["relational_evidence_mode"]=relational_mode
-        float_updates={}
-        if "pairwise_weight" in values:
-            pairwise_weight=float(values["pairwise_weight"])
-            if not 0.0<=pairwise_weight<=1.0:
-                raise ValueError("pairwise_weight must be between 0 and 1")
-            float_updates["pairwise_weight"]=pairwise_weight
-        if "ctv_evidence_k" in values:
-            try:
-                ctv_evidence_k=float(values["ctv_evidence_k"])
-            except (TypeError,ValueError) as exc:
-                raise ValueError(
-                    "ctv_evidence_k must be a finite number greater than 0 and at most 1e9"
-                ) from exc
-            if (not math.isfinite(ctv_evidence_k)
-                    or not 0.0<ctv_evidence_k<=1e9):
-                raise ValueError(
-                    "ctv_evidence_k must be a finite number greater than 0 and at most 1e9"
-                )
-            float_updates["ctv_evidence_k"]=ctv_evidence_k
-        if ("pair_rule_selection_k" in values
-                or "pair_ctv_evidence_k" in values):
-            selection_key=("pair_rule_selection_k"
-                           if "pair_rule_selection_k" in values
-                           else "pair_ctv_evidence_k")
-            try:
-                pair_rule_selection_k=float(values[selection_key])
-            except (TypeError,ValueError) as exc:
-                raise ValueError(
-                    f"{selection_key} must be a finite number greater than 0 "
-                    "and at most 1e9"
-                ) from exc
-            if (not math.isfinite(pair_rule_selection_k)
-                    or not 0.0<pair_rule_selection_k<=1e9):
-                raise ValueError(
-                    f"{selection_key} must be a finite number greater than 0 "
-                    "and at most 1e9"
-                )
-            if ("pair_rule_selection_k" in values
-                    and "pair_ctv_evidence_k" in values):
-                try:
-                    legacy_value=float(values["pair_ctv_evidence_k"])
-                except (TypeError,ValueError) as exc:
-                    raise ValueError(
-                        "pair_ctv_evidence_k must equal pair_rule_selection_k"
-                    ) from exc
-                if legacy_value!=pair_rule_selection_k:
-                    raise ValueError(
-                        "pair_ctv_evidence_k is a deprecated alias and must "
-                        "equal pair_rule_selection_k when both are supplied"
-                    )
-            float_updates["pair_rule_selection_k"]=pair_rule_selection_k
-            # Preserve round-tripping of old frozen configurations without
-            # allowing this legacy name to control PeTTa confidence encoding.
-            float_updates["pair_ctv_evidence_k"]=pair_rule_selection_k
-        if "pair_min_effect" in values:
-            pair_min_effect=float(values["pair_min_effect"])
-            if not 0.0<=pair_min_effect<=1.0:
-                raise ValueError("pair_min_effect must be between 0 and 1")
-            float_updates["pair_min_effect"]=pair_min_effect
-        if "pair_margin_power" in values:
-            try:
-                pair_margin_power=float(values["pair_margin_power"])
-            except (TypeError,ValueError) as exc:
-                raise ValueError(
-                    "pair_margin_power must be a finite number between "
-                    f"{PAIR_MARGIN_POWER_MIN} and {PAIR_MARGIN_POWER_MAX}"
-                ) from exc
-            if (not math.isfinite(pair_margin_power)
-                    or not PAIR_MARGIN_POWER_MIN<=pair_margin_power<=PAIR_MARGIN_POWER_MAX):
-                raise ValueError(
-                    "pair_margin_power must be a finite number between "
-                    f"{PAIR_MARGIN_POWER_MIN} and {PAIR_MARGIN_POWER_MAX}"
-                )
-            float_updates["pair_margin_power"]=pair_margin_power
-        for key,label in (
-            ("serving_reasoner_timeout_seconds","serving reasoner timeout"),
-            ("benchmark_reasoner_timeout_seconds","benchmark reasoner timeout"),
-        ):
+
+        integer_bounds={
+            "min_support":(1,None),"max_rules":(1,1024),
+            "top_k":(1,None),"conjunctions":(2,2),
+            "chain_steps":(1,None),"mine_interval":(1,None),
+            "max_candidates":(0,None),"random_seed":(0,None),
+            "query_batch_size":(1,None),"feed_window":(1,None),
+            "negative_ratio":(0,None),"max_feature_values":(10,None),
+            "pair_min_support":(1,None),"pair_max_rules":(1,1024),
+            "pair_negative_ratio":(0,None),"pair_conjunctions":(3,3),
+            "pair_numeric_bins":(1,8),"pairwise_opponents":(0,0),
+            "pair_chain_steps":(2,None),
+            "max_pair_comparisons":(1,HARD_MAX_PAIR_COMPARISONS),
+            "max_total_pair_comparisons":(1,HARD_MAX_TOTAL_PAIR_COMPARISONS),
+            "max_proof_cache_entries":(1,HARD_MAX_PROOF_CACHE_ENTRIES),
+            "mining_retention_max_units":(1,HARD_RETENTION_MAX_UNITS),
+            "mining_retention_max_cases":(1,HARD_RETENTION_MAX_CASES),
+        }
+        updates={}
+        for key,(minimum,maximum) in integer_bounds.items():
             if key not in values:
                 continue
-            try:
-                timeout=float(values[key])
-            except (TypeError,ValueError) as exc:
-                raise ValueError(
-                    f"{label} must be a finite number greater than 0 and at "
-                    f"most {REASONER_TIMEOUT_SECONDS_MAX:g}"
-                ) from exc
-            if (not math.isfinite(timeout) or timeout<=0.0
-                    or timeout>REASONER_TIMEOUT_SECONDS_MAX):
-                raise ValueError(
-                    f"{label} must be a finite number greater than 0 and at "
-                    f"most {REASONER_TIMEOUT_SECONDS_MAX:g}"
-                )
-            float_updates[key]=timeout
-        changed_values={**updates,**string_updates,**float_updates}
-        if getattr(self,"symbolic_only",False):
-            point_profile=changed_values.get("feature_profile",self.config["feature_profile"])
-            pair_profile=changed_values.get("pair_feature_profile",self.config["pair_feature_profile"])
-            predicates=(*FEATURE_PROFILES[point_profile],*PAIR_FEATURE_PROFILES[pair_profile])
-            if any("semantic" in p or "entity" in p or "llm_" in p for p in predicates):
-                raise ValueError("symbolic-only mode rejects semantic/vector/entity feature profiles")
-        selected_pair=string_updates.get("pair_feature_profile",self.config.get("pair_feature_profile",""))
-        selected_pair_predicates=PAIR_FEATURE_PROFILES.get(selected_pair,())
-        selected_point=string_updates.get(
-            "feature_profile",self.config.get("feature_profile","")
-        )
-        selected_point_predicates=FEATURE_PROFILES.get(selected_point,())
-        _validate_relational_score_dependencies(
-            selected_point_predicates,selected_pair_predicates
-        )
-        relational_predicates={
-            "rel_entity_continuity_scope","rel_concept_continuity_scope",
-            "pair_rel_entity_continuity_scope",
-            "pair_rel_concept_continuity_scope",
+            value=int(values[key])
+            if value<minimum or (maximum is not None and value>maximum):
+                interval=(f"[{minimum}, {maximum}]" if maximum is not None
+                          else f">= {minimum}")
+                raise ValueError(f"{key} must be {interval}")
+            updates[key]=value
+
+        float_bounds={
+            "ctv_evidence_k":(0.0,1e9),
+            "pair_rule_selection_k":(0.0,1e9),
+            "pair_ctv_evidence_k":(0.0,1e9),
+            "pair_min_effect":(-1e-12,1.0),
+            "serving_reasoner_timeout_seconds":(
+                0.0,REASONER_TIMEOUT_SECONDS_MAX
+            ),
+            "benchmark_reasoner_timeout_seconds":(
+                0.0,REASONER_TIMEOUT_SECONDS_MAX
+            ),
         }
-        relational_selected=bool(
-            relational_predicates.intersection(
-                (*selected_point_predicates,*selected_pair_predicates)
-            )
-        )
-        effective_relational_mode=string_updates.get(
-            "relational_evidence_mode",
-            self.config.get("relational_evidence_mode","disabled"),
-        )
-        if relational_selected and effective_relational_mode!="chained":
-            raise ValueError(
-                "relational feature profiles require "
-                "relational_evidence_mode=chained"
-            )
-        if (effective_relational_mode in {"facts_only","chained"}
-                and not getattr(self,"_relational_workspace",{})):
-            raise ValueError(
-                "relational evidence modes require a prepared relational workspace"
-            )
-        if (any(predicate in PAIR_CATEGORICAL_SIDE_PREDICATES
-                for predicate in selected_pair_predicates)
-                and effective_pair_depth<3):
-            raise ValueError(
-                "scoped categorical profiles require pair_conjunctions >= 3; "
-                "side categories are never mined as unconditioned unary rules"
-            )
-        if (selected_pair.startswith("llm_")
-                and any(predicate.endswith("_quantile")
-                        for predicate in selected_pair_predicates)):
-            effective_bins=updates.get(
-                "pair_numeric_bins",self.config["pair_numeric_bins"]
-            )
-            effective_value_cap=updates.get(
-                "max_feature_values",self.config["max_feature_values"]
-            )
-            minimum_value_cap=2*effective_bins+2
-            if effective_value_cap<minimum_value_cap:
+        for key,(lower,upper) in float_bounds.items():
+            if key not in values:
+                continue
+            value=float(values[key])
+            if not math.isfinite(value) or not lower<value<=upper:
+                raise ValueError(f"{key} must be finite and in ({lower}, {upper}]")
+            updates[key]=value
+
+        if "pair_ctv_evidence_k" in updates:
+            if ("pair_rule_selection_k" in updates
+                    and updates["pair_rule_selection_k"]!=updates["pair_ctv_evidence_k"]):
                 raise ValueError(
-                    "LLM quantile profiles require max_feature_values >= "
-                    f"{minimum_value_cap} for mirror-closed left/right bins"
+                    "pair_ctv_evidence_k is a legacy alias and must equal "
+                    "pair_rule_selection_k"
                 )
-        if selected_pair.startswith("llm_") and not getattr(self,"_llm_article_annotations",{}):
-            raise ValueError("LLM profiles require a prepared annotation workspace")
-        if (selected_pair.startswith("llm_")
-                and changed_values.get(
-                    "pair_aggregation",self.config["pair_aggregation"]
-                )!="proof_margin"):
+            updates["pair_rule_selection_k"]=updates["pair_ctv_evidence_k"]
+        elif "pair_rule_selection_k" in updates:
+            updates["pair_ctv_evidence_k"]=updates["pair_rule_selection_k"]
+
+        known=set(fixed)|set(integer_bounds)|set(float_bounds)
+        unknown=sorted(set(values)-known)
+        if unknown:
+            raise ValueError(f"unknown configuration fields: {', '.join(unknown)}")
+        if (updates.get("max_feature_values",self.config["max_feature_values"])
+                < 2*updates.get("pair_numeric_bins",
+                                self.config["pair_numeric_bins"])+2):
             raise ValueError(
-                "LLM profiles require proof_margin so correlated variants use "
-                "isolated PeTTa proof channels"
+                "max_feature_values must hold every mirrored numeric bin"
             )
-        if (effective_strategy in {
-                "conditional_llm","conditional_llm_seed_only",
-                "petta_conditional_seed_only","petta_mdl_seed_only",
-                "petta_hierarchical_seed_only"}
-                and selected_pair not in {
-                    "llm_conditional","llm_conditional_quantile",
-                    "llm_conditional_quantile_relational",
-                    "llm_conditional_magnitude_backoff",
-                    "llm_conditional_scoped_taxonomy"
-                }):
-            raise ValueError(
-                "conditional LLM mining requires pair_feature_profile "
-                "llm_conditional, llm_conditional_quantile or "
-                "llm_conditional_quantile_relational or "
-                "llm_conditional_magnitude_backoff or "
-                "llm_conditional_scoped_taxonomy"
-            )
-        effective_pair_ctv=string_updates.get(
-            "pair_ctv_mode",self.config.get("pair_ctv_mode","raw_pairs")
+
+        changed=any(self.config.get(key)!=value for key,value in updates.items())
+        inference_changed=any(
+            key in updates and self.config.get(key)!=updates[key]
+            for key in ("chain_steps","pair_chain_steps","query_batch_size")
         )
-        if (effective_pair_ctv=="conditional_effective_backoff"
-                and effective_strategy not in {
-                    "conditional_llm_seed_only","petta_conditional_seed_only",
-                    "petta_mdl_seed_only",
-                    "petta_hierarchical_seed_only",
-                }):
-            raise ValueError(
-                "conditional_effective_backoff requires "
-                "a seed-only conditional miner strategy"
-            )
-        if (getattr(self,"_llm_workspace",{})
-                and changed_values.get("pair_dependency_mode",self.config["pair_dependency_mode"])!="clustered"):
-            raise ValueError("LLM workspace requires clustered dependencies for correlated text evidence")
-        if selected_pair.startswith("workspace_") and not getattr(self,"_semantic_workspace_model",{}):
-            raise ValueError("workspace profiles require a prepared semantic-data snapshot")
-        if selected_pair.startswith("text_semantic_recency_") and not getattr(self,"_recency_workspace",{}):
-            raise ValueError("recency profiles require a prepared recency workspace snapshot")
-        if (getattr(self,"_recency_workspace",{})
-                and changed_values.get("pair_dependency_mode",self.config["pair_dependency_mode"])!="clustered"):
-            raise ValueError("recency workspace requires clustered dependencies for shared encoder evidence")
-        if (getattr(self,"_semantic_workspace_model",{})
-                and changed_values.get("pair_dependency_mode",self.config["pair_dependency_mode"])!="clustered"):
-            raise ValueError("semantic workspace requires clustered dependencies to avoid counting encoder variants twice")
-        changed=any(self.config.get(key)!=value for key,value in changed_values.items())
-        inference_changed=any(key in {
-                                  "aggregation","chain_steps",
-                                  "pair_chain_steps","query_batch_size"
-                              }
-                              and self.config.get(key)!=value
-                              for key,value in changed_values.items())
-        pair_margin_changed=any(
-            key in changed_values and self.config.get(key)!=changed_values[key]
-            for key in ("pair_margin_transform","pair_margin_power")
-        )
-        self.config.update(updates); self.config.update(string_updates); self.config.update(float_updates)
+        self.config.update(fixed)
+        self.config.update(updates)
         if changed:
-            self._feed_sessions.clear(); self.feed_cache.clear()
+            self._feed_sessions.clear()
+            self.feed_cache.clear()
         if inference_changed:
-            self._proof_cache.clear(); self._pair_proof_cache.clear()
+            self._proof_cache.clear()
+            self._pair_proof_cache.clear()
             self._point_channel_proof_cache.clear()
-            self._pair_channel_proof_cache.clear(); self._pair_margin_cache.clear()
-            self._pair_proof_origins.clear()
-            self._point_query_calls=0; self._point_query_roots=0
-            self._point_pruned_query_roots=0
-            self._point_channel_activations=0
-            self._point_reused_channel_activations=0
-            self._last_point_completeness={}
-            self._last_point_cache_stats={}
-        elif pair_margin_changed:
+            self._pair_channel_proof_cache.clear()
             self._pair_margin_cache.clear()
+            self._pair_proof_origins.clear()
         return self.config
 
 # ``spawn`` imports this module in every scoring child. Never construct the
@@ -2444,61 +1478,7 @@ LAB=(Lab() if (__name__!="__main__" and mp.current_process().name=="MainProcess"
               and os.getenv("RECOMMENDATION_DISABLE_DEFAULT_LAB")!="1")
      else None)
 LAB_SWAP_LOCK=threading.Lock()
-TRAINING_CONFIRMATION_HTTP_LOCK=threading.Lock()
-TRAINING_CONFIRMATION_MAX_BODY_BYTES=32_768
 HTML=WEB_TEMPLATE.read_text(encoding="utf-8")
-
-
-def _loopback_name(value):
-    name=str(value or "").lower()
-    if name=="localhost": return True
-    try: return ipaddress.ip_address(name).is_loopback
-    except ValueError: return False
-
-
-def _authority_parts(authority,default_port):
-    try:
-        parsed=urlparse("//"+str(authority or ""))
-        if (not parsed.hostname or parsed.username or parsed.password
-                or parsed.path or parsed.query or parsed.fragment):
-            return None
-        return parsed.hostname.lower(),parsed.port or default_port
-    except ValueError:
-        return None
-
-
-def _training_confirmation_request_error(headers,client_host,server_port):
-    """Return an HTTP error for an unsafe mutation request, otherwise None."""
-    if not _loopback_name(client_host):
-        return 403,"training confirmation is restricted to loopback clients"
-    host=_authority_parts(headers.get("Host"),server_port)
-    if host is None or not _loopback_name(host[0]) or host[1]!=server_port:
-        return 403,"training confirmation requires this localhost server origin"
-    content_type=str(headers.get("Content-Type","")).split(";",1)[0].strip().lower()
-    if content_type!="application/json":
-        return 415,"training confirmation requires application/json"
-
-    configured_token=os.getenv("RECOMMENDATION_ADMIN_TOKEN","").strip()
-    if configured_token:
-        supplied=str(headers.get("X-Admin-Token","")).strip()
-        authorization=str(headers.get("Authorization","")).strip()
-        if authorization.lower().startswith("bearer "):
-            supplied=authorization[7:].strip()
-        if not supplied or not hmac.compare_digest(supplied,configured_token):
-            return 403,"training confirmation requires the configured admin token"
-
-    origin=str(headers.get("Origin","")).strip()
-    if origin:
-        try:
-            parsed=urlparse(origin)
-            origin_host=(parsed.hostname.lower(),parsed.port or 80)
-        except (AttributeError,ValueError):
-            return 403,"training confirmation requires a same-origin request"
-        if (parsed.scheme!="http" or parsed.username or parsed.password
-                or parsed.query or parsed.fragment or parsed.path not in {"","/"}
-                or origin_host!=host):
-            return 403,"training confirmation requires a same-origin request"
-    return None
 
 @contextmanager
 def pinned_lab():
@@ -2573,38 +1553,18 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         global LAB
         path=urlparse(self.path).path
-        if path=="/api/training-confirmation":
-            request_error=_training_confirmation_request_error(
-                self.headers,self.client_address[0],self.server.server_port
-            )
-            if request_error is not None:
-                status,message=request_error
-                self.send_json({"error":message},status); return
         try:
             raw_length=self.headers.get("Content-Length")
-            if path=="/api/training-confirmation" and raw_length is None:
-                self.send_json({"error":"Content-Length is required"},411); return
             content_length=int(raw_length or 0)
             if content_length<0: raise ValueError
         except (TypeError,ValueError):
             self.send_json({"error":"invalid Content-Length"},400); return
-        if (path=="/api/training-confirmation"
-                and content_length>TRAINING_CONFIRMATION_MAX_BODY_BYTES):
-            self.send_json({"error":"training confirmation request body is too large"},413)
-            return
         try: body=json.loads(self.rfile.read(content_length) or b"{}")
         except (json.JSONDecodeError,UnicodeDecodeError):
             self.send_json({"error":"invalid json"},400); return
-        training_lock_claimed=False
-        if path=="/api/training-confirmation":
-            if not TRAINING_CONFIRMATION_HTTP_LOCK.acquire(blocking=False):
-                self.send_json({"error":"training confirmation is already running"},409)
-                return
-            training_lock_claimed=True
         try:
             if path in {
                     "/api/config","/api/dataset/load","/api/mine",
-                    "/api/training-confirmation","/api/tune",
             }:
                 with pinned_lab() as active:
                     immutable=bool(getattr(active,"serving_only",False))
@@ -2632,22 +1592,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path=="/api/dataset/load":
                 with pinned_lab() as active:
-                    symbolic_only=active.symbolic_only
-                    semantic_workspace=bool(getattr(active,"_semantic_workspace_model",{})) and not symbolic_only
-                    recency_workspace=bool(getattr(active,"_recency_workspace",{})) and not symbolic_only
                     replay_snapshot=bool(getattr(active,"_replay_snapshot",False))
-                    # Transfer the selected architecture, not a silently reset
-                    # baseline, when changing a strict-symbolic dataset.
-                    transferred_config=active.config.copy() if symbolic_only or semantic_workspace or recency_workspace or replay_snapshot else None
-                if symbolic_only:
-                    data=load_symbolic_snapshot(body["path"])
-                elif semantic_workspace:
-                    data=load_semantic_snapshot(body["path"])
-                elif recency_workspace:
-                    data=load_symbolic_snapshot(body["path"])
-                    if not data.get("metadata",{}).get("recency_workspace"):
-                        raise ValueError("recency mode requires a prepared recency workspace snapshot")
-                elif replay_snapshot:
+                    transferred_config=(active.config.copy()
+                                        if replay_snapshot else None)
+                if str(body["path"]).endswith((".json",".json.gz")):
                     data=load_symbolic_snapshot(body["path"])
                 else:
                     data=load_mind(body["path"],max_train_cases=int(body.get("max_train_cases",20000)),
@@ -2655,8 +1603,7 @@ class Handler(BaseHTTPRequestHandler):
                                    seed=int(body.get("random_seed",body.get("seed",7))),
                                    text_embedding_path=body.get("text_embedding_path"))
                 replacement=Lab(
-                    data=data,symbolic_only=symbolic_only,
-                    config=transferred_config,
+                    data=data,config=transferred_config,
                     serving_only=active.serving_only,
                 )
                 with LAB_SWAP_LOCK:
@@ -2690,9 +1637,6 @@ class Handler(BaseHTTPRequestHandler):
                     else: mined=None
                     result={"config":lab.config,"mined":mined}
                 elif path=="/api/benchmark": result=lab.benchmark(body)
-                elif path=="/api/compare": result=lab.compare_profiles(body)
-                elif path=="/api/training-confirmation": result=lab.training_confirmation(body)
-                elif path=="/api/tune": result=lab.tune(body)
                 else: self.send_json({"error":"not found"},404); return
             self.send_json(result)
         except SemanticPreviewBusyError:
@@ -2709,9 +1653,6 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error":"reasoner deadline exceeded; request failed"},504)
         except (KeyError,ValueError,OSError) as exc: self.send_json({"error":str(exc)},400)
         except Exception as exc: self.send_json({"error":f"engine failure: {exc}"},500)
-        finally:
-            if training_lock_claimed:
-                TRAINING_CONFIRMATION_HTTP_LOCK.release()
 def load_symbolic_snapshot(path):
     path=Path(path)
     if not str(path).endswith((".json",".json.gz")):
@@ -2720,13 +1661,6 @@ def load_symbolic_snapshot(path):
         data=json.load(stream)
     data.setdefault("metadata",{})["root"]=str(path.resolve())
     data["metadata"]["replay_snapshot"]=True
-    return data
-
-
-def load_semantic_snapshot(path):
-    data=load_symbolic_snapshot(path)
-    if not data.get("semantic_workspace_model") or not data.get("metadata",{}).get("semantic_workspace"):
-        raise ValueError("semantic-data requires a prepared semantic_workspace snapshot")
     return data
 
 
@@ -2770,8 +1704,6 @@ def _scorer_worker_command(args,port):
     if args.workers>1 or args.serving_only:
         command.append("--serving-only")
     for option,value in (
-        ("--symbolic-data",args.symbolic_data),
-        ("--semantic-data",args.semantic_data),
         ("--replay-data",args.replay_data),
         ("--config-file",args.config_file),
         ("--serving-model",args.serving_model),
@@ -2781,8 +1713,7 @@ def _scorer_worker_command(args,port):
             command.extend((option,str(value)))
     if args.fixture:
         command.append("--fixture")
-    elif (not args.symbolic_data and not args.semantic_data
-          and not args.replay_data and args.mind):
+    elif not args.replay_data and args.mind:
         command.extend(("--mind",str(args.mind)))
     return tuple(command)
 
@@ -2808,11 +1739,8 @@ def main():
     parser.add_argument("--mind",default=str(local_archive) if local_archive.is_file() else None,
                         help="Extracted raw MIND root or RecZoo MIND_small_x1.zip")
     parser.add_argument("--fixture",action="store_true",help="Use only the bundled deterministic fixture")
-    evidence=parser.add_mutually_exclusive_group()
-    evidence.add_argument("--symbolic-data",help="Prepared causal JSON snapshot; enforces no NN, vectors or NL2PLN")
-    evidence.add_argument("--semantic-data",help="Prepared frozen content-evidence workspace; only miner/PeTTa rules rank candidates")
-    evidence.add_argument("--replay-data",help="Prepared JSON replay snapshot; preserve its existing content/entity evidence")
-    parser.add_argument("--config-file",help="JSON configuration or saved symbolic_experiment artifact")
+    parser.add_argument("--replay-data",help="Prepared champion JSON replay snapshot")
+    parser.add_argument("--config-file",help="JSON object with bounded champion parameters")
     parser.add_argument(
         "--serving-model",
         help="Validated frozen serving-model JSON; skips fpMiner at startup",
@@ -2878,14 +1806,7 @@ def main():
         config=saved.get("result",saved).get("config",saved)
     serving_model=(load_serving_model(args.serving_model)
                    if args.serving_model else None)
-    if args.symbolic_data:
-        LAB=Lab(load_symbolic_snapshot(args.symbolic_data),symbolic_only=True,
-                config=config,serving_model=serving_model,
-                serving_only=args.serving_only)
-    elif args.semantic_data:
-        LAB=Lab(load_semantic_snapshot(args.semantic_data),config=config,
-                serving_model=serving_model,serving_only=args.serving_only)
-    elif args.replay_data:
+    if args.replay_data:
         LAB=Lab(load_symbolic_snapshot(args.replay_data),config=config,
                 serving_model=serving_model,serving_only=args.serving_only)
     elif args.mind and not args.fixture:

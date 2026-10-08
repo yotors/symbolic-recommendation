@@ -529,7 +529,10 @@ def make_benchmark_mixin(
             previous_config=self.config.copy()
             mining=None
             try:
-                self.configure(config)
+                self.configure({
+                    key:value for key,value in config.items()
+                    if key in self.config
+                })
                 remine=config.get("remine",True) is not False
                 stale_keys=sorted(
                     key for key in MINING_CONFIG_KEYS

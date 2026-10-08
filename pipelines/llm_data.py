@@ -20,13 +20,66 @@ from collections import Counter
 from collections.abc import Mapping
 
 from ..features.llm_workspace import LLM_WORKSPACE_FEATURES, LLM_WORKSPACE_SCHEMA, build_llm_workspace_facts
-from .recency_data import _corpus, _evaluation, _history, _read
-from ..features.text_embeddings import article_text
+from ..features.text_embeddings import _canonical_corpus, article_text
 
 
 LLM_PROJECTION_SCHEMA = "mindplex-preserved-llm-projection-v1"
 ANNOTATION_SNAPSHOT_SCHEMA = "mindplex-llm-article-facts-v1"
 CANONICAL_ANNOTATION_SCHEMA = "mindplex-canonical-article-annotations-v1"
+_EVALUATION_KEYS = ("eval_impressions", "evaluation", "tests", "impressions")
+
+
+def _file_hash(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _read(value):
+    if isinstance(value, Mapping):
+        encoded = json.dumps(
+            value, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"), allow_nan=False,
+        ).encode("utf-8")
+        return value, hashlib.sha256(encoded).hexdigest(), "canonical-json-mapping"
+    path = Path(value)
+    before = _file_hash(path)
+    with (gzip.open(path, "rt", encoding="utf-8") if path.suffix == ".gz"
+          else path.open(encoding="utf-8")) as stream:
+        data = json.load(stream)
+    if before != _file_hash(path):
+        raise ValueError("dataset changed while loading")
+    if not isinstance(data, Mapping):
+        raise ValueError("dataset must be a JSON mapping")
+    return data, before, "file-bytes"
+
+
+def _evaluation(data):
+    keys = [key for key in _EVALUATION_KEYS if isinstance(data.get(key), list)]
+    if len(keys) != 1:
+        raise ValueError("dataset must contain exactly one evaluation list")
+    return keys[0], data[keys[0]]
+
+
+def _history(row, label):
+    history = row.get("history")
+    if (not isinstance(history, list)
+            or any(not isinstance(item, str) or not item for item in history)):
+        raise ValueError(
+            f"{label} must have an explicit ordered history of article IDs"
+        )
+    return history
+
+
+def _corpus(data):
+    return _canonical_corpus(
+        ((article["id"], article.get("source_id", article["id"]),
+          article.get("title"), article.get("abstract"))
+         for article in data["articles"]),
+        source={"kind": "preserved-replay"},
+    )
 
 
 def _annotation_records(payload):

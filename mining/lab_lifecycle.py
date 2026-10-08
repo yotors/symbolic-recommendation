@@ -7,10 +7,8 @@ import hmac
 import json
 import math
 import random
-import re
 import threading
 import time
-import unicodedata
 from collections import Counter, OrderedDict
 
 from ..app.async_mining import MiningSnapshot
@@ -21,15 +19,13 @@ from ..core.ctv_calibration import (
 )
 from ..core.symbolic import QuantileNumericEvidence
 from ..features.llm_workspace import LLM_NUMERIC_FEATURES
-from ..features.relational_workspace import RELATIONAL_STRUCTURAL_RULES
 from .conditional_llm_mining import (
     ConditionalMiningConfig, FpMinerUnary, mine_conditional_llm_patterns,
 )
 from .retention import retain_complete_units
 from .rule_parser import (
-    POSITIVE, parse_petta_target_rules, parse_rules,
+    POSITIVE, parse_rules,
 )
-from .target_miner import TargetMinerConfig, mine_target_patterns
 
 
 def make_model_lifecycle_mixin(
@@ -139,78 +135,6 @@ def make_model_lifecycle_mixin(
                             exc.add_note(
                                 f"failed to roll back rejected {workspace_kind} "
                                 "mining workspace: "
-                                f"{type(rollback_exc).__name__}: {rollback_exc}"
-                            )
-                raise
-
-        def _mine_petta_target_workspace(
-            self, synced, *, plan, features, depth, min_support,
-            min_auc_gain, workspace_kind, semantic_features=(), context_features=(),
-            min_incremental_precision=0.0,
-        ):
-            """Run target metrics and conjunction filtering entirely in PeTTa."""
-            try:
-                started = time.perf_counter()
-                if semantic_features or context_features:
-                    if (not semantic_features or not context_features
-                            or int(depth) != 3):
-                        raise ValueError(
-                            "conditional PeTTa mining requires both predicate "
-                            "families and depth three"
-                        )
-                    semantic_atom="("+" ".join(semantic_features)+")"
-                    context_atom="("+" ".join(context_features)+")"
-                    function="conditional-target-aware-frequency-pattern-miner"
-                    query=(
-                        f"!({function} {synced.space} "
-                        f"{int(min_support)} "
-                        f"{semantic_atom} {context_atom} \"click\" "
-                        f"{float(self.config['ctv_evidence_k']):.17g} "
-                        f"{float(min_auc_gain):.17g} "
-                        f"{float(min_incremental_precision):.17g})"
-                    )
-                else:
-                    function="target-aware-frequency-pattern-miner"
-                    query=(
-                        f"!({function} {synced.space} {int(min_support)} "
-                        f"{int(depth)} \"click\" "
-                        f"{float(self.config['ctv_evidence_k']):.17g} "
-                        f"{float(min_auc_gain):.17g})"
-                    )
-                raw = self.petta.process_metta_string(query)
-                values = (() if raw is None else (raw,) if isinstance(raw, (str, bytes))
-                          else tuple(raw))
-                rules = parse_petta_target_rules(values, features=features)
-                return rules, {
-                    "plan": plan,
-                    "space": synced.space,
-                    "depth": int(depth),
-                    "min_support": int(min_support),
-                    "min_auc_gain": float(min_auc_gain),
-                    "min_incremental_precision":
-                        float(min_incremental_precision),
-                    "rules": len(rules),
-                    "seconds": time.perf_counter() - started,
-                    "executor": f"{function} via PeTTa",
-                    "semantic_features": list(semantic_features),
-                    "context_features": list(context_features),
-                    "host_role": "workspace_transport_and_atom_decoding_only",
-                    "symbolic_statistics": [
-                        "contingency", "CTV", "AUC", "Youden-J", "WRAcc",
-                        "information-gain", "log-odds", "parent-precision",
-                        "incremental-precision", "incremental-WRAcc", "MDL-gain",
-                        "hierarchical-parent-precision", "hierarchical-precision",
-                    ],
-                }
-            except BaseException as exc:
-                if plan not in self._active_mining_workspace_plans:
-                    try:
-                        self._mining_workspaces.rollback(synced)
-                    except BaseException as rollback_exc:
-                        if hasattr(exc, "add_note"):
-                            exc.add_note(
-                                f"failed to roll back rejected {workspace_kind} "
-                                "target-aware workspace: "
                                 f"{type(rollback_exc).__name__}: {rollback_exc}"
                             )
                 raise
@@ -329,28 +253,9 @@ def make_model_lifecycle_mixin(
             except (TypeError,ValueError,OverflowError): return True
             return not math.isfinite(number)
 
-        @staticmethod
-        def _category_symbol(value):
-            """Return a stable, parser-safe symbolic category plus its label.
-
-            Ordinary MIND labels remain readable (for example ``news``). Values
-            containing quoting/control syntax are represented by a readable slug
-            and content hash so they cannot corrupt the MeTTa form parser or alias
-            two distinct taxonomy nodes.
-            """
-            if not isinstance(value,str): return None,None
-            label=unicodedata.normalize("NFKC"," ".join(value.split())).casefold()
-            if label in {"","unknown","none","null"}: return None,None
-            if re.fullmatch(r"[a-z0-9][a-z0-9._:/-]{0,127}",label):
-                return label,label
-            ascii_label=(unicodedata.normalize("NFKD",label)
-                         .encode("ascii","ignore").decode("ascii"))
-            slug=re.sub(r"[^a-z0-9._:-]+","_",ascii_label).strip("_.:-")[:48]
-            digest=hashlib.sha256(label.encode("utf-8")).hexdigest()[:16]
-            return f"{slug or 'category'}__{digest}",label
-
         def _pair_features(self,left_attrs,right_attrs,left_article,right_article,
                            needed=None):
+            """Project one ordered candidate pair into champion predicates."""
             needed=set(needed) if needed is not None else None
             wants=lambda predicate: needed is None or predicate in needed
             plan=_pair_feature_execution_plan(
@@ -366,22 +271,7 @@ def make_model_lifecycle_mixin(
                 attrs["pair_history_scope"]=(
                     left_scope if left_scope==right_scope else "unknown"
                 )
-            for output,source in plan["lexical"]:
-                attrs[output]=self._relative_numeric_value(
-                    left_attrs.get(source),right_attrs.get(source)
-                )
-            for output,source in plan["semantic_workspace"]:
-                attrs[output]=self._relative_numeric_value(
-                    left_attrs.get(source),right_attrs.get(source)
-                )
             for output,source in plan["ordered"]:
-                if source in RELATIONAL_PROOF_FIELDS and (
-                        left_attrs.get(source) not in {"none","older","recent"}
-                        or right_attrs.get(source)
-                           not in {"none","older","recent"}):
-                    # Annotation absence/truncation is not directional evidence.
-                    # In particular, never encode it as left_known/right_known.
-                    continue
                 if source in left_attrs or source in right_attrs:
                     attrs[output]=self._relative_value(
                         left_attrs.get(source),right_attrs.get(source),PAIR_ORDERS[source]
@@ -390,21 +280,16 @@ def make_model_lifecycle_mixin(
                 attrs[output]=self._relative_numeric_value(
                     left_attrs.get(source),right_attrs.get(source)
                 )
-            for output,source in plan["multi_interest"]:
-                if source in LLM_NUMERIC_FEATURES and (
-                        self._numeric_missing(left_attrs.get(source))
+            for output,source in plan["llm"]:
+                if (self._numeric_missing(left_attrs.get(source))
                         or self._numeric_missing(right_attrs.get(source))):
-                    # Budget-limited extraction coverage is not a preference.
-                    # Missing annotation on one side cannot become left_known or
-                    # right_known evidence for choosing the annotated candidate.
                     attrs[output]="incomparable"
                     continue
                 attrs[output]=self._relative_numeric_value(
                     left_attrs.get(source),right_attrs.get(source)
                 )
             for source,predicate in plan["quantile"]:
-                if source in LLM_NUMERIC_FEATURES and (
-                        self._numeric_missing(left_attrs.get(source))
+                if (self._numeric_missing(left_attrs.get(source))
                         or self._numeric_missing(right_attrs.get(source))):
                     # Annotation absence is not directional evidence. This is
                     # stricter than the generic encoder's useful left_known /
@@ -417,27 +302,6 @@ def make_model_lifecycle_mixin(
                     attrs[predicate]=encoder.encode_pair(
                         left_attrs.get(source),right_attrs.get(source)
                     )
-            # A mined symbolic multi-interest ensemble.  The feature construction
-            # only states which side wins a majority of three independent views;
-            # it does not prescribe that the predicate predicts a click.  The
-            # MeTTa miner must discover and calibrate that implication from closed
-            # same-impression outcomes before PeTTaChainer can use it.
-            if wants("pair_stable_dominance"):
-                stable_values={}
-                for feature,source in PAIR_STABLE_DOMINANCE_SOURCES.items():
-                    value=attrs.get(feature)
-                    if value is None and (source in left_attrs or source in right_attrs):
-                        value=self._relative_value(
-                            left_attrs.get(source),right_attrs.get(source),
-                            PAIR_ORDERS[source],
-                        )
-                    stable_values[feature]=value
-                left_votes=sum(value=="left" for value in stable_values.values())
-                right_votes=sum(value=="right" for value in stable_values.values())
-                attrs["pair_stable_dominance"]=(
-                    "left" if left_votes>right_votes else
-                    "right" if right_votes>left_votes else "equal"
-                )
             left_topic=str(left_article.get("topic","unknown"))
             right_topic=str(right_article.get("topic","unknown"))
             left_subcategory=str(left_article.get("subcategory","unknown"))
@@ -450,83 +314,11 @@ def make_model_lifecycle_mixin(
                 attrs["pair_same_subcategory"]=(
                     "same" if left_subcategory==right_subcategory else "different"
                 )
-            wanted_categorical=(needed is None
-                                or bool(needed & PAIR_CATEGORICAL_SIDE_PREDICATES))
-            if not wanted_categorical:
-                return attrs
-            left_topic_value,left_topic_label=self._category_symbol(left_topic)
-            right_topic_value,right_topic_label=self._category_symbol(right_topic)
-            left_subcategory_value,left_subcategory_label=self._category_symbol(
-                left_subcategory
-            )
-            right_subcategory_value,right_subcategory_label=self._category_symbol(
-                right_subcategory
-            )
-            left_format_value,left_format_label=self._category_symbol(
-                left_attrs.get("llm_format")
-            )
-            right_format_value,right_format_label=self._category_symbol(
-                right_attrs.get("llm_format")
-            )
-            categorical_values={
-                "topic":(left_topic_value,right_topic_value),
-                # A subcategory label is meaningful only under its parent topic;
-                # namespacing prevents generic labels from colliding across trees.
-                "subcategory":(
-                    (f"topic={left_topic_value}|subcategory={left_subcategory_value}"
-                     if left_topic_value and left_subcategory_value else None),
-                    (f"topic={right_topic_value}|subcategory={right_subcategory_value}"
-                     if right_topic_value and right_subcategory_value else None),
-                ),
-                "llm_format":(left_format_value,right_format_value),
-            }
-            categorical_labels={
-                left_topic_value:left_topic_label,
-                right_topic_value:right_topic_label,
-                left_format_value:left_format_label,
-                right_format_value:right_format_label,
-            }
-            if left_topic_value and left_subcategory_value:
-                categorical_labels[categorical_values["subcategory"][0]]=(
-                    f"topic={left_topic_label}|subcategory={left_subcategory_label}"
-                )
-            if right_topic_value and right_subcategory_value:
-                categorical_labels[categorical_values["subcategory"][1]]=(
-                    f"topic={right_topic_label}|subcategory={right_subcategory_label}"
-                )
-            label_map=getattr(self,"_pair_categorical_labels",None)
-            if label_map is not None:
-                label_map.update({symbol:label for symbol,label in categorical_labels.items()
-                                  if symbol is not None and label is not None})
-            for family,(left_predicate,right_predicate) in (
-                    PAIR_CATEGORICAL_SIDE_FAMILIES.items()):
-                left_value,right_value=categorical_values[family]
-                # Omit the complete family unless both candidates are grounded;
-                # annotation/metadata availability can never become a preference.
-                if left_value is None or right_value is None: continue
-                if wants(left_predicate): attrs[left_predicate]=left_value
-                if wants(right_predicate): attrs[right_predicate]=right_value
             return attrs
 
         def _bounded_pair_features(self,attrs):
             bounded={}
-            categorical=PAIR_CATEGORICAL_SIDE_PREDICATES
-            for _family,(left_predicate,right_predicate) in (
-                    PAIR_CATEGORICAL_SIDE_FAMILIES.items()):
-                if left_predicate not in attrs and right_predicate not in attrs:
-                    continue
-                left_allowed=self._pair_feature_vocabulary.get(left_predicate)
-                right_allowed=self._pair_feature_vocabulary.get(right_predicate)
-                # A side category is meaningful only as a fully observed pair.
-                # If either side is absent/OOV, the whole family abstains.
-                if (left_predicate in attrs and right_predicate in attrs
-                        and left_allowed and right_allowed
-                        and attrs[left_predicate] in left_allowed
-                        and attrs[right_predicate] in right_allowed):
-                    bounded[left_predicate]=attrs[left_predicate]
-                    bounded[right_predicate]=attrs[right_predicate]
             for predicate,value in attrs.items():
-                if predicate in categorical: continue
                 allowed=self._pair_feature_vocabulary.get(predicate)
                 if allowed:
                     if value in allowed:
@@ -718,79 +510,12 @@ def make_model_lifecycle_mixin(
                      if smaller else 1.0)
             return overlap>=0.9
 
-        @staticmethod
-        def _select_positive_residual_hyperedges(rules):
-            """Compile only positive evidence increments over proper-subset rules.
-
-            Pair rules are mined in the direction in which their premises predict a
-            left-hand win.  A conjunction whose calibrated posterior is no better
-            than its already-selected parents therefore has no additional positive
-            evidence to contribute.  Keeping its negative residual would silently
-            turn a positive mined rule into an anti-rule during proof aggregation.
-
-            Rejected edges are deliberately not added to ``calibrated_edges``: a
-            redundant or contradictory edge must not become a parent of a later
-            conjunction either.
-            """
-            ordered=sorted(
-                (dict(rule) for rule in rules),
-                key=lambda rule:(rule.get("specificity",len(rule["premises"])),
-                                 rule["premises"]),
-            )
-            selected=[]; calibrated_edges=[]; rejected_nonpositive=0
-
-            def clipped_logit(probability):
-                bounded=max(1e-9,min(1.0-1e-9,float(probability)))
-                return math.log(bounded/(1.0-bounded))
-
-            for rule in ordered:
-                premise_set=frozenset(rule["premises"])
-                lower_edges=[previous for previous in calibrated_edges
-                             if previous["premise_set"]<premise_set]
-                lower_logit=math.fsum(previous["delta"] for previous in lower_edges)
-                lower_probability=1.0/(1.0+math.exp(
-                    -max(-40.0,min(40.0,lower_logit))
-                ))
-                reliability=max(0.0,min(1.0,float(
-                    rule.get("selection_confidence",rule["confidence"])
-                )))
-                posterior=((1.0-reliability)*lower_probability
-                           +reliability*float(rule["strength"]))
-                delta=clipped_logit(posterior)-lower_logit
-                if not math.isfinite(delta) or delta<=1e-12:
-                    rejected_nonpositive+=1
-                    continue
-                proof_strength=1.0/(1.0+math.exp(
-                    -max(-40.0,min(40.0,delta))
-                ))
-                dependency_id=f"pair_mined_cluster_{len(selected)+1}"
-                rule.update(
-                    id=dependency_id,dependency_id=dependency_id,
-                    variant_id=f"{dependency_id}_v1",
-                    residual_delta=delta,residual_parent_logit=lower_logit,
-                    residual_parent_count=len(lower_edges),
-                    proof_strength=proof_strength,proof_confidence=1.0,
-                )
-                selected.append(rule)
-                calibrated_edges.append({"premise_set":premise_set,"delta":delta})
-            return selected,{
-                "candidates":len(ordered),
-                "selected_positive":len(selected),
-                "rejected_nonpositive":rejected_nonpositive,
-            }
-
         def _mine_pairwise(self,indexed_events=None,retention=None):
-            """Mine AUC-aligned preference rules, then prove them with PeTTa.
+            """Mine the champion conditional pair rules and compile PeTTa proofs.
 
-            All target-aware strategies keep the real MeTTa fpMiner unary pass as
-            their discovery layer. ``target_aware`` expands all active bounded
-            predicates. ``conditional_llm`` is narrower: it expands only real-
-            miner LLM seeds with orientation-invariant context. The
-            ``conditional_llm_seed_only`` ablation uses those unary LLM rules only
-            as discovery/provenance seeds and compiles accepted conditional
-            children over the established non-LLM backoff. Both conditional modes
-            require a stable increment over every immediate parent before the
-            ordinary population CTV calibration and PeTTa compilation below.
+            Real fpMiner unary semantic rules seed conditional expansion with
+            history scope. The seed itself is then removed so correlated text
+            evidence cannot vote twice. Final CTVs use equal impression mass.
             """
             if retention is None:
                 retention=self._retained_mining_population()
@@ -800,12 +525,6 @@ def make_model_lifecycle_mixin(
             retention_audit=retention.audit.as_dict()
             started=time.perf_counter(); self._fit_pair_numeric_encoders(indexed_events)
             self._pair_categorical_labels={}
-            strategy=self.config["miner_strategy"]
-            weighted_search=strategy in {
-                "target_aware","conditional_llm","conditional_llm_seed_only",
-                "petta_conditional_seed_only","petta_mdl_seed_only",
-                "petta_hierarchical_seed_only",
-            }
             discovery_cases=self._pair_training_cases(indexed_events=indexed_events)
             if not discovery_cases:
                 self._active_pair_rule_ids=set(); self.pair_rules=[]
@@ -816,7 +535,7 @@ def make_model_lifecycle_mixin(
                     "retention":retention_audit,
                     "workspace_mode":MINING_WORKSPACE_MODE,
                     "workspace_sync":[],
-                    "full_structure_research":True,
+                    "full_structure_research":False,
                 }
                 return self.last_pair_mining
             # Negative sampling is only a search-time optimisation for fpMiner.
@@ -842,9 +561,7 @@ def make_model_lifecycle_mixin(
                 int(self.config["pair_min_support"]),
                 math.ceil(discovery_search_weight*0.001),
             )
-            vocabulary_min_support=(target_min_support
-                                    if weighted_search
-                                    else fpminer_min_support)
+            vocabulary_min_support=target_min_support
             calibration_min_support=max(
                 int(self.config["pair_min_support"]),math.ceil(len(population_cases)*0.001)
             )
@@ -853,7 +570,7 @@ def make_model_lifecycle_mixin(
                 for feature in PAIR_FEATURES:
                     if feature in case["attrs"]:
                         value_counts[feature][case["attrs"][feature]] += (
-                            case["search_weight"] if weighted_search else 1
+                            case["search_weight"]
                         )
             max_values=max(2,int(self.config["max_feature_values"])); vocabulary={}
             for feature,counts in value_counts.items():
@@ -955,10 +672,6 @@ def make_model_lifecycle_mixin(
                 # category before impression-macro validation can examine it.
                 plan.extend((features,3,bounded_population,"full_population")
                             for features in scoped_categorical_plans)
-            if (strategy=="fixed_combinations"
-                    and int(self.config["pair_conjunctions"])>=3):
-                plan.extend((pair,3,bounded_discovery,"sampled_discovery") for pair in PAIR_INTERACTIONS
-                            if all(feature in active for feature in pair))
             raw=[]; fpminer_incremental=[]
             for selected_features,depth,cases,case_policy in plan:
                 synced,plan_key,workspace_cases=sync_space(
@@ -1034,268 +747,153 @@ def make_model_lifecycle_mixin(
                 "host_generated_rules":0,
             }
             target_search=None
-            if strategy in {
-                    "petta_conditional_seed_only","petta_mdl_seed_only",
-                    "petta_hierarchical_seed_only"}:
-                semantic=tuple(feature for feature in active
-                               if feature in LLM_PAIR_PREDICATES)
-                context=tuple(feature for feature in active
-                              if feature in CONDITIONAL_LLM_CONTEXT_PREDICATES)
-                semantic_seeds=[
-                    rule for rule in rules
-                    if len(rule["premises"])==1
-                    and rule["premises"][0][0] in semantic
-                ]
-                seed_predicates=tuple(sorted({
-                    rule["premises"][0][0] for rule in semantic_seeds
-                }))
-                target_rules=[]; target_audits=[]
-                if seed_predicates and context:
-                    existing={(rule["premises"],rule["target"]) for rule in rules}
-                    selected_features=(*seed_predicates,*sorted(context))
-                    synced,plan_key,_workspace_cases=sync_space(
-                        selected_features,3,bounded_population,
-                        "petta_conditional_full_population",
-                    )
-                    discovered,audit=self._mine_petta_target_workspace(
-                        synced,plan=plan_key,features=selected_features,
-                        depth=3,min_support=calibration_min_support,
-                        min_auc_gain=0.0,workspace_kind="pair",
-                        semantic_features=seed_predicates,
-                        context_features=tuple(sorted(context)),
-                    )
-                    target_audits.append(audit)
-                    for rule in discovered:
-                        key=(rule["premises"],rule["target"])
-                        if key in existing:
-                            continue
-                        semantic_predicate=next(
-                            predicate for predicate,_value in rule["premises"]
-                            if predicate in seed_predicates
-                        )
-                        context_predicate=next(
-                            predicate for predicate,_value in rule["premises"]
-                            if predicate in context
-                        )
-                        rule.update(
-                            conditional_fpminer_seed_predicate=semantic_predicate,
-                            conditional_context_predicate=context_predicate,
-                            dependency_owner="pair_text_semantic_top3_mean",
-                            evidence_relationship="dependent_target_aware_variant",
-                        )
-                        target_rules.append(rule); existing.add(key)
-                    rules.extend(target_rules)
-                semantic_seed_ids={rule["id"] for rule in semantic_seeds}
-                removed=[
-                    rule for rule in rules
-                    if rule.get("id") in semantic_seed_ids
-                    and len(rule.get("premises",()))==1
-                    and rule["premises"][0][0] in LLM_PAIR_PREDICATES
-                ]
-                removed_ids={id(rule) for rule in removed}
-                rules=[rule for rule in rules if id(rule) not in removed_ids]
-                target_search={
-                    "kind":strategy,
-                    "executor":"recommendation/miner/fpMiner.metta via PeTTa",
-                    "target_discovery_symbolic_computation":"PeTTa_only",
-                    "semantic_predicates":list(semantic),
-                    "context_predicates":list(context),
-                    "fpminer_semantic_seeds":len(semantic_seeds),
-                    "seed_predicates":list(seed_predicates),
-                    "workspace_queries":target_audits,
-                    "candidate_patterns":len(target_rules),
-                    "deeper_candidate_patterns":len(target_rules),
-                    "semantic_seed_policy":"discovery_only",
-                    "discovery_only_seed_rules":[{
-                        "rule_id":rule["id"],
-                        "premises":[list(item) for item in rule["premises"]],
-                        "source":rule["source"],
-                        "support":rule["support"],
-                        "discovery_ctv":rule["discovery_ctv"],
-                    } for rule in removed],
-                    "backoff_policy":"non-LLM mined rules remain active",
-                }
-            elif strategy in {"conditional_llm","conditional_llm_seed_only"}:
-                semantic=tuple(feature for feature in active
-                               if feature in LLM_PAIR_PREDICATES)
-                context=tuple(feature for feature in active
-                              if feature in CONDITIONAL_LLM_CONTEXT_PREDICATES)
-                semantic_seeds=[
-                    FpMinerUnary(
-                        rule_id=rule["id"],predicate=rule["premises"][0][0],
-                        value=rule["premises"][0][1],target=rule["target"],
-                        source=rule["source"],
-                    )
-                    for rule in rules
-                    if len(rule["premises"])==1
-                    and rule["premises"][0][0] in semantic
-                ]
-                if semantic and context and semantic_seeds:
-                    # Use the complete training population for the conditional
-                    # test. Equal-impression mass prevents large slates from
-                    # dominating support, while fpMiner itself still receives the
-                    # raw-row support unit above for its mandatory unary seeds.
-                    conditional_result=mine_conditional_llm_patterns(
-                        ({feature:case["attrs"][feature] for feature in (*semantic,*context)
-                          if feature in case["attrs"]
-                          and str(case["attrs"][feature]).lower() not in {
-                              "unknown","incomparable","left_known","right_known"
-                          }}
-                         for case in bounded_population),
-                        (case["positive"] for case in bounded_population),
-                        weights=(case["search_weight"] for case in bounded_population),
-                        folds=(case["temporal_fold"] for case in bounded_population),
-                        fpminer_unaries=semantic_seeds,positive_target="click",
-                        semantic_predicates=semantic,context_predicates=context,
-                        predicate_lineages={
-                            feature:"+".join(sorted(self._pair_evidence_lineage(((feature,"value"),))))
-                            for feature in (*semantic,*context)
-                        },
-                        config=ConditionalMiningConfig(
-                            min_support=target_min_support,
-                            fold_min_support=max(1.0,target_min_support/3.0),
-                            max_depth=max(2,int(self.config["pair_conjunctions"])-1),
-                            top_k=max(256,int(self.config["pair_max_rules"])*24),
-                            min_usable_folds=2,
-                            min_effect=float(self.config["pair_min_effect"]),
-                            min_incremental_effect=0.0,
-                            max_values_per_predicate=max_values,
-                        ),
-                    )
-                    existing={(rule["premises"],rule["target"]) for rule in rules}
-                    for pattern in conditional_result.patterns:
-                        premises=tuple((atom.predicate,atom.value)
-                                       for atom in pattern.premises)
-                        key=(premises,"click")
-                        if key in existing:
-                            continue
-                        rules.append({
-                            "premises":premises,"target":"click",
-                            "support":pattern.counts.tp,
-                            "strength":pattern.precision,"confidence":0.0,
-                            "conditional_incremental_effect":pattern.incremental_effect,
-                            "conditional_stable_incremental_effect":
-                                pattern.stable_incremental_effect,
-                            "conditional_incremental_wracc":pattern.incremental_wracc,
-                            "conditional_robust_incremental_wracc":
-                                pattern.robust_incremental_wracc,
-                            "conditional_evidence_lineages":pattern.evidence_lineages,
-                            "conditional_lineage_signature":pattern.lineage_signature,
-                            "conditional_variant_signature":pattern.variant_signature,
-                            "conditional_fpminer_seed_rule_ids":
-                                pattern.fpminer_seed_rule_ids,
-                            # Conditional semantic structures remain variants of
-                            # the text evidence that seeded them; the invariant
-                            # gate does not mint an independent vote.
-                            "dependency_owner":"pair_text_semantic_top3_mean",
-                            "target_weighted_support":pattern.weighted.support,
-                            "target_weighted_contingency":pattern.weighted.as_dict(),
-                            "target_count_contingency":pattern.counts.as_dict(),
-                            "target_fold_statistics":[
-                                fold.as_dict() for fold in pattern.fold_statistics
-                            ],
-                            "source":"recommendation/mining/conditional_llm_mining.py",
-                        })
-                        existing.add(key)
-                    target_search={
-                        "kind":strategy,
-                        "requires_real_fpminer_seed":True,
-                        "semantic_predicates":list(semantic),
-                        "context_predicates":list(context),
-                        "fpminer_semantic_seeds":len(semantic_seeds),
-                        "config":dict(conditional_result.config.__dict__),
-                        "audit":conditional_result.audit.as_dict(),
-                        "candidate_patterns":len(conditional_result.patterns),
-                        "deeper_candidate_patterns":len(conditional_result.patterns),
-                    }
-                else:
-                    target_search={
-                        "kind":strategy,
-                        "requires_real_fpminer_seed":True,
-                        "semantic_predicates":list(semantic),
-                        "context_predicates":list(context),
-                        "fpminer_semantic_seeds":len(semantic_seeds),
-                        "candidate_patterns":0,"deeper_candidate_patterns":0,
-                        "reason":"no active semantic/context vocabulary or real fpMiner semantic seed",
-                    }
-                if strategy=="conditional_llm_seed_only":
-                    semantic_seed_ids={seed.rule_id for seed in semantic_seeds}
-                    removed=[
-                        rule for rule in rules
-                        if rule.get("id") in semantic_seed_ids
-                        and len(rule.get("premises",()))==1
-                        and rule["premises"][0][0] in LLM_PAIR_PREDICATES
-                    ]
-                    removed_ids={id(rule) for rule in removed}
-                    rules=[rule for rule in rules if id(rule) not in removed_ids]
-                    target_search.update({
-                        "semantic_seed_policy":"discovery_only",
-                        "discovery_only_seed_rules":[{
-                            "rule_id":rule["id"],
-                            "premises":[list(item) for item in rule["premises"]],
-                            "source":rule["source"],
-                            "support":rule["support"],
-                            "discovery_ctv":rule["discovery_ctv"],
-                        } for rule in removed],
-                        "discovery_only_seed_count":len(removed),
-                        "candidate_conditional_children":sum(
-                            rule.get("source","").endswith(
-                                "conditional_llm_mining.py"
-                            ) for rule in rules
-                        ),
-                        "backoff_policy":"non-LLM mined rules remain active",
-                    })
-            elif strategy=="target_aware":
-                target_result=mine_target_patterns(
-                    ({feature:case["attrs"][feature] for feature in active
-                      if feature in case["attrs"]} for case in bounded_discovery),
-                    (case["positive"] for case in bounded_discovery),
-                    weights=(case["search_weight"] for case in bounded_discovery),
-                    folds=(case["temporal_fold"] for case in bounded_discovery),
-                    config=TargetMinerConfig(
+            semantic=tuple(feature for feature in active
+                           if feature in LLM_PAIR_PREDICATES)
+            context=tuple(feature for feature in active
+                          if feature in CONDITIONAL_LLM_CONTEXT_PREDICATES)
+            semantic_seeds=[
+                FpMinerUnary(
+                    rule_id=rule["id"],predicate=rule["premises"][0][0],
+                    value=rule["premises"][0][1],target=rule["target"],
+                    source=rule["source"],
+                )
+                for rule in rules
+                if len(rule["premises"])==1
+                and rule["premises"][0][0] in semantic
+            ]
+            if semantic and context and semantic_seeds:
+                # Search the complete population with equal impression mass.
+                # fpMiner's real unary rules are mandatory provenance seeds;
+                # conditional children must improve them in stable time folds.
+                conditional_result=mine_conditional_llm_patterns(
+                    ({feature:case["attrs"][feature]
+                      for feature in (*semantic,*context)
+                      if feature in case["attrs"]
+                      and str(case["attrs"][feature]).lower() not in {
+                          "unknown","incomparable","left_known","right_known"
+                      }}
+                     for case in bounded_population),
+                    (case["positive"] for case in bounded_population),
+                    weights=(case["search_weight"] for case in bounded_population),
+                    folds=(case["temporal_fold"] for case in bounded_population),
+                    fpminer_unaries=semantic_seeds,positive_target="click",
+                    semantic_predicates=semantic,context_predicates=context,
+                    predicate_lineages={
+                        feature:"+".join(sorted(
+                            self._pair_evidence_lineage(((feature,"value"),))
+                        ))
+                        for feature in (*semantic,*context)
+                    },
+                    config=ConditionalMiningConfig(
                         min_support=target_min_support,
-                        max_depth=max(1,int(self.config["pair_conjunctions"])-1),
-                        top_k=max(256,int(self.config["pair_max_rules"])*24),
-                        objective="positive",
-                        min_wracc=0.0,
-                        exhaustive=False,
                         fold_min_support=max(1.0,target_min_support/3.0),
+                        max_depth=max(2,int(self.config["pair_conjunctions"])-1),
+                        top_k=max(256,int(self.config["pair_max_rules"])*24),
+                        min_usable_folds=2,
+                        min_effect=float(self.config["pair_min_effect"]),
+                        min_incremental_effect=0.0,
+                        max_values_per_predicate=max_values,
                     ),
                 )
                 existing={(rule["premises"],rule["target"]) for rule in rules}
-                for pattern in target_result.patterns:
-                    if pattern.depth<2:
-                        continue
-                    premises=tuple((atom.predicate,atom.value)
-                                   for atom in pattern.premises)
+                for pattern in conditional_result.patterns:
+                    premises=tuple(
+                        (atom.predicate,atom.value) for atom in pattern.premises
+                    )
                     key=(premises,"click")
                     if key in existing:
                         continue
                     rules.append({
                         "premises":premises,"target":"click",
                         "support":pattern.counts.tp,
-                        "strength":pattern.precision or 0.0,"confidence":0.0,
-                        "target_wracc":pattern.wracc,
+                        "strength":pattern.precision,"confidence":0.0,
+                        "conditional_incremental_effect":
+                            pattern.incremental_effect,
+                        "conditional_stable_incremental_effect":
+                            pattern.stable_incremental_effect,
+                        "conditional_incremental_wracc":
+                            pattern.incremental_wracc,
+                        "conditional_robust_incremental_wracc":
+                            pattern.robust_incremental_wracc,
+                        "conditional_evidence_lineages":
+                            pattern.evidence_lineages,
+                        "conditional_lineage_signature":
+                            pattern.lineage_signature,
+                        "conditional_variant_signature":
+                            pattern.variant_signature,
+                        "conditional_fpminer_seed_rule_ids":
+                            pattern.fpminer_seed_rule_ids,
+                        "dependency_owner":"pair_text_semantic_top3_mean",
                         "target_weighted_support":pattern.weighted.support,
-                        "target_weighted_contingency":pattern.weighted.as_dict(),
+                        "target_weighted_contingency":
+                            pattern.weighted.as_dict(),
                         "target_count_contingency":pattern.counts.as_dict(),
                         "target_fold_statistics":[
-                            fold.as_dict() for fold in pattern.fold_statistics
+                            fold.as_dict()
+                            for fold in pattern.fold_statistics
                         ],
-                        "source":"recommendation/mining/target_miner.py",
+                        "source":
+                            "recommendation/mining/conditional_llm_mining.py",
                     })
                     existing.add(key)
                 target_search={
-                    "config":dict(target_result.config.__dict__),
-                    "audit":target_result.audit.as_dict(),
-                    "candidate_patterns":len(target_result.patterns),
-                    "deeper_candidate_patterns":sum(
-                        pattern.depth>=2 for pattern in target_result.patterns
+                    "kind":"conditional_llm_seed_only",
+                    "requires_real_fpminer_seed":True,
+                    "semantic_predicates":list(semantic),
+                    "context_predicates":list(context),
+                    "fpminer_semantic_seeds":len(semantic_seeds),
+                    "config":dict(conditional_result.config.__dict__),
+                    "audit":conditional_result.audit.as_dict(),
+                    "candidate_patterns":len(conditional_result.patterns),
+                    "deeper_candidate_patterns":len(
+                        conditional_result.patterns
                     ),
                 }
+            else:
+                target_search={
+                    "kind":"conditional_llm_seed_only",
+                    "requires_real_fpminer_seed":True,
+                    "semantic_predicates":list(semantic),
+                    "context_predicates":list(context),
+                    "fpminer_semantic_seeds":len(semantic_seeds),
+                    "candidate_patterns":0,
+                    "deeper_candidate_patterns":0,
+                    "reason":(
+                        "no active semantic/context vocabulary or real "
+                        "fpMiner semantic seed"
+                    ),
+                }
+            # Unary semantic rules seed discovery but do not also vote.  Their
+            # conditional children and non-LLM fpMiner rules form the model.
+            semantic_seed_ids={seed.rule_id for seed in semantic_seeds}
+            removed=[
+                rule for rule in rules
+                if rule.get("id") in semantic_seed_ids
+                and len(rule.get("premises",()))==1
+                and rule["premises"][0][0] in LLM_PAIR_PREDICATES
+            ]
+            removed_ids={id(rule) for rule in removed}
+            rules=[rule for rule in rules if id(rule) not in removed_ids]
+            target_search.update({
+                "semantic_seed_policy":"discovery_only",
+                "discovery_only_seed_rules":[{
+                    "rule_id":rule["id"],
+                    "premises":[list(item) for item in rule["premises"]],
+                    "source":rule["source"],
+                    "support":rule["support"],
+                    "discovery_ctv":rule["discovery_ctv"],
+                } for rule in removed],
+                "discovery_only_seed_count":len(removed),
+                "candidate_conditional_children":sum(
+                    rule.get("source","").endswith(
+                        "conditional_llm_mining.py"
+                    ) for rule in rules
+                ),
+                "backoff_policy":"non-LLM mined rules remain active",
+            })
             n=len(bounded_population); wins=sum(case["positive"] for case in bounded_population)
             base_rate=wins/n if n else 0.5
-            impression_macro=self.config["pair_ctv_mode"]=="impression_macro"
+            impression_macro=True
             unavailable_evidence={"incomparable","unknown","left_known","right_known"}
             def rule_applicable(case,premises):
                 """True only when every premise family is observed for this pair."""
@@ -1364,65 +962,32 @@ def make_model_lifecycle_mixin(
                 calibration=None
                 petta_calibration=None
                 calibrated_base_rate=base_rate
-                is_conditional_child=(
-                    rule.get("petta_target_aware") is True
-                    or rule.get("source","").endswith("conditional_llm_mining.py")
-                )
                 is_scoped_categorical=rule.get("scoped_categorical_prior") is True
-                use_effective_conditional=(
-                    self.config["pair_ctv_mode"]=="conditional_effective_backoff"
-                    and is_conditional_child
+                calibration=calibrate_ctv((
+                    CTVObservation(
+                        impression_id=case["impression"],
+                        matched=index in matched,
+                        target=bool(case["positive"]),
+                        applicable=rule_applicable(case,rule["premises"]),
+                        # ``population_cases`` is exhaustive even when the
+                        # discovery pass sampled opponents.  The stored weight
+                        # is label-independent and sums to one per impression.
+                        weight=float(case["search_weight"]),
+                    )
+                    for index,case in enumerate(bounded_population)
+                ), evidence_k=float(self.config["pair_rule_selection_k"]),
+                   rule_kind="pair_preference")
+                petta_calibration=reencode_ctv_confidence(
+                    calibration,evidence_k=CTV_EVIDENCE_K_DEFAULT
                 )
-                if (self.config["pair_ctv_mode"] in {
-                        "impression_macro","raw_strength_effective_confidence"}
-                        or use_effective_conditional or is_scoped_categorical):
-                    calibration=calibrate_ctv((
-                        CTVObservation(
-                            impression_id=case["impression"],
-                            matched=index in matched,
-                            target=bool(case["positive"]),
-                            applicable=rule_applicable(case,rule["premises"]),
-                            # ``population_cases`` is exhaustive even when the
-                            # discovery pass sampled opponents.  The stored weight
-                            # is label-independent and sums to one per impression.
-                            weight=float(case["search_weight"]),
-                        )
-                        for index,case in enumerate(bounded_population)
-                    ), evidence_k=float(self.config["pair_rule_selection_k"]),
-                       rule_kind="pair_preference")
-                    petta_calibration=reencode_ctv_confidence(
-                        calibration,evidence_k=CTV_EVIDENCE_K_DEFAULT
-                    )
-                    if (self.config["pair_ctv_mode"]=="impression_macro"
-                            or is_scoped_categorical):
-                        strength=calibration.positive.strength
-                        negative_strength=calibration.negative.strength
-                        calibrated_base_rate=calibration.applicable_target_base_rate
-                    # This mode deliberately preserves the raw-pair conditional
-                    # rate used by the established scorer. Only its epistemic
-                    # sample unit changes from quadratic pair rows to
-                    # Kish-effective independent impression mass. Applicability
-                    # remains an audit dimension and is not multiplied into CTV
-                    # confidence a second time.
-                    selection_confidence=calibration.positive.confidence
-                    confidence=petta_calibration.positive.confidence
-                    if not use_effective_conditional:
-                        negative_confidence=petta_calibration.negative.confidence
-                        activation_coverage=calibration.activation.weighted_fraction
-                if (strategy=="petta_hierarchical_seed_only"
-                        and rule.get("petta_target_aware") is True):
-                    hierarchical_strength=rule.get("target_hierarchical_precision")
-                    if (not isinstance(hierarchical_strength,(int,float))
-                            or not math.isfinite(hierarchical_strength)
-                            or not 0.0<=hierarchical_strength<=1.0):
-                        raise ValueError(
-                            "PeTTa hierarchical rule is missing a valid strength"
-                        )
-                    rule.update(
-                        unshrunk_calibrated_strength=strength,
-                        strength_estimator="petta_hierarchical_parent_shrinkage",
-                    )
-                    strength=float(hierarchical_strength)
+                strength=calibration.positive.strength
+                negative_strength=calibration.negative.strength
+                calibrated_base_rate=calibration.applicable_target_base_rate
+                selection_confidence=calibration.positive.confidence
+                confidence=petta_calibration.positive.confidence
+                negative_confidence=petta_calibration.negative.confidence
+                activation_coverage=calibration.activation.weighted_fraction
+
                 effect=strength-calibrated_base_rate; specificity=len(rule["premises"])
                 fold_effects=[]
                 fold_supports=[]
@@ -1432,56 +997,42 @@ def make_model_lifecycle_mixin(
                                      if case["temporal_fold"]==fold]
                     fold_matches=matched.intersection(fold_population)
                     if not fold_population: continue
-                    if (self.config["pair_ctv_mode"]=="impression_macro"
-                            or is_scoped_categorical):
-                        fold_calibration=calibrate_ctv((
-                            CTVObservation(
-                                impression_id=bounded_population[index]["impression"],
-                                matched=index in fold_matches,
-                                target=bool(bounded_population[index]["positive"]),
-                                applicable=rule_applicable(
-                                    bounded_population[index],rule["premises"]
-                                ),
-                                weight=float(
-                                    bounded_population[index]["search_weight"]
-                                ),
-                            )
-                            for index in fold_population
-                        ), evidence_k=float(self.config["pair_rule_selection_k"]),
-                           rule_kind="pair_preference_fold")
-                        fold_support=fold_calibration.positive.weighted_support
-                        fold_effective=fold_calibration.positive.effective_impressions
-                        macro_fold_min=(target_min_support/3.0
-                                              if (impression_macro
-                                                  or is_scoped_categorical)
-                                              else calibration_min_support/3.0)
-                        if fold_support<max(1.0,macro_fold_min):
-                            continue
-                        fold_base=fold_calibration.applicable_target_base_rate
-                        fold_strength=fold_calibration.positive.strength
-                    else:
-                        if len(fold_matches)<max(4,calibration_min_support//3):
-                            continue
-                        fold_support=float(len(fold_matches))
-                        fold_effective=fold_support
-                        fold_base=(sum(bounded_population[index]["positive"] for index in fold_population)
-                                   /len(fold_population))
-                        fold_strength=(sum(bounded_population[index]["positive"] for index in fold_matches)
-                                       /len(fold_matches))
+                    fold_calibration=calibrate_ctv((
+                        CTVObservation(
+                            impression_id=bounded_population[index]["impression"],
+                            matched=index in fold_matches,
+                            target=bool(bounded_population[index]["positive"]),
+                            applicable=rule_applicable(
+                                bounded_population[index],rule["premises"]
+                            ),
+                            weight=float(
+                                bounded_population[index]["search_weight"]
+                            ),
+                        )
+                        for index in fold_population
+                    ), evidence_k=float(self.config["pair_rule_selection_k"]),
+                       rule_kind="pair_preference_fold")
+                    fold_support=fold_calibration.positive.weighted_support
+                    fold_effective=fold_calibration.positive.effective_impressions
+                    macro_fold_min=target_min_support/3.0
+                    if fold_support<max(1.0,macro_fold_min):
+                        continue
+                    fold_base=fold_calibration.applicable_target_base_rate
+                    fold_strength=fold_calibration.positive.strength
+
                     fold_effects.append(fold_strength-fold_base)
                     fold_supports.append(fold_support)
                     fold_effective_impressions.append(fold_effective)
                 required_folds=3 if is_scoped_categorical else 2
                 stable_effect=(min(fold_effects)
                                if len(fold_effects)>=required_folds else -1.0)
-                uses_impression_support=(impression_macro or is_scoped_categorical)
+                uses_impression_support=True
                 calibrated_support=(
                     calibration.positive.weighted_support
                     if uses_impression_support and calibration is not None
                     else antecedent_total
                 )
-                required_support=(target_min_support if uses_impression_support
-                                  else calibration_min_support)
+                required_support=target_min_support
                 mined_support=rule["support"]
                 ctv_calibration_audit=None
                 selection_calibration_audit=None
@@ -1518,24 +1069,9 @@ def make_model_lifecycle_mixin(
                     pair_rule_selection_k=float(
                         self.config["pair_rule_selection_k"]
                     ),
-                    ctv_estimation_mode=(
-                        "impression_macro_kish"
-                        if (impression_macro or is_scoped_categorical) else
-                        "raw_strength_kish_confidence"
-                        if (self.config["pair_ctv_mode"]==
-                            "raw_strength_effective_confidence"
-                            or use_effective_conditional) else
-                        "raw_oriented_pairs"
-                    ),
+                    ctv_estimation_mode="impression_macro_kish",
                     confidence_basis=(
-                        "petta_kish_effective_impressions_k800_scoped_categorical"
-                        if is_scoped_categorical else
-                        "petta_kish_effective_impressions_k800_conditional_backoff"
-                        if use_effective_conditional else
                         "petta_kish_effective_impressions_k800"
-                        if self.config["pair_ctv_mode"] in {
-                            "impression_macro","raw_strength_effective_confidence"
-                        } else "petta_raw_pair_count_k800"
                     ),
                     selection_confidence_basis=(
                         "kish_effective_impressions_with_pair_rule_selection_k"
@@ -1574,16 +1110,6 @@ def make_model_lifecycle_mixin(
                         and stable_effect>=float(self.config["pair_min_effect"])):
                     calibrated.append(rule)
             def selection_quality(rule):
-                if (strategy=="petta_mdl_seed_only"
-                        and rule.get("petta_target_aware") is True):
-                    value=rule.get("target_mdl_gain")
-                    if not isinstance(value,(int,float)) or not math.isfinite(value):
-                        raise ValueError("PeTTa MDL rule is missing a finite MDL gain")
-                    rule.update(
-                        selection_objective="petta_mdl_gain_bits",
-                        selection_objective_value=float(value),
-                    )
-                    return float(value)
                 return rule["quality"]
             calibrated.sort(key=lambda rule:(-selection_quality(rule),
                                              -rule["specificity"],
@@ -1626,32 +1152,30 @@ def make_model_lifecycle_mixin(
                     if len(selected)>=rule_cap or (limit is not None and retained>=limit):
                         return True
                 return False
-            if weighted_search:
-                # A shared cap must not let either half of the hybrid starve the
-                # other. Reserve deterministic quotas for the real fpMiner unary
-                # backoff and target-expanded structures, then backfill unused slots
-                # by the common quality order. During the reserved pass, redundancy
-                # is evaluated within each family so at least one deeper rule can be
-                # exercised even when it closely specializes a unary rule.
-                unary=[rule for rule in calibrated if rule["specificity"]==1]
-                deeper=[rule for rule in calibrated if rule["specificity"]>1]
-                if unary and deeper:
-                    if rule_cap>=2:
-                        unary_quota=(rule_cap+1)//2
-                        deeper_quota=rule_cap-unary_quota
-                        retain_candidates(iter(unary),unary_quota,within_family=True)
-                        retain_candidates(iter(deeper),deeper_quota,within_family=True)
-                        if len(selected)<rule_cap:
-                            retain_candidates(iter(calibrated))
-                    else:
-                        # A one-rule artifact cannot contain both families; retain
-                        # the auditable real-miner backoff instead of silently
-                        # presenting one host-expanded rule as the whole hybrid.
-                        retain_candidates(iter(unary))
+            # A shared cap must not let either half of the hybrid starve the
+            # other. Reserve deterministic quotas for the real fpMiner unary
+            # backoff and target-expanded structures, then backfill unused slots
+            # by the common quality order. During the reserved pass, redundancy
+            # is evaluated within each family so at least one deeper rule can be
+            # exercised even when it closely specializes a unary rule.
+            unary=[rule for rule in calibrated if rule["specificity"]==1]
+            deeper=[rule for rule in calibrated if rule["specificity"]>1]
+            if unary and deeper:
+                if rule_cap>=2:
+                    unary_quota=(rule_cap+1)//2
+                    deeper_quota=rule_cap-unary_quota
+                    retain_candidates(iter(unary),unary_quota,within_family=True)
+                    retain_candidates(iter(deeper),deeper_quota,within_family=True)
+                    if len(selected)<rule_cap:
+                        retain_candidates(iter(calibrated))
                 else:
-                    retain_candidates(iter(calibrated))
+                    # A one-rule artifact cannot contain both families; retain
+                    # the auditable real-miner backoff instead of silently
+                    # presenting one host-expanded rule as the whole hybrid.
+                    retain_candidates(iter(unary))
             else:
                 retain_candidates(iter(calibrated))
+
             # Preserve useful specific variants, but make strongly nested evidence
             # dependent in PeTTa instead of confidence-inflating it. The residual
             # challenger keeps each conjunction as a separate evidence hyperedge
@@ -1667,35 +1191,25 @@ def make_model_lifecycle_mixin(
             roots={}
             variants=Counter()
             residual_audit=None
-            if self.config["pair_dependency_mode"]=="residual_hypergraph":
-                selected,residual_audit=self._select_positive_residual_hyperedges(selected)
-                roots={rule_index:rule_index for rule_index in range(len(selected))}
-            else:
-                for left in range(len(selected)):
-                    for right in range(left+1,len(selected)):
-                        # A conditional LLM rule is an incrementally validated
-                        # variant of its real-miner semantic seed, not a new
-                        # witness. Bind it to the declared text owner without
-                        # allowing its invariant context gate to bridge unrelated
-                        # structured dependencies through union-find.
-                        if self._pair_rules_share_dependency(
-                                selected[left],selected[right]):
-                            union(left,right)
-                for rule_index,rule in enumerate(selected):
-                    root=find(rule_index)
-                    cluster_index=roots.setdefault(root,len(roots)+1)
-                    dependency_id=f"pair_mined_cluster_{cluster_index}"
-                    variants[dependency_id]+=1
-                    rule.update(id=dependency_id,dependency_id=dependency_id,
-                                variant_id=f"{dependency_id}_v{variants[dependency_id]}")
-            if target_search is not None and strategy in {
-                    "conditional_llm_seed_only","petta_conditional_seed_only",
-                    "petta_mdl_seed_only","petta_hierarchical_seed_only"}:
+            for left in range(len(selected)):
+                for right in range(left+1,len(selected)):
+                    if self._pair_rules_share_dependency(
+                            selected[left],selected[right]):
+                        union(left,right)
+            for rule_index,rule in enumerate(selected):
+                root=find(rule_index)
+                cluster_index=roots.setdefault(root,len(roots)+1)
+                dependency_id=f"pair_mined_cluster_{cluster_index}"
+                variants[dependency_id]+=1
+                rule.update(
+                    id=dependency_id,dependency_id=dependency_id,
+                    variant_id=f"{dependency_id}_v{variants[dependency_id]}",
+                )
+            if target_search is not None:
                 compiled_children=[
                     rule for rule in selected
-                    if (rule.get("petta_target_aware") is True
-                        or rule.get("source","").endswith(
-                            "conditional_llm_mining.py"))
+                    if rule.get("source","").endswith(
+                        "conditional_llm_mining.py")
                 ]
                 target_search.update({
                     "compiled_conditional_children":len(compiled_children),
@@ -1752,7 +1266,7 @@ def make_model_lifecycle_mixin(
             # proof channel in proof-margin mode, while retaining its logical
             # dependency as a separate argument.  The scorer will still take at
             # most one inferred margin per dependency.
-            isolate_variants=self.config["pair_aggregation"]=="proof_margin"
+            isolate_variants=True
             for rule in selected:
                 rule.setdefault("source","recommendation/miner/fpMiner.metta")
                 terms=[f'({predicate.title()} $pair {json.dumps(value)})'
@@ -1874,31 +1388,20 @@ def make_model_lifecycle_mixin(
                     "reasoner_role":"two-hop channel proof and inferred STV",
                 },
                 "base_rate":round(base_rate,8),
-                "min_support":(target_min_support if weighted_search
-                               else fpminer_min_support),
-                "min_support_unit":("equal_impression_mass_target_search_only"
-                                    if weighted_search
-                                    else "raw_oriented_pair_case"),
+                "min_support":target_min_support,
+                "min_support_unit":"equal_impression_mass_target_search_only",
                 "fpminer_min_support":fpminer_min_support,
                 "fpminer_support_unit":"raw_oriented_pair_case",
-                "target_min_support":(target_min_support
-                                      if weighted_search else None),
-                "target_support_unit":("equal_impression_mass"
-                                       if weighted_search else None),
+                "target_min_support":target_min_support,
+                "target_support_unit":"equal_impression_mass",
                 "calibration_min_support":calibration_min_support,
                 "calibration_min_support_unit":"raw_oriented_pair_case",
-                "selected_ctv_min_support":(
-                    target_min_support if impression_macro else calibration_min_support
-                ),
-                "selected_ctv_min_support_unit":(
-                    "equal_impression_weighted_activation_mass"
-                    if impression_macro else "raw_oriented_pair_case"
-                ),
+                "selected_ctv_min_support":target_min_support,
+                "selected_ctv_min_support_unit":
+                    "equal_impression_weighted_activation_mass",
                 "selected_ctv_support_policy":{
-                    "ordinary_rules":(
-                        "equal_impression_weighted_activation_mass"
-                        if impression_macro else "raw_oriented_pair_case"
-                    ),
+                    "ordinary_rules":
+                        "equal_impression_weighted_activation_mass",
                     "scoped_categorical_rules":(
                         "equal_impression_weighted_activation_mass"
                     ),
@@ -1912,11 +1415,9 @@ def make_model_lifecycle_mixin(
                 "workspace_sync":workspace_sync,
                 "workspace_plans":len(workspace_plans),
                 "retention":retention_audit,
-                "full_structure_research":(
-                    strategy!="fixed_combinations" or any(
-                        item["full_structure_research"]
-                        for item in fpminer_incremental
-                    )
+                "full_structure_research":any(
+                    item.get("full_structure_research",False)
+                    for item in fpminer_incremental
                 ),
                 # No held-out outcomes participate in this training-population
                 # estimate.
@@ -1950,15 +1451,13 @@ def make_model_lifecycle_mixin(
                         "retained closed training impressions"
                     ),
                     "held_out_evaluation_labels_used":False,
-                    "ordinary_rule_weighting":(
-                        "one total mass per impression with Kish effective support"
-                        if impression_macro else "raw oriented-pair rows"
-                    ),
+                    "ordinary_rule_weighting":
+                        "one total mass per impression with Kish effective support",
                     "scoped_categorical_weighting":(
                         "one total mass per impression with Kish effective support"
                     ),
                 },
-                "miner_strategy":strategy,
+                "miner_strategy":"conditional_llm_seed_only",
                 "ctv_evidence_k":float(self.config["ctv_evidence_k"]),
                 "pair_ctv_mode":self.config["pair_ctv_mode"],
                 "petta_ctv_evidence_k":CTV_EVIDENCE_K_DEFAULT,
@@ -1974,28 +1473,12 @@ def make_model_lifecycle_mixin(
                     "PeTTa STV confidence = evidence/(evidence+800); configurable "
                     "selection K affects host-side rule selection only"
                 ),
-                "conditional_effective_backoff":{
-                    "enabled":self.config["pair_ctv_mode"]==
-                        "conditional_effective_backoff",
-                    "scope":(
-                        "conditional_llm_mining.py children only; scoped categorical "
-                        "priors always use mandatory impression-macro calibration"
-                    ),
-                    "base_rule_policy":"byte-equivalent raw-pair CTV",
-                    "fusion":"replace weaker variant within shared text dependency",
-                    "independent_vote_added":False,
-                },
-                "pair_dependency_mode":self.config["pair_dependency_mode"],
+                "pair_dependency_mode":"clustered",
                 "residual_hypergraph":residual_audit,
                 "target_search":target_search,
                 "categorical_search":categorical_search,
-                "search_weight_unit":("equal_impression_mass_target_search_only"
-                                      if weighted_search
-                                      else "raw_oriented_pair_case"),
-                "search_weight_total":round(
-                    discovery_search_weight if weighted_search
-                    else len(discovery_cases),8
-                ),
+                "search_weight_unit":"equal_impression_mass_target_search_only",
+                "search_weight_total":round(discovery_search_weight,8),
                 "feature_profile":self.config["pair_feature_profile"],
                 "rules_by_premises":dict(sorted(Counter(rule["specificity"] for rule in selected).items())),
                 "feature_vocabulary":{feature:len(values) for feature,values
@@ -2151,9 +1634,6 @@ def make_model_lifecycle_mixin(
             self.engine.replace([
                 *self._point_rule_sources,*self._point_channel_sources,
                 *self._pair_rule_sources,*LIVE_NEGATIVE_RULE_SOURCES,
-                *(RELATIONAL_STRUCTURAL_RULES
-                  if self.config.get("relational_evidence_mode")=="chained"
-                  else ()),
             ])
             self.version=max(1,int(model.get("source_rule_version",1)))
             self.pending_events=0
@@ -2572,7 +2052,6 @@ def make_model_lifecycle_mixin(
 
         def _mine_once(self):
             started=time.perf_counter()
-            strategy=self.config["miner_strategy"]
             retention=self._retained_mining_population()
             indexed_events=retention.records
             retention_audit=retention.audit.as_dict()
@@ -2621,10 +2100,6 @@ def make_model_lifecycle_mixin(
 
             active_features=[feature for feature in selected_profile if feature in vocabulary]
             plan=[(tuple(active_features),2)] if active_features else []
-            if strategy=="fixed_combinations" and int(self.config["conjunctions"])>=3:
-                plan.extend((pair,3) for pair in INTERACTION_PAIRS if all(feature in vocabulary for feature in pair))
-            if strategy=="fixed_combinations" and int(self.config["conjunctions"])>=4:
-                plan.extend((triple,4) for triple in INTERACTION_TRIPLES if all(feature in vocabulary for feature in triple))
             raw=[]; fpminer_incremental=[]
             for selected_features,depth in plan:
                 synced,plan_key,workspace_cases=sync_space(selected_features,depth)
@@ -2639,53 +2114,6 @@ def make_model_lifecycle_mixin(
                 fpminer_incremental.append(mined.audit.as_dict())
             rules=parse_rules([str(v) for v in raw])
             target_search=None
-            if strategy=="target_aware":
-                target_result=mine_target_patterns(
-                    ({feature:attrs[feature] for feature in active_features
-                      if feature in attrs}
-                     for _case_id,_event,attrs in feature_rows),
-                    (event["action"] in POSITIVE
-                     for _case_id,event,_attrs in feature_rows),
-                    config=TargetMinerConfig(
-                        min_support=int(self.config["min_support"]),
-                        max_depth=max(1,int(self.config["conjunctions"])-1),
-                        top_k=max(256,int(self.config["max_rules"])*24),
-                        objective="absolute",
-                        min_wracc=0.0,
-                        exhaustive=False,
-                    ),
-                )
-                existing={(rule["premises"],rule["target"]) for rule in rules}
-                for pattern in target_result.patterns:
-                    if pattern.depth<2:
-                        continue
-                    premises=tuple((atom.predicate,atom.value)
-                                   for atom in pattern.premises)
-                    key=(premises,"click")
-                    if key in existing:
-                        continue
-                    rules.append({
-                        "premises":premises,"target":"click",
-                        "support":pattern.counts.tp,
-                        "strength":pattern.precision or 0.0,"confidence":0.0,
-                        "target_wracc":pattern.wracc,
-                        "target_weighted_support":pattern.weighted.support,
-                        "target_weighted_contingency":pattern.weighted.as_dict(),
-                        "target_count_contingency":pattern.counts.as_dict(),
-                        "target_fold_statistics":[
-                            fold.as_dict() for fold in pattern.fold_statistics
-                        ],
-                        "source":"recommendation/mining/target_miner.py",
-                    })
-                    existing.add(key)
-                target_search={
-                    "config":dict(target_result.config.__dict__),
-                    "audit":target_result.audit.as_dict(),
-                    "candidate_patterns":len(target_result.patterns),
-                    "deeper_candidate_patterns":sum(
-                        pattern.depth>=2 for pattern in target_result.patterns
-                    ),
-                }
             if not rules: raise RuntimeError("MeTTa miner produced no usable rules")
             self.mined_output=[str(v) for v in raw]
             # Negative sampling is a search-time optimization only.  Re-estimate
@@ -2723,13 +2151,11 @@ def make_model_lifecycle_mixin(
                             quality=confidence*abs(strength-base_rate)
                                     *(1+0.25*(specificity-1))*math.log1p(antecedent_total))
             def rule_order(rule):
-                if self.config["rule_rank"]=="quality":
-                    return (-rule["quality"],-rule["specificity"],-rule["support"],rule["premises"])
-                return (-rule["support"],-rule["strength"],rule["premises"])
-            if self.config["rule_rank"]=="quality":
-                rules.sort(key=rule_order)
-            else:
-                rules.sort(key=rule_order)
+                return (
+                    -rule["quality"],-rule["specificity"],
+                    -rule["support"],rule["premises"],
+                )
+            rules.sort(key=rule_order)
             max_rules=int(self.config["max_rules"])
             if len(rules)>max_rules:
                 # When the budget can represent them, keep a backoff layer from
@@ -2827,9 +2253,6 @@ def make_model_lifecycle_mixin(
             self.engine.replace([
                 *rule_sources,*point_channel_sources,
                 *self._pair_rule_sources,*LIVE_NEGATIVE_RULE_SOURCES,
-                *(RELATIONAL_STRUCTURAL_RULES
-                  if self.config.get("relational_evidence_mode")=="chained"
-                  else ()),
             ])
             self._point_rule_sources=rule_sources
             self._point_channel_sources=point_channel_sources
@@ -2883,14 +2306,13 @@ def make_model_lifecycle_mixin(
                     "point_proof_factorization":{
                         "enabled":True,
                         "serving_mode":"weighted_aggregation",
-                        "shared_target_modes":["max","hybrid"],
                         "mode":"alpha_normalized_isolated_channels",
                         "safety_contract":"isolated_extensional_point_channel_v1",
                         "maximum_templates":len(rules),
                         "host_applicability":"exact categorical premise join",
                         "reasoner_role":"two-hop channel proof and inferred STV",
                     },
-                    "miner_calls":len(plan),"miner_strategy":strategy,
+                    "miner_calls":len(plan),"miner_strategy":"conditional_llm_seed_only",
                     "fpminer_query_calls":sum(
                         item["miner_calls"] for item in fpminer_incremental
                     ),
@@ -2899,20 +2321,16 @@ def make_model_lifecycle_mixin(
                     "workspace_sync":workspace_sync,
                     "workspace_plans":len(active_workspace_plans),
                     "workspace_prune":workspace_prune,
-                    "full_structure_research":(
-                        strategy!="fixed_combinations" or any(
-                            item["full_structure_research"]
-                            for item in fpminer_incremental
-                        )
+                    "full_structure_research":any(
+                        item.get("full_structure_research",False)
+                        for item in fpminer_incremental
                     ),
                     "full_population_ctv_estimation":True,
                     "ctv_evidence_k":float(self.config["ctv_evidence_k"]),
                     "fpminer_min_support":int(self.config["min_support"]),
                     "fpminer_support_unit":"raw_point_case",
-                    "target_min_support":(int(self.config["min_support"])
-                                          if strategy=="target_aware" else None),
-                    "target_support_unit":("raw_point_case"
-                                           if strategy=="target_aware" else None),
+                    "target_min_support":None,
+                    "target_support_unit":None,
                     "target_search":target_search,"pairwise":pair_mining,
                     "serving_prewarm":serving_prewarm,
                     "seconds":round(time.perf_counter()-started,3),"version":self.version}

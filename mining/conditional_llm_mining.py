@@ -34,15 +34,95 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from .target_miner import Atom, CountContingency, WeightedContingency
-
-
 AtomicValue = str | int | float | bool | None
 CaseValue = AtomicValue | Sequence[AtomicValue] | set[AtomicValue] | frozenset[AtomicValue]
 
 _FORBIDDEN_TARGET_PREDICATES = frozenset({
     "action", "clicked", "engagement", "is_click", "label", "outcome", "target",
 })
+
+
+def _normalize_atomic(value: object, *, field_name: str) -> AtomicValue:
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{field_name} must not contain NaN or infinity")
+        return 0.0 if value == 0.0 else value
+    raise TypeError(
+        f"{field_name} must use only str, int, float, bool, or None values"
+    )
+
+
+@dataclass(frozen=True, eq=False)
+class Atom:
+    """One typed symbolic premise."""
+
+    predicate: str
+    value: AtomicValue
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.predicate, str) or not self.predicate:
+            raise ValueError("atom predicate must be a non-empty string")
+        object.__setattr__(
+            self, "value", _normalize_atomic(self.value, field_name="atom value")
+        )
+
+    @property
+    def sort_key(self) -> tuple[str, tuple[str, str]]:
+        return (self.predicate, _typed_value_key(self.value))
+
+    def __hash__(self) -> int:
+        return hash((self.predicate, type(self.value), self.value))
+
+    def __eq__(self, other: object) -> bool:
+        return (
+            isinstance(other, Atom)
+            and self.predicate == other.predicate
+            and type(self.value) is type(other.value)
+            and self.value == other.value
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"predicate": self.predicate, "value": self.value}
+
+
+@dataclass(frozen=True)
+class WeightedContingency:
+    tp: float
+    fp: float
+    fn: float
+    tn: float
+
+    @property
+    def total(self) -> float:
+        return self.tp + self.fp + self.fn + self.tn
+
+    @property
+    def support(self) -> float:
+        return self.tp + self.fp
+
+    def as_dict(self) -> dict[str, float]:
+        return {"tp": self.tp, "fp": self.fp, "fn": self.fn, "tn": self.tn}
+
+
+@dataclass(frozen=True)
+class CountContingency:
+    tp: int
+    fp: int
+    fn: int
+    tn: int
+
+    @property
+    def total(self) -> int:
+        return self.tp + self.fp + self.fn + self.tn
+
+    @property
+    def support(self) -> int:
+        return self.tp + self.fp
+
+    def as_dict(self) -> dict[str, int]:
+        return {"tp": self.tp, "fp": self.fp, "fn": self.fn, "tn": self.tn}
 
 
 class ConditionalMiningLimitError(ValueError):

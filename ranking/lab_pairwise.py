@@ -208,66 +208,31 @@ def make_pairwise_ranking_mixin(
             return self.pair_candidate_case(signature),attrs
 
         def _ensure_pair_specs(self,specs,*,timeout_sec=None):
-            materialization_started=time.perf_counter()
-            timeout_sec=(self._serving_reasoner_timeout()
-                         if timeout_sec is None else float(timeout_sec))
-            # Isolated proof-margin channels are grounded lazily below as one
-            # alpha-normalized template per rule.  Keep the candidate activation
-            # attributes for the exact applicability check, but do not materialize
-            # the exponentially many joint activation contexts in PeTTa.
+            """Index exact activation cases; proof channels are grounded lazily."""
+            started=time.perf_counter()
             cache_limit=int(self.config.get(
                 "max_proof_cache_entries",DEFAULT_MAX_PROOF_CACHE_ENTRIES
             ))
-            cache_started=time.perf_counter()
-            new_cases={case for case,_attrs in specs
-                       if case not in self._pair_case_attrs}
+            new_cases={
+                case for case,_attrs in specs
+                if case not in self._pair_case_attrs
+            }
             if len(self._pair_case_attrs)+len(new_cases)>cache_limit:
                 raise RuntimeError(
                     "pair case cache limit exceeded; promote a fresh rule snapshot"
                 )
-            if self.config["pair_aggregation"]=="proof_margin":
-                for case,attrs in specs:
-                    # Cases are keyed by their selected-rule activation vector.
-                    # Raw unused feature values may differ without changing any
-                    # possible proof, so the first representative is sufficient.
-                    self._pair_case_attrs.setdefault(case,attrs)
-                cache_seconds=time.perf_counter()-cache_started
-                self._last_pair_materialization_profile={
-                    "pair_case_cache_index_seconds":cache_seconds,
-                    "pair_atom_serialization_seconds":0.0,
-                    "pair_atomspace_insertion_seconds":0.0,
-                    "candidate_pair_atoms_inserted":0,
-                    "factorized_channels":True,
-                    "total_seconds":time.perf_counter()-materialization_started,
-                }
-                return
-            cache_seconds=time.perf_counter()-cache_started
-            serialization_started=time.perf_counter()
-            facts=[]; missing=set()
             for case,attrs in specs:
+                # A case is its selected-rule activation vector.  Unused raw
+                # values cannot change any proof, so one representative is exact.
                 self._pair_case_attrs.setdefault(case,attrs)
-                if case in self._loaded_pairs or case in missing: continue
-                missing.add(case)
-                for predicate,value in attrs.items():
-                    facts.append(
-                        f'(: fact_{case}_{predicate} ({predicate.title()} {case} {json.dumps(value)}) '
-                        '(STV 1.0 1.0))'
-                    )
-            serialization_seconds=time.perf_counter()-serialization_started
-            insertion_started=time.perf_counter()
-            for offset in range(0,len(facts),1000):
-                self.engine.add_atoms_no_check(
-                    facts[offset:offset+1000],timeout_sec=timeout_sec
-                )
-            self._loaded_pairs.update(missing)
-            insertion_seconds=time.perf_counter()-insertion_started
+            cache_seconds=time.perf_counter()-started
             self._last_pair_materialization_profile={
                 "pair_case_cache_index_seconds":cache_seconds,
-                "pair_atom_serialization_seconds":serialization_seconds,
-                "pair_atomspace_insertion_seconds":insertion_seconds,
-                "candidate_pair_atoms_inserted":len(facts),
-                "factorized_channels":False,
-                "total_seconds":time.perf_counter()-materialization_started,
+                "pair_atom_serialization_seconds":0.0,
+                "pair_atomspace_insertion_seconds":0.0,
+                "candidate_pair_atoms_inserted":0,
+                "factorized_channels":True,
+                "total_seconds":cache_seconds,
             }
 
         def _proofs_for_pair_specs(self,specs,*,timeout_sec=None):
@@ -275,13 +240,14 @@ def make_pairwise_ranking_mixin(
             timeout_sec=(self._serving_reasoner_timeout()
                          if timeout_sec is None else float(timeout_sec))
             batch=max(1,int(self.config["query_batch_size"])); calls=0
-            aggregation=self.config["pair_aggregation"]
             proof_roots=tuple(sorted({(
                 rule.get("dependency_id",rule["id"]),
                 rule.get("proof_channel_id",rule.get("dependency_id",rule["id"])),
             ) for rule in self.pair_rules}))
-            inference_key=(self.version,int(self.config["pair_chain_steps"]),batch,
-                           aggregation,proof_roots)
+            inference_key=(
+                self.version,int(self.config["pair_chain_steps"]),batch,
+                "proof_margin",proof_roots,
+            )
             unique=list(dict.fromkeys(case for case,_attrs in specs))
             missing=[case for case in unique if (*inference_key,case) not in self._pair_proof_cache]
             cache_limit=int(self.config.get(
@@ -302,219 +268,206 @@ def make_pairwise_ranking_mixin(
             topology_seconds=0.0; activation_join_seconds=0.0
             template_serialization_seconds=0.0; atomspace_insertion_seconds=0.0
             query_seconds=0.0; inserted_template_atoms=0
-            if aggregation=="proof_margin":
-                topology_started=time.perf_counter()
-                supplied_attrs={case:attrs for case,attrs in specs}
-                rules_by_root={}
-                for rule in self.pair_rules:
-                    root=(
-                        rule.get("dependency_id",rule["id"]),
-                        rule.get("proof_channel_id",rule.get(
-                            "dependency_id",rule["id"]
-                        )),
-                    )
-                    rules_by_root.setdefault(root,[]).append(rule)
-                # Exact factorization is deliberately fail-closed.  Every queried
-                # root must have one producer, an isolated variant channel, and a
-                # conjunction of keyed same-case extensional facts.  Shared-target
-                # posterior mode follows the unfactorized branch below.
-                topology={}
-                compiled_source_hashes={hashlib.sha256(source.encode("utf-8")).hexdigest()
-                                        for source in self._pair_rule_sources}
-                for root,producers in rules_by_root.items():
-                    dependency,channel=root
-                    if len(producers)!=1:
-                        raise RuntimeError(
-                            f"proof channel {root!r} has {len(producers)} producers"
-                        )
-                    rule=producers[0]
-                    premises=tuple(rule.get("premises",()))
-                    predicates=[predicate for predicate,_value in premises]
-                    contract=rule.get("proof_factorization",{})
-                    if (not premises or len(predicates)!=len(set(predicates))
-                            or channel==dependency
-                            or channel!=rule.get("variant_id")
-                            or any(not isinstance(predicate,str)
-                                   or not re.fullmatch(r"[a-z][a-z0-9_]*",predicate)
-                                   or not isinstance(value,str)
-                                   for predicate,value in premises)
-                            or contract.get("schema")!="isolated_extensional_pair_channel_v1"
-                            or contract.get("case_variable")!="$pair"
-                            or contract.get("premise_tv")!=[1.0,1.0]
-                            or contract.get("single_channel_producer") is not True
-                            or contract.get("dependency_id")!=dependency
-                            or contract.get("proof_channel_id")!=channel
-                            or contract.get("premises")!=[
-                                list(item) for item in premises
-                            ]
-                            or contract.get("rule_source_sha256")
-                               not in compiled_source_hashes):
-                        raise RuntimeError(
-                            f"proof channel {root!r} is not safely factorable"
-                        )
-                    topology[root]=premises
-                topology_seconds=time.perf_counter()-topology_started
-                activation_started=time.perf_counter()
-                active_by_case={case:[] for case in missing}
-                stored_attrs=getattr(self,"_pair_case_attrs",{})
-                for case in missing:
-                    attrs=stored_attrs.get(case,supplied_attrs.get(case,{}))
-                    for dependency,channel in proof_roots:
-                        premises=topology[(dependency,channel)]
-                        if all(attrs.get(predicate)==value
-                               for predicate,value in premises):
-                            active_by_case[case].append((dependency,channel,premises))
-                activation_join_seconds=time.perf_counter()-activation_started
-                active_uses=sum(map(len,active_by_case.values()))
-                active_templates=list(dict.fromkeys(
-                    (dependency,channel,premises)
-                    for case in missing
-                    for dependency,channel,premises in active_by_case[case]
-                ))
-                channel_key=lambda item:(*inference_key,item[0],item[1],item[2])
-                channel_cache=getattr(self,"_pair_channel_proof_cache",None)
-                if channel_cache is None:
-                    channel_cache={}; self._pair_channel_proof_cache=channel_cache
-                query_templates=[item for item in active_templates
-                                 if channel_key(item) not in channel_cache]
-                if len(channel_cache)+len(query_templates)>cache_limit:
+            topology_started=time.perf_counter()
+            supplied_attrs={case:attrs for case,attrs in specs}
+            rules_by_root={}
+            for rule in self.pair_rules:
+                root=(
+                    rule.get("dependency_id",rule["id"]),
+                    rule.get("proof_channel_id",rule.get(
+                        "dependency_id",rule["id"]
+                    )),
+                )
+                rules_by_root.setdefault(root,[]).append(rule)
+            # Exact factorization is deliberately fail-closed.  Every queried
+            # root must have one producer, an isolated variant channel, and a
+            # conjunction of keyed same-case extensional facts.  Shared-target
+            # posterior mode follows the unfactorized branch below.
+            topology={}
+            compiled_source_hashes={hashlib.sha256(source.encode("utf-8")).hexdigest()
+                                    for source in self._pair_rule_sources}
+            for root,producers in rules_by_root.items():
+                dependency,channel=root
+                if len(producers)!=1:
                     raise RuntimeError(
-                        "pair proof-channel cache limit exceeded; promote a fresh "
-                        "rule snapshot"
+                        f"proof channel {root!r} has {len(producers)} producers"
                     )
-                pair_stats.update(
-                    channel_root_requests=len(active_templates),
-                    channel_root_hits=len(active_templates)-len(query_templates),
-                    channel_root_misses=len(query_templates),
-                )
-                serialization_started=time.perf_counter(); facts=[]
-                loaded_channels=getattr(self,"_loaded_pair_channels",None)
-                if loaded_channels is None:
-                    loaded_channels=set(); self._loaded_pair_channels=loaded_channels
-                template_audit=getattr(self,"_pair_channel_templates",None)
-                if template_audit is None:
-                    template_audit={}; self._pair_channel_templates=template_audit
-                known_template_identities={
-                    item["case"]:(
-                        item["dependency_id"],item["proof_channel_id"],
-                        tuple(tuple(fact) for fact in item["facts"]),
-                    )
-                    for item in template_audit.values()
-                }
-                pending_loaded=set(); pending_audit={}
-                for dependency,channel,premises in query_templates:
-                    template=self.pair_channel_case(dependency,channel,premises)
-                    loaded_key=(self.version,dependency,channel,premises)
-                    identity=(dependency,channel,premises)
-                    previous_identity=known_template_identities.setdefault(template,identity)
-                    if previous_identity!=identity:
-                        raise RuntimeError(
-                            f"pair proof template hash collision at {template}"
-                        )
-                    pending_audit[loaded_key]={
-                        "case":template,"dependency_id":dependency,
-                        "proof_channel_id":channel,
-                        "facts":[[predicate,value] for predicate,value in premises],
-                    }
-                    if loaded_key in loaded_channels: continue
-                    for index,(predicate,value) in enumerate(premises,1):
-                        facts.append(
-                            f'(: fact_{template}_{index}_{predicate} '
-                            f'({predicate.title()} {template} {json.dumps(value)}) '
-                            '(STV 1.0 1.0))'
-                        )
-                    pending_loaded.add(loaded_key)
-                template_serialization_seconds=(
-                    time.perf_counter()-serialization_started
-                )
-                insertion_started=time.perf_counter()
-                for offset in range(0,len(facts),1000):
-                    self.engine.add_atoms_no_check(
-                        facts[offset:offset+1000],timeout_sec=timeout_sec
-                    )
-                atomspace_insertion_seconds=time.perf_counter()-insertion_started
-                inserted_template_atoms=len(facts)
-                staged_channel_results={}
-                query_started=time.perf_counter()
-                for offset in range(0,len(query_templates),batch):
-                    items=query_templates[offset:offset+batch]
-                    queries=[
-                        f'(: $proof (PairSignal '
-                        f'{self.pair_channel_case(dependency,channel,premises)} '
-                        f'{json.dumps(dependency)} {json.dumps(channel)}) $tv)'
-                        for dependency,channel,premises in items
-                    ]
-                    # Each independently mined vote is a real two-hop proof:
-                    # predicate -> MinedPairPreference -> PairSignal.
-                    steps=max(10,int(self.config["pair_chain_steps"]))*len(items)
-                    results=self.engine.query_many(
-                        queries,steps=steps,timeout_sec=timeout_sec
-                    ); calls+=1
-                    for item,proofs in zip(items,results):
-                        staged_channel_results[channel_key(item)]=proofs
-                query_seconds=time.perf_counter()-query_started
-                candidate_channel_results={
-                    **channel_cache,**staged_channel_results,
-                }
-                unproved=[
-                    (dependency,channel)
-                    for dependency,channel,premises in active_templates
-                    if not candidate_channel_results.get(
-                        channel_key((dependency,channel,premises))
-                    )
-                ]
-                if unproved:
-                    raise RuntimeError(
-                        "active isolated pair channels returned no PeTTa proof: "
-                        +", ".join(
-                            f"{dependency}/{channel}"
-                            for dependency,channel in unproved[:8]
-                        )
-                    )
-                # Publish cache and audit state only after every PeTTa mutation and
-                # query has succeeded. A retired/failed worker can never leave a
-                # false empty proof or a falsely "loaded" fact template behind.
-                channel_cache.update(staged_channel_results)
-                loaded_channels.update(pending_loaded)
-                template_audit.update(pending_audit)
-                self._pair_query_roots=getattr(self,"_pair_query_roots",0)+len(query_templates)
-                self._pair_pruned_query_roots=(
-                    getattr(self,"_pair_pruned_query_roots",0)
-                    +len(missing)*len(proof_roots)-active_uses
-                )
-                self._pair_channel_activations=(
-                    getattr(self,"_pair_channel_activations",0)+active_uses
-                )
-                self._pair_reused_channel_activations=(
-                    getattr(self,"_pair_reused_channel_activations",0)
-                    +max(0,active_uses-len(query_templates))
-                )
-                origins=getattr(self,"_pair_proof_origins",None)
-                if origins is None:
-                    origins={}; self._pair_proof_origins=origins
-                for case,active in active_by_case.items():
-                    candidate_proofs=[]
-                    for dependency,channel,premises in active:
-                        proofs=channel_cache[
-                            channel_key((dependency,channel,premises))
+                rule=producers[0]
+                premises=tuple(rule.get("premises",()))
+                predicates=[predicate for predicate,_value in premises]
+                contract=rule.get("proof_factorization",{})
+                if (not premises or len(predicates)!=len(set(predicates))
+                        or channel==dependency
+                        or channel!=rule.get("variant_id")
+                        or any(not isinstance(predicate,str)
+                               or not re.fullmatch(r"[a-z][a-z0-9_]*",predicate)
+                               or not isinstance(value,str)
+                               for predicate,value in premises)
+                        or contract.get("schema")!="isolated_extensional_pair_channel_v1"
+                        or contract.get("case_variable")!="$pair"
+                        or contract.get("premise_tv")!=[1.0,1.0]
+                        or contract.get("single_channel_producer") is not True
+                        or contract.get("dependency_id")!=dependency
+                        or contract.get("proof_channel_id")!=channel
+                        or contract.get("premises")!=[
+                            list(item) for item in premises
                         ]
-                        candidate_proofs.extend(proofs)
-                        for proof in proofs:
-                            origins[(self.version,case,proof)]=dependency
-                    self._pair_proof_cache[(*inference_key,case)]=candidate_proofs
-            else:
-                query_started=time.perf_counter()
-                for offset in range(0,len(missing),batch):
-                    cases=missing[offset:offset+batch]
-                    queries=[f'(: $proof (PairWin {case}) $tv)' for case in cases]
-                    # Posterior mode adds a third merge hop over PairSignal.
-                    steps=max(12,int(self.config["pair_chain_steps"]))*len(cases)
-                    results=self.engine.query_many(
-                        queries,steps=steps,timeout_sec=timeout_sec
-                    ); calls+=1
-                    for case,proofs in zip(cases,results):
-                        self._pair_proof_cache[(*inference_key,case)]=proofs
-                query_seconds=time.perf_counter()-query_started
+                        or contract.get("rule_source_sha256")
+                           not in compiled_source_hashes):
+                    raise RuntimeError(
+                        f"proof channel {root!r} is not safely factorable"
+                    )
+                topology[root]=premises
+            topology_seconds=time.perf_counter()-topology_started
+            activation_started=time.perf_counter()
+            active_by_case={case:[] for case in missing}
+            stored_attrs=getattr(self,"_pair_case_attrs",{})
+            for case in missing:
+                attrs=stored_attrs.get(case,supplied_attrs.get(case,{}))
+                for dependency,channel in proof_roots:
+                    premises=topology[(dependency,channel)]
+                    if all(attrs.get(predicate)==value
+                           for predicate,value in premises):
+                        active_by_case[case].append((dependency,channel,premises))
+            activation_join_seconds=time.perf_counter()-activation_started
+            active_uses=sum(map(len,active_by_case.values()))
+            active_templates=list(dict.fromkeys(
+                (dependency,channel,premises)
+                for case in missing
+                for dependency,channel,premises in active_by_case[case]
+            ))
+            channel_key=lambda item:(*inference_key,item[0],item[1],item[2])
+            channel_cache=getattr(self,"_pair_channel_proof_cache",None)
+            if channel_cache is None:
+                channel_cache={}; self._pair_channel_proof_cache=channel_cache
+            query_templates=[item for item in active_templates
+                             if channel_key(item) not in channel_cache]
+            if len(channel_cache)+len(query_templates)>cache_limit:
+                raise RuntimeError(
+                    "pair proof-channel cache limit exceeded; promote a fresh "
+                    "rule snapshot"
+                )
+            pair_stats.update(
+                channel_root_requests=len(active_templates),
+                channel_root_hits=len(active_templates)-len(query_templates),
+                channel_root_misses=len(query_templates),
+            )
+            serialization_started=time.perf_counter(); facts=[]
+            loaded_channels=getattr(self,"_loaded_pair_channels",None)
+            if loaded_channels is None:
+                loaded_channels=set(); self._loaded_pair_channels=loaded_channels
+            template_audit=getattr(self,"_pair_channel_templates",None)
+            if template_audit is None:
+                template_audit={}; self._pair_channel_templates=template_audit
+            known_template_identities={
+                item["case"]:(
+                    item["dependency_id"],item["proof_channel_id"],
+                    tuple(tuple(fact) for fact in item["facts"]),
+                )
+                for item in template_audit.values()
+            }
+            pending_loaded=set(); pending_audit={}
+            for dependency,channel,premises in query_templates:
+                template=self.pair_channel_case(dependency,channel,premises)
+                loaded_key=(self.version,dependency,channel,premises)
+                identity=(dependency,channel,premises)
+                previous_identity=known_template_identities.setdefault(template,identity)
+                if previous_identity!=identity:
+                    raise RuntimeError(
+                        f"pair proof template hash collision at {template}"
+                    )
+                pending_audit[loaded_key]={
+                    "case":template,"dependency_id":dependency,
+                    "proof_channel_id":channel,
+                    "facts":[[predicate,value] for predicate,value in premises],
+                }
+                if loaded_key in loaded_channels: continue
+                for index,(predicate,value) in enumerate(premises,1):
+                    facts.append(
+                        f'(: fact_{template}_{index}_{predicate} '
+                        f'({predicate.title()} {template} {json.dumps(value)}) '
+                        '(STV 1.0 1.0))'
+                    )
+                pending_loaded.add(loaded_key)
+            template_serialization_seconds=(
+                time.perf_counter()-serialization_started
+            )
+            insertion_started=time.perf_counter()
+            for offset in range(0,len(facts),1000):
+                self.engine.add_atoms_no_check(
+                    facts[offset:offset+1000],timeout_sec=timeout_sec
+                )
+            atomspace_insertion_seconds=time.perf_counter()-insertion_started
+            inserted_template_atoms=len(facts)
+            staged_channel_results={}
+            query_started=time.perf_counter()
+            for offset in range(0,len(query_templates),batch):
+                items=query_templates[offset:offset+batch]
+                queries=[
+                    f'(: $proof (PairSignal '
+                    f'{self.pair_channel_case(dependency,channel,premises)} '
+                    f'{json.dumps(dependency)} {json.dumps(channel)}) $tv)'
+                    for dependency,channel,premises in items
+                ]
+                # Each independently mined vote is a real two-hop proof:
+                # predicate -> MinedPairPreference -> PairSignal.
+                steps=max(10,int(self.config["pair_chain_steps"]))*len(items)
+                results=self.engine.query_many(
+                    queries,steps=steps,timeout_sec=timeout_sec
+                ); calls+=1
+                for item,proofs in zip(items,results):
+                    staged_channel_results[channel_key(item)]=proofs
+            query_seconds=time.perf_counter()-query_started
+            candidate_channel_results={
+                **channel_cache,**staged_channel_results,
+            }
+            unproved=[
+                (dependency,channel)
+                for dependency,channel,premises in active_templates
+                if not candidate_channel_results.get(
+                    channel_key((dependency,channel,premises))
+                )
+            ]
+            if unproved:
+                raise RuntimeError(
+                    "active isolated pair channels returned no PeTTa proof: "
+                    +", ".join(
+                        f"{dependency}/{channel}"
+                        for dependency,channel in unproved[:8]
+                    )
+                )
+            # Publish cache and audit state only after every PeTTa mutation and
+            # query has succeeded. A retired/failed worker can never leave a
+            # false empty proof or a falsely "loaded" fact template behind.
+            channel_cache.update(staged_channel_results)
+            loaded_channels.update(pending_loaded)
+            template_audit.update(pending_audit)
+            self._pair_query_roots=getattr(self,"_pair_query_roots",0)+len(query_templates)
+            self._pair_pruned_query_roots=(
+                getattr(self,"_pair_pruned_query_roots",0)
+                +len(missing)*len(proof_roots)-active_uses
+            )
+            self._pair_channel_activations=(
+                getattr(self,"_pair_channel_activations",0)+active_uses
+            )
+            self._pair_reused_channel_activations=(
+                getattr(self,"_pair_reused_channel_activations",0)
+                +max(0,active_uses-len(query_templates))
+            )
+            origins=getattr(self,"_pair_proof_origins",None)
+            if origins is None:
+                origins={}; self._pair_proof_origins=origins
+            for case,active in active_by_case.items():
+                candidate_proofs=[]
+                for dependency,channel,premises in active:
+                    proofs=channel_cache[
+                        channel_key((dependency,channel,premises))
+                    ]
+                    candidate_proofs.extend(proofs)
+                    for proof in proofs:
+                        origins[(self.version,case,proof)]=dependency
+                self._pair_proof_cache[(*inference_key,case)]=candidate_proofs
+
             self._pair_query_calls+=calls
             pair_stats["hits"]=(pair_stats["case_root_hits"]
                                 +pair_stats["channel_root_hits"])
@@ -533,32 +486,19 @@ def make_pairwise_ranking_mixin(
             }
             return {case:self._pair_proof_cache[(*inference_key,case)] for case in unique},calls
 
-        @staticmethod
-        def _pair_posterior(proofs,prior=0.5):
-            if not proofs: return prior
-            # query_many returns PeTTaChainer's canonical root proofs.  Strength is
-            # the preference probability; confidence shrinks it to the neutral
-            # pair prior rather than being multiplied into a pseudo-probability.
-            strength,confidence=max((proof_tv(proof) for proof in proofs),
-                                    key=lambda tv:(tv[1],abs(tv[0]-prior)))
-            return confidence*strength+(1.0-confidence)*prior
-
         def _proof_dependency_margins(self,case,proofs,*,cache=None):
             """Return PeTTa confidence-adjusted margins keyed by dependency.
 
             A PairSignal STV is a probability around the balanced pair prior 0.5.
             Its base linear decision margin is therefore ``c * (2s - 1)``.  The
-            configured signed power may temper that linear/log-odds margin after
-            PeTTa inference. Reading the STV from the returned root proof preserves
+            log-odds transform preserves strong calibrated evidence. Reading the
+            STV from the returned root proof preserves
             PeTTa's CTV propagation and revision semantics instead of reducing the
             reasoner to a Boolean gate.
             """
             if not proofs: return {}
             margin_cache=(self._pair_margin_cache if cache is None else cache)
-            margin_transform=self.config["pair_margin_transform"]
-            margin_power=float(self.config["pair_margin_power"])
-            cache_key=("dependencies",self.version,margin_transform,margin_power,
-                       case,tuple(proofs))
+            cache_key=("dependencies",self.version,case,tuple(proofs))
             if cache_key in margin_cache: return margin_cache[cache_key]
             cache_limit=int(self.config.get(
                 "max_proof_cache_entries",DEFAULT_MAX_PROOF_CACHE_ENTRIES
@@ -587,23 +527,9 @@ def make_pairwise_ranking_mixin(
                               set(re.findall(r"\bpair_mined_cluster_\d+\b",proof)))
                 strength,confidence=proof_tv(proof)
                 posterior=0.5+confidence*(strength-0.5)
-                if margin_transform=="log_odds":
-                    # Pairwise AUC is driven by relative evidence. Log odds retains
-                    # PeTTa's confidence shrinkage while preventing a strong,
-                    # well-supported proof from being flattened into the same
-                    # nearly-linear vote as weak evidence.
-                    bounded=max(1e-9,min(1.0-1e-9,posterior))
-                    proof_margin=math.log(bounded/(1.0-bounded))
-                else:
-                    proof_margin=2.0*posterior-1.0
-                # A positive power preserves the proof direction and ordering of
-                # variants inside one dependency.  Powers below one conservatively
-                # temper calibration-scale differences between independent
-                # evidence families; the default 1.0 is exactly the old margin.
-                if proof_margin:
-                    proof_margin=math.copysign(
-                        abs(proof_margin)**margin_power,proof_margin
-                    )
+                # The champion uses confidence-shrunk PeTTa posterior log odds.
+                bounded=max(1e-9,min(1.0-1e-9,posterior))
+                proof_margin=math.log(bounded/(1.0-bounded))
                 for dependency_id in dependencies:
                     # A dependency cluster can expose several correlated proof
                     # variants. PeTTa supplies their inferred STVs; retain only the
@@ -818,36 +744,20 @@ def make_pairwise_ranking_mixin(
             raw_by_article={aid:(self.article(aid),raw_attrs)
                             for aid,_case,_attrs,raw_attrs in specs}
             comparisons=[]; pair_specs=[]
-            opponent_limit=int(self.config["pairwise_opponents"])
             comparison_limit=int(self.config["max_pair_comparisons"])
             graph_started=time.perf_counter()
-            if opponent_limit<=0 or opponent_limit>=len(rows)-1:
-                exhaustive_count=len(rows)*(len(rows)-1)//2
-                if exhaustive_count>comparison_limit:
-                    raise ValueError(
-                        "pairwise comparison budget exceeded: "
-                        f"{exhaustive_count} unordered pairs for {len(rows)} "
-                        f"candidates is greater than max_pair_comparisons="
-                        f"{comparison_limit}; reduce the candidate slate or set "
-                        "a finite pairwise_opponents value"
-                    )
-                index_pairs=((left,right) for left in range(len(rows))
-                             for right in range(left+1,len(rows)))
-            else:
-                # A cyclic comparison graph gives every candidate the same local
-                # proof budget while retaining occasional top-vs-tail comparisons.
-                pair_set=set()
-                for left in range(len(rows)):
-                    for offset in range(1,opponent_limit+1):
-                        right=(left+offset)%len(rows)
-                        pair_set.add(tuple(sorted((left,right))))
-                        if len(pair_set)>comparison_limit:
-                            raise ValueError(
-                                "bounded pairwise comparison budget exceeded: "
-                                f"more than {comparison_limit} unordered pairs; "
-                                "reduce the candidate slate or pairwise_opponents"
-                            )
-                index_pairs=iter(sorted(pair_set))
+            exhaustive_count=len(rows)*(len(rows)-1)//2
+            if exhaustive_count>comparison_limit:
+                raise ValueError(
+                    "pairwise comparison budget exceeded: "
+                    f"{exhaustive_count} unordered pairs for {len(rows)} "
+                    f"candidates is greater than max_pair_comparisons="
+                    f"{comparison_limit}"
+                )
+            index_pairs=(
+                (left,right) for left in range(len(rows))
+                for right in range(left+1,len(rows))
+            )
             graph_seconds=time.perf_counter()-graph_started
             feature_seconds=0.0; reverse_seconds=0.0; bounding_seconds=0.0
             activation_seconds=0.0; cache_seconds=0.0; serialization_seconds=0.0
@@ -900,13 +810,18 @@ def make_pairwise_ranking_mixin(
 
         def _pairwise_rank(self,rows,specs,plan=None,proof_map=None,
                            reasoner_timeout_sec=None):
-            if self.config["ranking_mode"]!="pairwise" or not self.pair_rules or len(rows)<2:
+            """Rank a slate with the champion balanced-family proof tournament."""
+            if not self.pair_rules or len(rows)<2:
                 self._last_pair_replay=None
                 for row in rows:
-                    row.update(ranking_score=row["score"],pairwise_score=None,
-                               pairwise_margin_score=None,
-                               pairwise_proof_coverage=0.0,pairwise_directional_coverage=0.0)
+                    row.update(
+                        ranking_score=row["score"],pairwise_score=None,
+                        pairwise_margin_score=None,
+                        pairwise_proof_coverage=0.0,
+                        pairwise_directional_coverage=0.0,
+                    )
                 return rows
+
             comparisons,pair_specs=plan or self._pairwise_plan(rows,specs)
             if proof_map is None:
                 self._ensure_pair_specs(
@@ -924,267 +839,163 @@ def make_pairwise_ranking_mixin(
                 ),
                 "proof_map":proof_map,
             }
-            pair_totals=[0.0]*len(rows); comparison_counts=[0]*len(rows)
-            covered=[0]*len(rows); directional_covered=[0]*len(rows)
-            proof_margin=self.config["pair_aggregation"]=="proof_margin"
-            family_fusion=self.config.get("pair_family_fusion","flat_margin")
-            symbolic_families=family_fusion=="symbolic_balanced"
-            magnitude_balanced=family_fusion=="balanced_margin"
-            balanced_families=(
-                proof_margin
-                and family_fusion
-                    in {"balanced_rank","balanced_margin","symbolic_balanced"}
-            )
+
+            count=len(rows)
+            pair_totals=[0.0]*count
+            comparison_counts=[0]*count
+            covered=[0]*count
+            directional_covered=[0]*count
+
             dependency_families={}
-            for rule in self.pair_rules:
-                dependency_id=rule.get("dependency_id",rule["id"])
-                if symbolic_families:
-                    dependency_families.setdefault(dependency_id,set()).update(
-                        self._symbolic_rule_families(rule))
-                    continue
-                family=self._pair_rule_family(rule)
-                # Several correlated variants may share one dependency.  If any
-                # variant consumes text evidence, classify the indivisible PeTTa
-                # dependency as text-semantic instead of depending on rule order.
-                if (family=="text_semantic"
-                        or dependency_id not in dependency_families):
-                    dependency_families[dependency_id]=family
-            if not symbolic_families:
-                dependency_families={key:{family} for key,family in dependency_families.items()}
-            else:
-                # One proof dependency can influence only one family midrank.
-                # Splitting its margin across families would still duplicate its
-                # vote after independent normalization. Mixed dependencies belong
-                # to their most specific source under this fixed schema order.
-                dependency_families={
-                    key:{next(family for family in ("lexical","transition","interest")
-                              if family in families)}
-                    for key,families in dependency_families.items()
-                }
-            active_families=tuple(sorted(set().union(*dependency_families.values())))
-            family_totals={family:[0.0]*len(rows) for family in active_families}
-            for left_index,right_index,forward_case,reverse_case in comparisons:
-                forward_proofs=proof_map[forward_case]; reverse_proofs=proof_map[reverse_case]
-                if proof_margin:
-                    if balanced_families:
-                        forward_margins=self._proof_dependency_margins(
-                            forward_case,forward_proofs
-                        )
-                        reverse_margins=self._proof_dependency_margins(
-                            reverse_case,reverse_proofs
-                        )
-                        comparison_family_totals={}
-                        comparison_family_dependency_mass={}
-                        margin=0.0
-                        for dependency_id in sorted(set(forward_margins)|set(reverse_margins)):
-                            if symbolic_families and dependency_id not in dependency_families:
-                                raise RuntimeError("proof references a dependency outside the active symbolic model")
-                            dependency_margin=(
-                                forward_margins.get(dependency_id,0.0)
-                                -reverse_margins.get(dependency_id,0.0)
-                            )
-                            margin+=dependency_margin
-                            families=dependency_families.get(dependency_id,{"structured_symbolic"})
-                            for family in families:
-                                contribution=dependency_margin/len(families)
-                                family_totals.setdefault(family,[0.0]*len(rows))
-                                if magnitude_balanced:
-                                    # Average only the dependency evidence that
-                                    # actually participated in this comparison.
-                                    # Merely compiling an inactive rule must not
-                                    # dilute an active family's PeTTa margin.
-                                    comparison_family_totals[family]=(
-                                        comparison_family_totals.get(family,0.0)
-                                        +contribution
-                                    )
-                                    comparison_family_dependency_mass[family]=(
-                                        comparison_family_dependency_mass.get(
-                                            family,0.0
-                                        )+1.0/len(families)
-                                    )
-                                else:
-                                    family_totals[family][left_index]+=contribution
-                                    family_totals[family][right_index]-=contribution
-                        if magnitude_balanced:
-                            # First average correlated/alternative dependencies
-                            # inside each active family, then give each family
-                            # that actually supplied a proof one top-level term.
-                            # An absent family is not entered in the denominator:
-                            # abstention must neither invent nor dilute evidence.
-                            active_family_margins=[]
-                            for family,total in comparison_family_totals.items():
-                                family_margin=total/comparison_family_dependency_mass[family]
-                                active_family_margins.append(family_margin)
-                                family_totals[family][left_index]+=family_margin
-                                family_totals[family][right_index]-=family_margin
-                            margin=(
-                                sum(active_family_margins)/len(active_family_margins)
-                                if active_family_margins else 0.0
-                            )
-                    else:
-                        margin=(self._proof_vote_margin(forward_case,forward_proofs)
-                                -self._proof_vote_margin(reverse_case,reverse_proofs))
-                    pair_totals[left_index]+=margin; pair_totals[right_index]-=margin
-                else:
-                    left=self._pair_posterior(forward_proofs); right=self._pair_posterior(reverse_proofs)
-                    # The two directions are complementary pieces of evidence, not
-                    # unnormalised class logits. Antisymmetrising around the pair
-                    # prior preserves neutral 0.5 when both directions agree.
-                    probability=0.5+0.5*(left-right)
-                    pair_totals[left_index]+=probability
-                    pair_totals[right_index]+=1.0-probability
-                comparison_counts[left_index]+=1; comparison_counts[right_index]+=1
-                if forward_proofs or reverse_proofs:
-                    covered[left_index]+=1; covered[right_index]+=1
-                directional_covered[left_index]+=bool(forward_proofs)
-                directional_covered[right_index]+=bool(reverse_proofs)
-            rank_denominator=max(1,len(rows)-1); weight=float(self.config["pairwise_weight"])
-            feedback_active=any(
-                row.get("feedback_evidence",{}).get("rule_ids") for row in rows
-            )
-            # A configured pair weight of 1 normally makes point evidence an
-            # audit-only signal.  Once PeTTa has proved live negative evidence,
-            # give its point-proof order one bounded Borda vote beside the PeTTa
-            # pair tournament.  The mined pair model retains at least three
-            # quarters of the decision weight. This is rank fusion of two reasoner
-            # outputs—not a host-language score penalty—and leaves all offline /
-            # no-feedback rankings byte-for-byte on their configured path.
-            applied_pair_weight=min(weight,0.75) if feedback_active else weight
             cluster_weights={}
-            margin_power=float(self.config["pair_margin_power"])
             for rule in self.pair_rules:
-                dependency_id=rule.get("dependency_id",rule["id"])
-                posterior=0.5+float(rule.get("proof_confidence",rule.get("confidence",0.0)))*(
-                    float(rule.get("proof_strength",rule.get("strength",0.5)))-0.5
+                dependency=rule.get("dependency_id",rule["id"])
+                family=self._pair_rule_family(rule)
+                if (family=="text_semantic"
+                        or dependency not in dependency_families):
+                    dependency_families[dependency]=family
+                posterior=0.5+float(rule.get(
+                    "proof_confidence",rule.get("confidence",0.0)
+                ))*(float(rule.get(
+                    "proof_strength",rule.get("strength",0.5)
+                ))-0.5)
+                bounded=max(1e-9,min(1.0-1e-9,posterior))
+                margin=abs(math.log(bounded/(1.0-bounded)))
+                cluster_weights[dependency]=max(
+                    cluster_weights.get(dependency,0.0),margin
                 )
-                if self.config["pair_margin_transform"]=="log_odds":
-                    bounded=max(1e-9,min(1.0-1e-9,posterior))
-                    rule_margin=abs(math.log(bounded/(1.0-bounded)))
-                else:
-                    rule_margin=abs(2.0*posterior-1.0)
-                rule_margin=rule_margin**margin_power
-                cluster_weights[dependency_id]=max(
-                    cluster_weights.get(dependency_id,0.0),
-                    rule_margin
+
+            active_families=tuple(sorted(set(dependency_families.values())))
+            family_totals={
+                family:[0.0]*count for family in active_families
+            }
+            for left,right,forward_case,reverse_case in comparisons:
+                forward_proofs=proof_map[forward_case]
+                reverse_proofs=proof_map[reverse_case]
+                forward_margins=self._proof_dependency_margins(
+                    forward_case,forward_proofs
                 )
-            maximum_margin=max(1e-12,sum(cluster_weights.values()))
-            raw_pair_values=[pair_totals[index]/max(1,comparison_counts[index])
-                             for index in range(len(rows))]
+                reverse_margins=self._proof_dependency_margins(
+                    reverse_case,reverse_proofs
+                )
+                total=0.0
+                for dependency in sorted(
+                        set(forward_margins)|set(reverse_margins)):
+                    margin=(forward_margins.get(dependency,0.0)
+                            -reverse_margins.get(dependency,0.0))
+                    total+=margin
+                    family=dependency_families.get(
+                        dependency,"structured_symbolic"
+                    )
+                    family_totals.setdefault(family,[0.0]*count)
+                    family_totals[family][left]+=margin
+                    family_totals[family][right]-=margin
+                pair_totals[left]+=total
+                pair_totals[right]-=total
+                comparison_counts[left]+=1
+                comparison_counts[right]+=1
+                if forward_proofs or reverse_proofs:
+                    covered[left]+=1
+                    covered[right]+=1
+                directional_covered[left]+=bool(forward_proofs)
+                directional_covered[right]+=bool(reverse_proofs)
+
+            raw_pair_values=[
+                pair_totals[index]/max(1,comparison_counts[index])
+                for index in range(count)
+            ]
             family_rank_scores={}
             family_pair_values={}
-            family_margin_scores={}
-            fused_family_margin=None
-            if balanced_families and family_totals:
-                for family,totals in family_totals.items():
-                    family_raw=[totals[index]/max(1,comparison_counts[index])
-                                for index in range(len(rows))]
-                    if magnitude_balanced:
-                        # Give each family one top-level term in the fusion while
-                        # retaining the magnitude of PeTTa's confidence-adjusted
-                        # proof margins. Dependency-count normalization was
-                        # already performed per comparison over the union of its
-                        # forward/reverse proofs. An absent family remains zero.
-                        # Unlike balanced_rank, an uncertain 0.52/0.10 proof
-                        # cannot cancel an opposing 0.90/0.95 proof merely because
-                        # both families induced the opposite ordinal order.
-                        family_margin_scores[family]=family_raw
-                        family_pair_values[family]=[
-                            self._logistic(value)
-                            for value in family_margin_scores[family]
-                        ]
-                    else:
-                        family_max=max(1e-12,sum(
-                            weight/len(dependency_families.get(dependency_id,{"structured_symbolic"}))
-                            for dependency_id,weight in cluster_weights.items()
-                            if family in dependency_families.get(dependency_id,{"structured_symbolic"})
-                        ))
-                        family_pair_values[family]=[
-                            0.5+0.5*value/family_max for value in family_raw
-                        ]
-                    family_rank_scores[family]=self._midrank_scores(family_raw)
-                family_count=len(family_rank_scores)
-                if magnitude_balanced:
-                    # ``raw_pair_values`` contains the mean of the already fused
-                    # per-comparison margins.  Re-averaging the diagnostic family
-                    # totals here would incorrectly count an absent family as a
-                    # zero-valued observation.
-                    fused_family_margin=list(raw_pair_values)
-                    pair_values=[self._logistic(value)
-                                 for value in fused_family_margin]
-                    # Rank only after calibrated magnitudes from all families have
-                    # been combined.  The final midrank is required by the public
-                    # rank-fusion contract; it no longer erases magnitude before
-                    # conflicting evidence families meet.
-                    pair_rank_scores=self._midrank_scores(fused_family_margin)
-                else:
-                    pair_values=[sum(values[index] for values in family_pair_values.values())
-                                 /family_count for index in range(len(rows))]
-                    pair_rank_scores=[sum(values[index] for values in family_rank_scores.values())
-                                      /family_count for index in range(len(rows))]
-            else:
-                pair_values=([0.5+0.5*value/maximum_margin for value in raw_pair_values]
-                             if proof_margin else raw_pair_values)
-                pair_rank_scores=self._midrank_scores(pair_values)
-            # Midrank candidates whose point proofs are identical.  Editorial
-            # priors and article IDs remain final deterministic tie-breakers, but
-            # they no longer masquerade as a continuous point-proof signal inside
-            # rank fusion.
-            pointwise_rank_scores=[0.0]*len(rows)
-            point_position=0
-            while point_position<len(rows):
-                point_end=point_position+1
-                point_signature=(rows[point_position]["score"],
-                                 rows[point_position]["stv"]["strength"],
-                                 rows[point_position]["stv"]["confidence"])
-                while point_end<len(rows) and (
-                    rows[point_end]["score"],rows[point_end]["stv"]["strength"],
-                    rows[point_end]["stv"]["confidence"]
-                )==point_signature:
-                    point_end+=1
-                average_position=(point_position+point_end-1)/2
-                rank_score=1.0-average_position/rank_denominator
-                for offset in range(point_position,point_end):
-                    pointwise_rank_scores[offset]=rank_score
-                point_position=point_end
+            for family,totals in family_totals.items():
+                raw=[
+                    totals[index]/max(1,comparison_counts[index])
+                    for index in range(count)
+                ]
+                family_max=max(1e-12,sum(
+                    weight for dependency,weight in cluster_weights.items()
+                    if dependency_families.get(
+                        dependency,"structured_symbolic"
+                    )==family
+                ))
+                family_pair_values[family]=[
+                    0.5+0.5*value/family_max for value in raw
+                ]
+                family_rank_scores[family]=self._midrank_scores(raw)
+
+            family_count=max(1,len(family_rank_scores))
+            pair_values=[
+                sum(values[index] for values in family_pair_values.values())
+                /family_count
+                for index in range(count)
+            ]
+            pair_rank_scores=[
+                sum(values[index] for values in family_rank_scores.values())
+                /family_count
+                for index in range(count)
+            ]
+
+            # Point proofs are a tie-aware live-feedback channel.  The frozen
+            # offline champion gives the pair tournament full weight; a proved
+            # recent skip temporarily reserves one quarter for point evidence.
+            rank_denominator=max(1,count-1)
+            point_ranks=[0.0]*count
+            position=0
+            while position<count:
+                end=position+1
+                signature=(
+                    rows[position]["score"],
+                    rows[position]["stv"]["strength"],
+                    rows[position]["stv"]["confidence"],
+                )
+                while end<count and (
+                    rows[end]["score"],
+                    rows[end]["stv"]["strength"],
+                    rows[end]["stv"]["confidence"],
+                )==signature:
+                    end+=1
+                rank=1.0-(position+end-1)/2/rank_denominator
+                for index in range(position,end):
+                    point_ranks[index]=rank
+                position=end
+
+            feedback_active=any(
+                row.get("feedback_evidence",{}).get("rule_ids")
+                for row in rows
+            )
+            pair_weight=0.75 if feedback_active else 1.0
             for index,row in enumerate(rows):
                 denominator=max(1,comparison_counts[index])
-                pointwise_rank=pointwise_rank_scores[index]
-                pairwise_score=pair_values[index]
-                pairwise_rank_score=pair_rank_scores[index]
-                pair_signal=(pairwise_rank_score if self.config["pairwise_fusion"]=="rank"
-                             else pairwise_score)
                 row.update(
-                    pairwise_score=round(pairwise_score,8),
+                    pairwise_score=round(pair_values[index],8),
                     pairwise_margin_score=round(raw_pair_values[index],8),
-                    pairwise_rank_score=round(pairwise_rank_score,8),
-                    pointwise_rank_score=round(pointwise_rank,8),
-                    ranking_score=round(applied_pair_weight*pair_signal
-                                        +(1.0-applied_pair_weight)*pointwise_rank,8),
-                    pairwise_proof_coverage=round(covered[index]/denominator,8),
-                    pairwise_directional_coverage=round(directional_covered[index]/denominator,8),
-                    pairwise_weight_applied=applied_pair_weight,
+                    pairwise_rank_score=round(pair_rank_scores[index],8),
+                    pointwise_rank_score=round(point_ranks[index],8),
+                    ranking_score=round(
+                        pair_weight*pair_rank_scores[index]
+                        +(1.0-pair_weight)*point_ranks[index],8
+                    ),
+                    pairwise_proof_coverage=round(
+                        covered[index]/denominator,8
+                    ),
+                    pairwise_directional_coverage=round(
+                        directional_covered[index]/denominator,8
+                    ),
+                    pairwise_weight_applied=pair_weight,
                     live_feedback_rank_fusion=feedback_active,
-                )
-                if balanced_families:
-                    row["pairwise_family_rank_scores"]={
+                    pairwise_family_rank_scores={
                         family:round(values[index],8)
                         for family,values in family_rank_scores.items()
-                    }
-                if magnitude_balanced:
-                    row["pairwise_family_margin_scores"]={
-                        family:round(values[index],8)
-                        for family,values in family_margin_scores.items()
-                    }
-                    row["pairwise_fused_margin_score"]=round(
-                        fused_family_margin[index],8
-                    )
-            rows.sort(key=lambda row:(-row["ranking_score"],-row["pairwise_score"],
-                                      -row["score"],-row["stv"]["strength"],
-                                      -row["stv"]["confidence"],
-                                      -row["tie_break"]["topic_prior"],
-                                      -row["tie_break"]["format_prior"],
-                                      -row["tie_break"]["subcategory_prior"],
-                                      row["article"]["id"]))
+                    },
+                )
+            rows.sort(key=lambda row:(
+                -row["ranking_score"],-row["pairwise_score"],
+                -row["score"],-row["stv"]["strength"],
+                -row["stv"]["confidence"],
+                -row["tie_break"]["topic_prior"],
+                -row["tie_break"]["format_prior"],
+                -row["tie_break"]["subcategory_prior"],
+                row["article"]["id"],
+            ))
             return rows
 
         def _pairwise_replay_plan(self,rows,replay):
@@ -1214,9 +1025,11 @@ def make_pairwise_ranking_mixin(
             popularity=self._popularity; rows=[]; prior=float(self._click_base_rate)
             for (aid,_case,_attrs,_raw_attrs),proofs in zip(specs,groups):
                 scored=[(proof_tv(proof),proof) for proof in proofs]
-                inference_tv,inference_proof=max(
-                    scored,key=lambda item:prior+item[0][1]*(item[0][0]-prior),
-                                                    default=((0.0,0.0),""))
+                inference_tv,_inference_proof=max(
+                    scored,
+                    key=lambda item:prior+item[0][1]*(item[0][0]-prior),
+                    default=((0.0,0.0),""),
+                )
                 feedback_scored=[
                     (proof_tv(proof),proof) for proof in proofs
                     if LIVE_NEGATIVE_RULE_IDS.intersection(
@@ -1228,88 +1041,81 @@ def make_pairwise_ranking_mixin(
                         re.findall(r"\bfeedback_skip_[a-z]+\b",proof)
                     ) for _tv,proof in feedback_scored
                 ))) if feedback_scored else []
-                if self.config["aggregation"]=="max":
-                    tv,proof=inference_tv,inference_proof
-                    proof_rule_ids=set(re.findall(r"\bmined_\d+\b",proof))
-                    fired=[rule for rule in self.mined_rules if rule["id"] in proof_rule_ids]
-                    score=prior+tv[1]*(tv[0]-prior) if proofs else prior
-                    score_method="pettachainer_base_rate_posterior"
+
+                proof_rule_ids=set().union(*(
+                    set(re.findall(r"\bmined_\d+\b",proof))
+                    for _tv,proof in scored
+                )) if scored else set()
+                fired=[
+                    rule for rule in self.mined_rules
+                    if rule["id"] in proof_rule_ids
+                ]
+                if fired:
+                    weights=[
+                        max(1,int(rule.get(
+                            "specificity",len(rule["premises"])
+                        ))) for rule in fired
+                    ]
+                    evidence_confidence=sum(
+                        rule["confidence"]*weight
+                        for rule,weight in zip(fired,weights)
+                    )/sum(weights)
+                    score=sum(
+                        (prior+rule["confidence"]*(
+                            rule["strength"]-prior
+                        ))*weight
+                        for rule,weight in zip(fired,weights)
+                    )/sum(weights)
+                elif scored:
+                    values=[value for value,_proof in scored]
+                    evidence_confidence=sum(
+                        value[1] for value in values
+                    )/len(values)
+                    score=sum(
+                        prior+value[1]*(value[0]-prior)
+                        for value in values
+                    )/len(values)
                 else:
-                    proof_rule_ids=set().union(*(set(re.findall(r"\bmined_\d+\b",proof)) for _tv,proof in scored)) if scored else set()
-                    fired=[rule for rule in self.mined_rules if rule["id"] in proof_rule_ids]
-                    if fired:
-                        weights=[max(1,int(rule.get("specificity",len(rule["premises"])))) for rule in fired]
-                        evidence_confidence=sum(rule["confidence"]*weight for rule,weight in zip(fired,weights))/sum(weights)
-                        evidence_score=sum(
-                            (prior+rule["confidence"]*(rule["strength"]-prior))*weight
-                            for rule,weight in zip(fired,weights)
-                        )/sum(weights)
-                    elif scored:
-                        tv_values=[value for value,_proof in scored]
-                        evidence_confidence=sum(value[1] for value in tv_values)/len(tv_values)
-                        evidence_score=sum(prior+value[1]*(value[0]-prior)
-                                           for value in tv_values)/len(tv_values)
-                    else:
-                        evidence_confidence=0.0; evidence_score=prior
-                    if self.config["aggregation"]=="hybrid":
-                        # Use PeTTaChainer's merged inference STV as part of the
-                        # decision while retaining calibrated CTV evidence from
-                        # each rule present in the proof tree.  This is a fixed,
-                        # auditable 80/20 semantic blend (not a fallback ranker).
-                        canonical_score=(prior+inference_tv[1]*(inference_tv[0]-prior)
-                                         if scored else prior)
-                        confidence=0.8*evidence_confidence+0.2*inference_tv[1]
-                        score=0.8*evidence_score+0.2*canonical_score
-                        strength=(prior+(score-prior)/confidence
-                                  if confidence else prior)
-                        tv=(max(0.0,min(1.0,strength)),confidence)
-                        score_method="pettachainer_hybrid_base_rate_posterior"
-                    else:
-                        confidence=evidence_confidence; score=evidence_score
-                        strength=(prior+(score-prior)/confidence
-                                  if confidence else prior)
-                        tv=(max(0.0,min(1.0,strength)),confidence)
-                        score_method="proof_gated_base_rate_posterior"
+                    evidence_confidence=0.0
+                    score=prior
+                strength=(prior+(score-prior)/evidence_confidence
+                          if evidence_confidence else prior)
+                tv=(max(0.0,min(1.0,strength)),evidence_confidence)
+                score_method="proof_gated_base_rate_posterior"
+
                 if feedback_scored:
-                    # Weighted point aggregation intentionally reconstructs mined
-                    # rule CTVs for auditability. Online feedback is different: a
-                    # dedicated PeTTa policy goal proves its zero-strength CTV.
-                    # Read that canonical proof so neither the rule strength nor
-                    # its effect is duplicated in Python as an opaque penalty.
-                    feedback_tv,feedback_proof=max(
-                        feedback_scored,key=lambda item:(item[0][1],
-                                                         abs(item[0][0]-prior))
+                    tv,_feedback_proof=max(
+                        feedback_scored,
+                        key=lambda item:(item[0][1],abs(item[0][0]-prior)),
                     )
-                    tv=feedback_tv
                     score=prior+tv[1]*(tv[0]-prior)
                     score_method="pettachainer_live_feedback_revision"
-                relational_refs=getattr(
-                    self,"_candidate_relational_proof_refs",{}
-                ).get(_case,{})
-                relational_scopes={
-                    field:_raw_attrs[field] for field in RELATIONAL_PROOF_FIELDS
-                    if _raw_attrs.get(field) in {"none","older","recent"}
+
+                row={
+                    "article":self.public_article(aid),
+                    "score":round(score,8),
+                    "stv":{"strength":tv[0],"confidence":tv[1]},
+                    "inference_stv":{
+                        "strength":inference_tv[0],
+                        "confidence":inference_tv[1],
+                    },
+                    "baseline":popularity[aid],
+                    "rules":fired,
+                    "proofs":proofs,
+                    "engine":"PeTTaChainer",
+                    "aggregation":"weighted",
+                    "score_method":score_method,
+                    "tie_break":self._tie_break(self.article(aid)),
+                    "feedback_evidence":{
+                        "match":_raw_attrs.get(
+                            LIVE_NEGATIVE_FEATURE,"none"
+                        ),
+                        "rule_ids":feedback_rule_ids,
+                        "proof_stv":{
+                            "strength":tv[0],"confidence":tv[1]
+                        } if feedback_rule_ids else None,
+                    },
                 }
-                row={"article":self.public_article(aid),"score":round(score,8),"stv":{"strength":tv[0],"confidence":tv[1]},
-                             "inference_stv":{"strength":inference_tv[0],"confidence":inference_tv[1]},
-                             "baseline":popularity[aid],"rules":fired,"proofs":proofs,"engine":"PeTTaChainer",
-                             "aggregation":self.config["aggregation"],"score_method":score_method,
-                             "tie_break":self._tie_break(self.article(aid)),
-                             "relational_evidence":{
-                                 "scopes":relational_scopes,
-                                 "proof_ids":{
-                                     key:list(value)
-                                     for key,value in relational_refs.items()
-                                     if value
-                                 },
-                                 "ledger":"immutable_snapshot_or_live_sidecar",
-                             },
-                             "feedback_evidence":{
-                                 "match":_raw_attrs.get(LIVE_NEGATIVE_FEATURE,"none"),
-                                 "rule_ids":feedback_rule_ids,
-                                 "proof_stv":{"strength":tv[0],"confidence":tv[1]}
-                                     if feedback_rule_ids else None,
-                             }}
                 if include_context:
                     row["_prepared_context"]=_raw_attrs
                 rows.append(row)
