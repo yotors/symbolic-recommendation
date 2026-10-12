@@ -2,34 +2,65 @@
 ;; The host submits PeTTa-computed sufficient statistics; all rule selection
 ;; and scoring below remain in PeTTa.
 
-(= (conditional-sum-count ($sum $count) $weight)
-   ((+ $sum $weight) (+ $count 1)))
-
 (= (conditional-conjunction $clauses)
    (if (== (size-atom $clauses) 1)
        (car-atom $clauses)
        (cons-atom , $clauses)))
 
-(= (conditional-aggregate $db $clauses)
+(= (conditional-observation-step
+      (ObservationMass $scope $target $positive $negative
+                       $positive-count $negative-count)
+      (Observation $fold $outcome $weight))
+   (if (or (== $scope AllFolds) (== $scope $fold))
+       (if (== $outcome $target)
+           (ObservationMass $scope $target
+             (+ $positive $weight) $negative
+             (+ $positive-count 1) $negative-count)
+           (ObservationMass $scope $target
+             $positive (+ $negative $weight)
+             $positive-count (+ $negative-count 1)))
+       (ObservationMass $scope $target $positive $negative
+                        $positive-count $negative-count)))
+
+(= (conditional-observation-mass $observations $scope $target)
+   (let (ObservationMass $_scope $_target
+          $positive $negative $positive-count $negative-count)
+        (foldl-atom $observations
+          (ObservationMass $scope $target 0.0 0.0 0 0)
+          conditional-observation-step)
+     (Mass $positive $negative $positive-count $negative-count)))
+
+(= (conditional-fold-cells () $_observations $_key $_target) ())
+(= (conditional-fold-cells $folds $observations $key $target)
+   (let ($fold $tail) (decons-atom $folds)
+     (cons-atom
+       (Cell $key $fold
+         (conditional-observation-mass $observations $fold $target))
+       (conditional-fold-cells $tail $observations $key $target))))
+
+(= (conditional-case-table $db $key $clauses $folds $target)
    (let $joined
         (conditional-conjunction
-          (append $clauses ((case-weight "$x" "$weight"))))
-     (let (Query $pattern $weight)
+          (append $clauses
+            ((case-fold "$x" "$fold")
+             (engagement "$x" "$outcome")
+             (case-weight "$x" "$weight"))))
+     (let (Query $pattern (Observation $fold $outcome $weight))
           (promote-placeholders
-            (Query $joined "$weight") ("$x" "$weight"))
-       (foldl-atom
-         (collapse (match $db $pattern $weight))
-         (0.0 0) conditional-sum-count))))
+            (Query $joined (Observation "$fold" "$outcome" "$weight"))
+            ("$x" "$fold" "$outcome" "$weight"))
+       (let $observations
+            (collapse
+              (match $db $pattern (Observation $fold $outcome $weight)))
+         (cons-atom
+           (Cell $key AllFolds
+             (conditional-observation-mass $observations AllFolds $target))
+           (conditional-fold-cells $folds $observations $key $target))))))
 
-(= (conditional-case-mass $db $clauses $target)
-   (let* ((($all-weight $all-count)
-             (conditional-aggregate $db $clauses))
-          (($positive-weight $positive-count)
-             (conditional-aggregate
-               $db (append $clauses ((engagement "$x" $target))))))
-     (Mass
-       $positive-weight (- $all-weight $positive-weight)
-       $positive-count (- $all-count $positive-count))))
+(= (conditional-merge-tables ()) ())
+(= (conditional-merge-tables $tables)
+   (let ($head $tail) (decons-atom $tables)
+     (append $head (conditional-merge-tables $tail))))
 
 (= (conditional-cell () $_key $_fold) (Mass 0.0 0.0 0 0))
 (= (conditional-cell $table $key $fold)
@@ -146,10 +177,13 @@
          (empty))))
 
 (= (conditional-score
-      $population-table $semantic-table $context-table $candidate-table
-      $seeds $contexts $fold-values $candidate
+      $population-table $semantic-table $context-table
+      $seeds $contexts $fold-values $candidate-cells
       $min-support $fold-min-support $min-folds $min-effect $min-increment)
-   (let* (((Candidate $seed-key $functor $value) $candidate)
+   (let* (((Cell (Candidate $seed-key $functor $value)
+                  AllFolds $_candidate-mass)
+             (car-atom $candidate-cells))
+          ($candidate (Candidate $seed-key $functor $value))
           ((Seed $seed-key $seed-ids $semantic $semantic-lineage)
              (superpose $seeds))
           ((Context $functor $context-lineage) (superpose $contexts))
@@ -158,7 +192,7 @@
           ($context-key (Context $functor $value))
           ($global
             (conditional-stats
-              $population-table $semantic-table $context-table $candidate-table
+              $population-table $semantic-table $context-table $candidate-cells
               $semantic-key $context-key $candidate AllFolds 0.5)))
      (let (Stats $_total $_matched
                  (Rates $support $_coverage $base $_precision $_effect
@@ -169,16 +203,12 @@
                 (collapse
                   (conditional-fold-stat
                     $population-table $semantic-table $context-table
-                    $candidate-table $semantic-key $context-key $candidate
+                    $candidate-cells $semantic-key $context-key $candidate
                     (superpose $fold-values) $base $fold-min-support))
              (conditional-stable-result
                $seed-ids $semantic $semantic-lineage $context $context-lineage
                $global $folds $min-folds $min-effect $min-increment))
            (empty)))))
-
-(= (conditional-candidate
-      (Cell (Candidate $seed $functor $value) $_fold $_mass))
-   (Candidate $seed $functor $value))
 
 (= (conditional-context-key
       (Cell (Context $functor $value) $_fold $_mass))
@@ -198,27 +228,26 @@
          (cons-atom $rule (conditional-unrank $tail)))))
 
 (= (conditional-frequency-pattern-miner
-      $population-table $semantic-table $context-table $candidate-table
+      $population-tables $semantic-tables $context-tables $candidate-tables
       $seeds $contexts $fold-values
       $min-support $fold-min-support $min-folds
       $min-effect $min-increment $top-k $max-candidates)
-   (let* (($candidates
-            (unique-atom
-              (collapse
-                (conditional-candidate (superpose $candidate-table)))))
+   (let* (($population-table (conditional-merge-tables $population-tables))
+          ($semantic-table (conditional-merge-tables $semantic-tables))
+          ($context-table (conditional-merge-tables $context-tables))
           ($context-keys
             (unique-atom
               (collapse
                 (conditional-context-key (superpose $context-table)))))
-          ($candidate-count (size-atom $candidates)))
+          ($candidate-count (size-atom $candidate-tables)))
      (if (> $candidate-count $max-candidates)
          (MiningLimit $candidate-count $max-candidates)
          (let* (($ranked
                    (collapse
                      (conditional-score
                        $population-table $semantic-table $context-table
-                       $candidate-table $seeds $contexts $fold-values
-                       (superpose $candidates) $min-support
+                       $seeds $contexts $fold-values
+                       (superpose $candidate-tables) $min-support
                        $fold-min-support $min-folds $min-effect $min-increment)))
                 ($selected (conditional-take $top-k (sort-atom $ranked))))
            (ConditionalMining

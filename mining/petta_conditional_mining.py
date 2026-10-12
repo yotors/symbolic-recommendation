@@ -57,35 +57,39 @@ def _mass_table(
     petta: _PeTTaRuntime,
     space: str,
     target: object,
-    cells: Iterable[tuple[str, tuple[str, ...], object | None]],
+    folds: tuple[object, ...],
+    cells: Iterable[tuple[str, tuple[str, ...]]],
 ) -> str:
-    """Batch PeTTa mass queries and label their returned sufficient statistics."""
+    """Batch one PeTTa observation scan per key; PeTTa computes fold masses."""
 
     pending = tuple(cells)
-    rows: list[str] = []
+    tables: list[str] = []
+    fold_source = f"({' '.join(_atom_source(fold) for fold in folds)})"
     for offset in range(0, len(pending), 128):
         batch = pending[offset:offset + 128]
-        queries = []
-        for _key, clauses, fold in batch:
-            scoped = clauses + (() if fold is None else (
-                f'(case-fold "$x" {_atom_source(fold)})',
-            ))
-            queries.append(
-                "!(conditional-case-mass "
-                f"{space} ({' '.join(scoped)}) {_atom_source(target)})"
-            )
+        queries = [
+            "!(conditional-case-table "
+            f"{space} {key} ({' '.join(clauses)}) {fold_source} "
+            f"{_atom_source(target)})"
+            for key, clauses in batch
+        ]
         raw = petta.process_metta_string(" ".join(queries))
         values = list(raw if isinstance(raw, (list, tuple)) else [raw])
         if len(values) != len(batch):
             raise ValueError("PeTTa returned an incomplete conditional mass table")
-        for (key, _clauses, fold), value in zip(batch, values):
+        for value in values:
             text = str(value)
             parsed = _forms(text)
-            if len(parsed) != 1 or _find(parsed, "Mass") is None:
+            table = parsed[0] if len(parsed) == 1 else None
+            if (not isinstance(table, list)
+                    or len(table) != len(folds) + 1
+                    or any(not isinstance(cell, list) or not cell
+                           or cell[0] != "Cell"
+                           or _find(cell, "Mass") is None
+                           for cell in table)):
                 raise ValueError("PeTTa returned an invalid conditional mass")
-            scope = "AllFolds" if fold is None else _atom_source(fold)
-            rows.append(f"(Cell {key} {scope} {text})")
-    return f"({' '.join(rows)})"
+            tables.append(text)
+    return f"({' '.join(tables)})"
 
 
 def _tokens(text: str) -> list[str]:
@@ -384,34 +388,29 @@ def mine_petta_conditional_patterns(
             f"PeTTa generated {generated_candidates} candidates; limit is "
             f"{config.max_generated_candidates}"
         )
-    scopes = (None, *fold_values)
     population_table = _mass_table(
-        petta, space, positive, (
-            ("Population", (), fold) for fold in scopes
-        ),
+        petta, space, positive, tuple(fold_values), (("Population", ()),),
     )
     semantic_table = _mass_table(
-        petta, space, positive, (
+        petta, space, positive, tuple(fold_values), (
             (
                 f"(Semantic {seed_key})",
                 (f'({atom.predicate} "$x" {_atom_source(atom.value)})',),
-                fold,
             )
-            for seed_key, atom in seed_records for fold in scopes
+            for seed_key, atom in seed_records
         ),
     )
     context_table = _mass_table(
-        petta, space, positive, (
+        petta, space, positive, tuple(fold_values), (
             (
                 f"(Context {atom.predicate} {_atom_source(atom.value)})",
                 (f'({atom.predicate} "$x" {_atom_source(atom.value)})',),
-                fold,
             )
-            for atom in context_atoms for fold in scopes
+            for atom in context_atoms
         ),
     )
     candidate_table = _mass_table(
-        petta, space, positive, (
+        petta, space, positive, tuple(fold_values), (
             (
                 f"(Candidate {seed_key} {context.predicate} "
                 f"{_atom_source(context.value)})",
@@ -421,11 +420,9 @@ def mine_petta_conditional_patterns(
                     f'({context.predicate} "$x" '
                     f'{_atom_source(context.value)})',
                 ),
-                fold,
             )
             for seed_key, semantic in seed_records
             for context in context_atoms
-            for fold in scopes
         ),
     )
     source = (
