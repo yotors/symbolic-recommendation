@@ -18,17 +18,17 @@ class ChampionLLMTest(unittest.TestCase):
         })
         cls.addClassCleanup(cls.lab.close)
 
-    def test_fixed_profile_uses_conditional_llm_seed_mining(self):
+    def test_fixed_profile_uses_petta_conditional_mining(self):
         self.assertEqual(
             self.lab.config["pair_feature_profile"],
             "llm_conditional_quantile",
         )
         search=self.lab.last_pair_mining["target_search"]
-        self.assertEqual(search["kind"],"conditional_llm_seed_only")
+        self.assertEqual(search["kind"],"petta_conditional_seed_only")
         self.assertTrue(search["requires_real_fpminer_seed"])
         self.assertTrue(all(
             rule["source"].endswith((
-                "miner/fpMiner.metta","mining/conditional_llm_mining.py"
+                "miner/fpMiner.metta","miner/conditionalMiner.metta"
             ))
             for rule in self.lab.pair_rules
         ))

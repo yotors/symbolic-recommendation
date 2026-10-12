@@ -1829,8 +1829,8 @@ def make_benchmark_mixin(
                 def architecture_summary(run,profile):
                     run_config=run["config"]
                     engine=(
-                        "fpMiner LLM discovery seeds + stable conditional "
-                        "children -> PeTTaChainer"
+                        "PeTTa fpMiner seeds + PeTTa conditional expansion "
+                        "-> PeTTaChainer"
                     )
                     return {
                         "profile":profile,"run_id":run["id"],"auc":run["auc"],

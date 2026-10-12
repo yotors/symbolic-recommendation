@@ -45,7 +45,8 @@ _ATTEMPT_ORIGINS = frozenset({"pre_run", "backfill"})
 _REGISTRY_DIRECTORY = GATE_CLAIM_DIR
 
 _AUDITED_SOURCE_PATHS = (
-    "recommendation/mining/conditional_llm_mining.py",
+    "recommendation/mining/conditional_model.py",
+    "recommendation/mining/petta_conditional_mining.py",
     "recommendation/core/ctv_calibration.py",
     "recommendation/integrations/engine.py",
     "recommendation/app/server.py",
@@ -61,6 +62,7 @@ _AUDITED_SOURCE_PATHS = (
     "recommendation/evaluation/training_gate.py",
     "recommendation/paths.py",
     "recommendation/miner/fpMiner.metta",
+    "recommendation/miner/conditionalMiner.metta",
     "PeTTa/python/petta/__init__.py",
     "PeTTaChainer/pettachainer/pettachainer.py",
     "PeTTaChainer/pettachainer/metta/petta_chainer.metta",

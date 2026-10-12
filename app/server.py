@@ -446,7 +446,7 @@ class Lab(
         ) if self._candidate_feature_workers>1 else None)
         self.config = {
             # Fixed champion architecture (MIND-small development AUC 0.6891).
-            "miner_strategy":"conditional_llm_seed_only",
+            "miner_strategy":"petta_conditional_seed_only",
             "aggregation":"weighted",
             "rule_rank":"quality",
             "feature_profile":"accuracy_detail",
@@ -552,6 +552,7 @@ class Lab(
             self.petta=PeTTa()
             self.petta.load_metta_file(str(base/"helpers.metta"))
             self.petta.load_metta_file(str(base/"fpMiner.metta"))
+            self.petta.load_metta_file(str(base/"conditionalMiner.metta"))
             self._mining_workspaces=PeTTaWorkspaceCache(
                 self.petta,namespace=self.instance_id,batch_size=1000,
                 lock=MINER_LOCK,
@@ -1359,7 +1360,7 @@ class Lab(
     def configure(self,values):
         """Apply bounded parameters without changing the champion architecture."""
         fixed={
-            "miner_strategy":"conditional_llm_seed_only",
+            "miner_strategy":"petta_conditional_seed_only",
             "aggregation":"weighted",
             "rule_rank":"quality",
             "feature_profile":"accuracy_detail",

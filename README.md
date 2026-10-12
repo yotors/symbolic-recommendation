@@ -1,15 +1,15 @@
 # Symbolic Recommendation Lab
 
-Live recommendation prototype using a real MeTTa fpMiner for behavioral-rule
-discovery and PeTTaChainer for grounded point and pair proofs. Python owns data
-loading, bounded workspace construction, orchestration, metrics, and HTTP; it
-does not provide a fallback recommender.
+Live recommendation prototype using MeTTa fpMiner and conditional mining for
+behavioral-rule discovery, then PeTTaChainer for grounded point and pair proofs.
+Python owns data loading, bounded workspace construction, orchestration,
+metrics, and HTTP; it does not provide a fallback recommender.
 
 ## Active flow
 
 1. Load MIND or a prepared dataset-agnostic causal replay.
 2. Build pre-outcome candidate facts from article content and user history.
-3. Mine supported target-aware structures from closed training cases.
+3. Mine supported target-aware structures in PeTTa from closed training cases.
 4. Recount retained structures on the full training population and encode CTVs.
 5. Ground candidate and candidate-pair facts in isolated PeTTaChainer channels.
 6. Rank from proof-derived point evidence and a balanced pair tournament.

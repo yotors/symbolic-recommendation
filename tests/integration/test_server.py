@@ -41,7 +41,7 @@ class ChampionServerTest(unittest.TestCase):
         self.assertEqual(result["cases"],2)
         self.assertIsNotNone(result["auc"])
         self.assertEqual(
-            result["config"]["miner_strategy"],"conditional_llm_seed_only"
+            result["config"]["miner_strategy"],"petta_conditional_seed_only"
         )
         self.assertEqual(
             result["config"]["pair_feature_profile"],

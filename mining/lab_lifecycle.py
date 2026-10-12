@@ -19,9 +19,10 @@ from ..core.ctv_calibration import (
 )
 from ..core.symbolic import QuantileNumericEvidence
 from ..features.llm_workspace import LLM_NUMERIC_FEATURES
-from .conditional_llm_mining import (
-    ConditionalMiningConfig, FpMinerUnary, mine_conditional_llm_patterns,
+from .conditional_model import (
+    ConditionalMiningConfig, FpMinerUnary,
 )
+from .petta_conditional_mining import mine_petta_conditional_patterns
 from .retention import retain_complete_units
 from .rule_parser import (
     POSITIVE, parse_rules,
@@ -765,29 +766,54 @@ def make_model_lifecycle_mixin(
                 # Search the complete population with equal impression mass.
                 # fpMiner's real unary rules are mandatory provenance seeds;
                 # conditional children must improve them in stable time folds.
-                conditional_result=mine_conditional_llm_patterns(
-                    ({feature:case["attrs"][feature]
-                      for feature in (*semantic,*context)
-                      if feature in case["attrs"]
-                      and str(case["attrs"][feature]).lower() not in {
-                          "unknown","incomparable","left_known","right_known"
-                      }}
-                     for case in bounded_population),
-                    (case["positive"] for case in bounded_population),
-                    weights=(case["search_weight"] for case in bounded_population),
-                    folds=(case["temporal_fold"] for case in bounded_population),
+                predicate_lineages={
+                    feature:"+".join(sorted(
+                        self._pair_evidence_lineage(((feature,"value"),))
+                    ))
+                    for feature in (*semantic,*context)
+                }
+                conditional_cases={}
+                for case in bounded_population:
+                    facts=[]
+                    for feature in (*semantic,*context):
+                        value=case["attrs"].get(feature)
+                        if (value is None or str(value).lower() in {
+                                "unknown","incomparable",
+                                "left_known","right_known"}):
+                            continue
+                        facts.append(
+                            f'({feature} {case["case_id"]} '
+                            f'{json.dumps(value)})'
+                        )
+                    outcome="click" if case["positive"] else "skip"
+                    facts.extend((
+                        f'(engagement {case["case_id"]} {json.dumps(outcome)})',
+                        f'(case-weight {case["case_id"]} '
+                        f'{float(case["search_weight"]):.17g})',
+                        f'(case-fold {case["case_id"]} '
+                        f'{json.dumps(case["temporal_fold"])})',
+                    ))
+                    conditional_cases[case["case_id"]]=tuple(facts)
+                conditional_plan=self._mining_workspace_plan(
+                    "pair_conditional",(*semantic,*context),2,
+                    "full_population_equal_impression",
+                )
+                conditional_workspace=self._mining_workspaces.sync(
+                    conditional_plan,conditional_cases
+                )
+                workspace_plans.add(conditional_plan)
+                workspace_sync.append(conditional_workspace.as_dict())
+                conditional_result=mine_petta_conditional_patterns(
+                    self.petta,conditional_workspace.space,
+                    row_count=len(bounded_population),
                     fpminer_unaries=semantic_seeds,positive_target="click",
-                    semantic_predicates=semantic,context_predicates=context,
-                    predicate_lineages={
-                        feature:"+".join(sorted(
-                            self._pair_evidence_lineage(((feature,"value"),))
-                        ))
-                        for feature in (*semantic,*context)
-                    },
+                    context_predicates=context,
+                    predicate_lineages=predicate_lineages,
+                    folds=(case["temporal_fold"] for case in bounded_population),
                     config=ConditionalMiningConfig(
                         min_support=target_min_support,
                         fold_min_support=max(1.0,target_min_support/3.0),
-                        max_depth=max(2,int(self.config["pair_conjunctions"])-1),
+                        max_depth=2,
                         top_k=max(256,int(self.config["pair_max_rules"])*24),
                         min_usable_folds=2,
                         min_effect=float(self.config["pair_min_effect"]),
@@ -833,11 +859,11 @@ def make_model_lifecycle_mixin(
                             for fold in pattern.fold_statistics
                         ],
                         "source":
-                            "recommendation/mining/conditional_llm_mining.py",
+                            "recommendation/miner/conditionalMiner.metta",
                     })
                     existing.add(key)
                 target_search={
-                    "kind":"conditional_llm_seed_only",
+                    "kind":"petta_conditional_seed_only",
                     "requires_real_fpminer_seed":True,
                     "semantic_predicates":list(semantic),
                     "context_predicates":list(context),
@@ -851,7 +877,7 @@ def make_model_lifecycle_mixin(
                 }
             else:
                 target_search={
-                    "kind":"conditional_llm_seed_only",
+                    "kind":"petta_conditional_seed_only",
                     "requires_real_fpminer_seed":True,
                     "semantic_predicates":list(semantic),
                     "context_predicates":list(context),
@@ -886,7 +912,7 @@ def make_model_lifecycle_mixin(
                 "discovery_only_seed_count":len(removed),
                 "candidate_conditional_children":sum(
                     rule.get("source","").endswith(
-                        "conditional_llm_mining.py"
+                        "conditionalMiner.metta"
                     ) for rule in rules
                 ),
                 "backoff_policy":"non-LLM mined rules remain active",
@@ -1209,7 +1235,7 @@ def make_model_lifecycle_mixin(
                 compiled_children=[
                     rule for rule in selected
                     if rule.get("source","").endswith(
-                        "conditional_llm_mining.py")
+                        "conditionalMiner.metta")
                 ]
                 target_search.update({
                     "compiled_conditional_children":len(compiled_children),
@@ -1457,7 +1483,7 @@ def make_model_lifecycle_mixin(
                         "one total mass per impression with Kish effective support"
                     ),
                 },
-                "miner_strategy":"conditional_llm_seed_only",
+                "miner_strategy":"petta_conditional_seed_only",
                 "ctv_evidence_k":float(self.config["ctv_evidence_k"]),
                 "pair_ctv_mode":self.config["pair_ctv_mode"],
                 "petta_ctv_evidence_k":CTV_EVIDENCE_K_DEFAULT,
@@ -2312,7 +2338,7 @@ def make_model_lifecycle_mixin(
                         "host_applicability":"exact categorical premise join",
                         "reasoner_role":"two-hop channel proof and inferred STV",
                     },
-                    "miner_calls":len(plan),"miner_strategy":"conditional_llm_seed_only",
+                    "miner_calls":len(plan),"miner_strategy":"petta_conditional_seed_only",
                     "fpminer_query_calls":sum(
                         item["miner_calls"] for item in fpminer_incremental
                     ),
