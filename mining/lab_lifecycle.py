@@ -772,30 +772,27 @@ def make_model_lifecycle_mixin(
                     ))
                     for feature in (*semantic,*context)
                 }
+                conditional_features=tuple(sorted(set((*semantic,*context))))
                 conditional_cases={}
                 for case in bounded_population:
-                    facts=[]
-                    for feature in (*semantic,*context):
+                    values=[]
+                    for feature in conditional_features:
                         value=case["attrs"].get(feature)
                         if (value is None or str(value).lower() in {
                                 "unknown","incomparable",
                                 "left_known","right_known"}):
-                            continue
-                        facts.append(
-                            f'({feature} {case["case_id"]} '
-                            f'{json.dumps(value)})'
-                        )
+                            values.append("ConditionalMissing")
+                        else:
+                            values.append(json.dumps(value))
                     outcome="click" if case["positive"] else "skip"
-                    facts.extend((
-                        f'(engagement {case["case_id"]} {json.dumps(outcome)})',
-                        f'(case-weight {case["case_id"]} '
-                        f'{float(case["search_weight"]):.17g})',
-                        f'(case-fold {case["case_id"]} '
-                        f'{json.dumps(case["temporal_fold"])})',
-                    ))
-                    conditional_cases[case["case_id"]]=tuple(facts)
+                    conditional_cases[case["case_id"]]=(f'(conditional-case '
+                        f'{case["case_id"]} '
+                        f'{json.dumps(case["temporal_fold"])} '
+                        f'{json.dumps(outcome)} '
+                        f'{float(case["search_weight"]):.17g} '
+                        f'{" ".join(values)})',)
                 conditional_plan=self._mining_workspace_plan(
-                    "pair_conditional",(*semantic,*context),2,
+                    "pair_conditional",conditional_features,2,
                     "full_population_equal_impression",
                 )
                 conditional_workspace=self._mining_workspaces.sync(
@@ -807,6 +804,7 @@ def make_model_lifecycle_mixin(
                     self.petta,conditional_workspace.space,
                     row_count=len(bounded_population),
                     fpminer_unaries=semantic_seeds,positive_target="click",
+                    feature_order=conditional_features,
                     context_predicates=context,
                     predicate_lineages=predicate_lineages,
                     folds=(case["temporal_fold"] for case in bounded_population),

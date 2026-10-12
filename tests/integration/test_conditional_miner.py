@@ -44,11 +44,8 @@ class ConditionalMinerIntegrationTest(unittest.TestCase):
             ):
                 case = f"case_{fold}_{suffix}"
                 for fact in (
-                    f'(semantic {case} "{semantic}")',
-                    f'(context {case} "{context}")',
-                    f'(engagement {case} "{outcome}")',
-                    f'(case-weight {case} 1.0)',
-                    f'(case-fold {case} {fold})',
+                    f'(conditional-case {case} {fold} "{outcome}" 1.0 '
+                    f'"{context}" "{semantic}")',
                 ):
                     self.petta.process_metta_string(
                         f"!(add-atom {self.space} {fact})"
@@ -66,6 +63,7 @@ class ConditionalMinerIntegrationTest(unittest.TestCase):
                 source="recommendation/miner/fpMiner.metta",
             ),),
             positive_target="click",
+            feature_order=("context", "semantic"),
             context_predicates=("context",),
             predicate_lineages={"semantic": "semantic", "context": "context"},
             folds=(0, 1, 2),

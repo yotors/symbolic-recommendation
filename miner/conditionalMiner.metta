@@ -1,11 +1,6 @@
 ;; Target-aware expansion of fpMiner seeds.
-;; The host submits PeTTa-computed sufficient statistics; all rule selection
-;; and scoring below remain in PeTTa.
-
-(= (conditional-conjunction $clauses)
-   (if (== (size-atom $clauses) 1)
-       (car-atom $clauses)
-       (cons-atom , $clauses)))
+;; Compact case rows are only the retrieval index. PeTTa computes the
+;; sufficient statistics, temporal stability, rule selection, and scores.
 
 (= (conditional-observation-step
       (ObservationMass $scope $target $positive $negative
@@ -38,24 +33,27 @@
          (conditional-observation-mass $observations $fold $target))
        (conditional-fold-cells $tail $observations $key $target))))
 
-(= (conditional-case-table $db $key $clauses $folds $target)
-   (let $joined
-        (conditional-conjunction
-          (append $clauses
-            ((case-fold "$x" "$fold")
-             (engagement "$x" "$outcome")
-             (case-weight "$x" "$weight"))))
-     (let (Query $pattern (Observation $fold $outcome $weight))
-          (promote-placeholders
-            (Query $joined (Observation "$fold" "$outcome" "$weight"))
-            ("$x" "$fold" "$outcome" "$weight"))
-       (let $observations
-            (collapse
-              (match $db $pattern (Observation $fold $outcome $weight)))
-         (cons-atom
-           (Cell $key AllFolds
-             (conditional-observation-mass $observations AllFolds $target))
-           (conditional-fold-cells $folds $observations $key $target))))))
+(= (conditional-column-values $db $pattern $placeholders)
+   (let (Query $query $value)
+        (promote-placeholders (Query $pattern "$value") $placeholders)
+     (let $values (unique-atom (collapse (match $db $query $value)))
+       (collapse
+         (let $candidate (superpose $values)
+           (if (== $candidate ConditionalMissing)
+               (empty)
+               $candidate))))))
+
+(= (conditional-case-table
+      $db $key $row-pattern $placeholders $folds $target)
+   (let (Query $pattern $observation)
+        (promote-placeholders
+          (Query $row-pattern (Observation "$fold" "$outcome" "$weight"))
+          $placeholders)
+     (let $observations (collapse (match $db $pattern $observation))
+       (cons-atom
+         (Cell $key AllFolds
+           (conditional-observation-mass $observations AllFolds $target))
+         (conditional-fold-cells $folds $observations $key $target)))))
 
 (= (conditional-merge-tables ()) ())
 (= (conditional-merge-tables $tables)

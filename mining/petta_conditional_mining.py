@@ -53,12 +53,69 @@ def _atom_source(value: object) -> str:
     raise TypeError("MeTTa atom values must be JSON scalars")
 
 
+def _row_query(
+    feature_order: tuple[str, ...],
+    required: Iterable[Atom],
+    *,
+    projected_feature: str | None = None,
+) -> tuple[str, str]:
+    """Build one fixed-schema case pattern and its promoted placeholders."""
+
+    values: dict[str, object] = {}
+    for atom in required:
+        if atom.predicate in values and values[atom.predicate] != atom.value:
+            raise ValueError("a row query cannot require conflicting values")
+        values[atom.predicate] = atom.value
+    fields: list[str] = []
+    placeholders = ["$x", "$fold", "$outcome", "$weight"]
+    for index, predicate in enumerate(feature_order):
+        if predicate == projected_feature:
+            name = "$value"
+            fields.append(json.dumps(name))
+            placeholders.append(name)
+        elif predicate in values:
+            fields.append(_atom_source(values[predicate]))
+        else:
+            name = f"$feature_{index}"
+            fields.append(json.dumps(name))
+            placeholders.append(name)
+    pattern = (
+        '(conditional-case "$x" "$fold" "$outcome" "$weight" '
+        f"{' '.join(fields)})"
+    )
+    names = f"({' '.join(json.dumps(name) for name in placeholders)})"
+    return pattern, names
+
+
+def _column_values(
+    petta: _PeTTaRuntime,
+    space: str,
+    feature_order: tuple[str, ...],
+    predicate: str,
+) -> tuple[object, ...]:
+    pattern, placeholders = _row_query(
+        feature_order, (), projected_feature=predicate
+    )
+    raw = petta.process_metta_string(
+        f"!(conditional-column-values {space} {pattern} {placeholders})"
+    )
+    text = " ".join(map(
+        str, raw if isinstance(raw, (list, tuple)) else [raw]
+    ))
+    parsed = _forms(text)
+    values = parsed[0] if len(parsed) == 1 else None
+    if not isinstance(values, list):
+        raise ValueError("PeTTa returned an invalid conditional column")
+    return tuple(values)
+
+
 def _mass_table(
     petta: _PeTTaRuntime,
     space: str,
     target: object,
     folds: tuple[object, ...],
-    cells: Iterable[tuple[str, tuple[str, ...]]],
+    feature_order: tuple[str, ...],
+    cells: Iterable[tuple[str, tuple[Atom, ...]]],
 ) -> str:
     """Batch one PeTTa observation scan per key; PeTTa computes fold masses."""
 
@@ -67,12 +124,14 @@ def _mass_table(
     fold_source = f"({' '.join(_atom_source(fold) for fold in folds)})"
     for offset in range(0, len(pending), 128):
         batch = pending[offset:offset + 128]
-        queries = [
-            "!(conditional-case-table "
-            f"{space} {key} ({' '.join(clauses)}) {fold_source} "
-            f"{_atom_source(target)})"
-            for key, clauses in batch
-        ]
+        queries = []
+        for key, requirements in batch:
+            pattern, placeholders = _row_query(feature_order, requirements)
+            queries.append(
+                "!(conditional-case-table "
+                f"{space} {key} {pattern} {placeholders} {fold_source} "
+                f"{_atom_source(target)})"
+            )
         raw = petta.process_metta_string(" ".join(queries))
         values = list(raw if isinstance(raw, (list, tuple)) else [raw])
         if len(values) != len(batch):
@@ -289,6 +348,7 @@ def mine_petta_conditional_patterns(
     row_count: int,
     fpminer_unaries: Iterable[FpMinerUnary],
     positive_target: object,
+    feature_order: Iterable[str],
     context_predicates: Iterable[str],
     predicate_lineages: Mapping[str, str],
     folds: Iterable[object],
@@ -351,6 +411,15 @@ def mine_petta_conditional_patterns(
         context_forms.append(
             f'(Context {predicate} {_atom_source(lineage)})'
         )
+    row_features = tuple(feature_order)
+    if (len(set(row_features)) != len(row_features)
+            or any(not isinstance(predicate, str)
+                   or not _SYMBOL.fullmatch(predicate)
+                   for predicate in row_features)):
+        raise ValueError("feature_order must contain unique safe predicates")
+    required_features = {atom.predicate for atom in grouped} | set(context_names)
+    if not required_features <= set(row_features):
+        raise ValueError("feature_order omits a seed or context predicate")
     fold_values = sorted(
         {Atom("fold", value).value for value in folds},
         key=lambda value: Atom("fold", value).sort_key,
@@ -358,17 +427,10 @@ def mine_petta_conditional_patterns(
     if len(fold_values) < config.min_usable_folds:
         raise ValueError("insufficient distinct folds")
 
-    raw_atoms = petta.process_metta_string(f"!(collapse (absSpeCan {space} 1))")
-    atom_text = " ".join(map(
-        str, raw_atoms if isinstance(raw_atoms, (list, tuple)) else [raw_atoms]
-    ))
-    atom_forms = _forms(atom_text)
-    candidates = atom_forms[0] if len(atom_forms) == 1 else []
     context_atoms = tuple(sorted({
-        Atom(str(item[0]), item[2])
-        for item in candidates
-        if isinstance(item, list) and len(item) == 3
-        and item[0] in context_names
+        Atom(predicate, value)
+        for predicate in context_names
+        for value in _column_values(petta, space, row_features, predicate)
     }, key=lambda item: item.sort_key))
     value_counts = {
         predicate: sum(atom.predicate == predicate for atom in context_atoms)
@@ -389,37 +451,33 @@ def mine_petta_conditional_patterns(
             f"{config.max_generated_candidates}"
         )
     population_table = _mass_table(
-        petta, space, positive, tuple(fold_values), (("Population", ()),),
+        petta, space, positive, tuple(fold_values), row_features,
+        (("Population", ()),),
     )
     semantic_table = _mass_table(
-        petta, space, positive, tuple(fold_values), (
+        petta, space, positive, tuple(fold_values), row_features, (
             (
                 f"(Semantic {seed_key})",
-                (f'({atom.predicate} "$x" {_atom_source(atom.value)})',),
+                (atom,),
             )
             for seed_key, atom in seed_records
         ),
     )
     context_table = _mass_table(
-        petta, space, positive, tuple(fold_values), (
+        petta, space, positive, tuple(fold_values), row_features, (
             (
                 f"(Context {atom.predicate} {_atom_source(atom.value)})",
-                (f'({atom.predicate} "$x" {_atom_source(atom.value)})',),
+                (atom,),
             )
             for atom in context_atoms
         ),
     )
     candidate_table = _mass_table(
-        petta, space, positive, tuple(fold_values), (
+        petta, space, positive, tuple(fold_values), row_features, (
             (
                 f"(Candidate {seed_key} {context.predicate} "
                 f"{_atom_source(context.value)})",
-                (
-                    f'({semantic.predicate} "$x" '
-                    f'{_atom_source(semantic.value)})',
-                    f'({context.predicate} "$x" '
-                    f'{_atom_source(context.value)})',
-                ),
+                (semantic, context),
             )
             for seed_key, semantic in seed_records
             for context in context_atoms
