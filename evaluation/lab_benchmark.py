@@ -1828,21 +1828,10 @@ def make_benchmark_mixin(
 
                 def architecture_summary(run,profile):
                     run_config=run["config"]
-                    engine={
-                        "fixed_combinations":"fpMiner -> PeTTaChainer",
-                        "target_aware":
-                            "fpMiner unary + target-aware expansion -> PeTTaChainer",
-                        "conditional_llm":
-                            "fpMiner LLM unary + stable conditional expansion -> PeTTaChainer",
-                        "conditional_llm_seed_only":
-                            "fpMiner LLM discovery seeds + stable conditional children -> PeTTaChainer",
-                        "petta_conditional_seed_only":
-                            "PeTTa target-aware fpMiner + PeTTaChainer",
-                        "petta_mdl_seed_only":
-                            "PeTTa MDL-selected target rules + PeTTaChainer",
-                        "petta_hierarchical_seed_only":
-                            "PeTTa hierarchical target rules + PeTTaChainer",
-                    }[run_config["miner_strategy"]]
+                    engine=(
+                        "fpMiner LLM discovery seeds + stable conditional "
+                        "children -> PeTTaChainer"
+                    )
                     return {
                         "profile":profile,"run_id":run["id"],"auc":run["auc"],
                         "pair_margin_power":run_config["pair_margin_power"],

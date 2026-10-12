@@ -142,8 +142,7 @@ def _typed_value_key(value: AtomicValue) -> tuple[str, str]:
 
 
 def _fold_key(value: AtomicValue) -> tuple[str, str]:
-    # Reuse Atom's public typed ordering without depending on target_miner's
-    # private helpers.
+    # Keep typed categorical values distinct and deterministically ordered.
     return _typed_value_key(Atom("fold", value).value)
 
 

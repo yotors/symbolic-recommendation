@@ -18,9 +18,8 @@ support pruning cannot remove a conjunction which survives the final target
 support filter.  Retaining all support-one conjunctions lets callers change
 the threshold later without losing a previously hidden pattern.
 
-Only discovery/support accumulation is incremental here.  A caller may still
-perform full-population calibration, validation, or a separate target-aware
-search after this component returns.
+Only discovery/support accumulation is incremental here. A caller may still
+perform full-population calibration or validation after this component returns.
 """
 
 from __future__ import annotations

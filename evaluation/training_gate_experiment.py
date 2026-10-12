@@ -57,7 +57,6 @@ _AUDITED_SOURCE_PATHS = (
     "recommendation/features/semantic_workspace.py",
     "recommendation/core/symbolic.py",
     "recommendation/pipelines/symbolic_data.py",
-    "recommendation/mining/target_miner.py",
     "recommendation/features/text_embeddings.py",
     "recommendation/evaluation/training_gate.py",
     "recommendation/paths.py",
