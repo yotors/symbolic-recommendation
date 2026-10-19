@@ -193,16 +193,12 @@
            0.0
            (// $count (+ $count $evidence-k)))))
 
-;; Convert the validated contingency (nAY, nA, N, nY) into PeTTa's two
-;; conditional branches.  These discovery values are audit evidence only;
-;; The application recalibrates every retained structure on the full causal population.
-(= (recommendation-ctv-with-support
-      $pattern $db $joint-support $target-value $evidence-k)
-   (let* (($antecedent-support
-              (counter $db (recommendation-antecedent $pattern)))
-          ($case-count (recommendation-case-count $db))
-          ($target-support (recommendation-target-support $db $target-value))
-          ($outside-support (- $case-count $antecedent-support))
+;; Build PeTTa's positive and complement branches from one exact contingency.
+;; Keeping this operation in MeTTa makes the same count semantics available to
+;; discovery, complete-population calibration and future delta updates.
+(= (recommendation-ctv-from-counts
+      $joint-support $antecedent-support $case-count $target-support $evidence-k)
+   (let* (($outside-support (- $case-count $antecedent-support))
           ($outside-target (- $target-support $joint-support))
           ($valid
              (and (>= $joint-support 0)
@@ -225,6 +221,92 @@
                  (// $outside-target $outside-support))
              (recommendation-count-confidence $outside-support $evidence-k)))
          (empty))))
+
+;; Convert the validated contingency (nAY, nA, N, nY) into PeTTa's two
+;; conditional branches.  These discovery values are audit evidence only;
+;; complete-population calibration replaces them before rule compilation.
+(= (recommendation-ctv-with-support
+      $pattern $db $joint-support $target-value $evidence-k)
+   (let* (($antecedent-support
+              (counter $db (recommendation-antecedent $pattern)))
+          ($case-count (recommendation-case-count $db))
+          ($target-support (recommendation-target-support $db $target-value)))
+     (recommendation-ctv-from-counts
+       $joint-support $antecedent-support $case-count $target-support $evidence-k)))
+
+;; Render one calibrated rule from sufficient statistics.  Both full and delta
+;; calibration terminate here, so their CTV and selection-quality semantics
+;; cannot drift apart.
+(= (recommendation-calibration-from-counts
+      $rule-id $joint-support $antecedent-support $case-count
+      $target-support $specificity $evidence-k)
+   (let* (
+          ($base-rate (if (<= $case-count 0)
+                          0.0
+                          (// $target-support $case-count)))
+          ($strength (if (<= $antecedent-support 0)
+                         0.0
+                         (// $joint-support $antecedent-support)))
+          ($confidence
+             (recommendation-count-confidence $antecedent-support $evidence-k))
+          ($lift (if (<= $base-rate 0.0) 0.0 (// $strength $base-rate)))
+          ($quality
+             (* $confidence
+                (* (abs-math (- $strength $base-rate))
+                   (* (+ 1.0 (* 0.25 (- $specificity 1)))
+                      (log-math 2.718281828459045
+                                (+ 1 $antecedent-support))))))
+          ($CTV (recommendation-ctv-from-counts
+                  $joint-support $antecedent-support $case-count
+                  $target-support $evidence-k)))
+     (PointCalibration
+       $rule-id $CTV
+       (Counts $joint-support $antecedent-support $case-count $target-support)
+       (Metrics $base-rate $lift $specificity $quality))))
+
+;; Re-estimate one discovered rule over the complete retained population.
+(= (recommendation-calibrate-rule
+      $rule-id $pattern $db $target-value $evidence-k)
+   (let* (($joint-support (counter $db $pattern))
+          ($antecedent (recommendation-antecedent $pattern))
+          ($antecedent-support (counter $db $antecedent))
+          ($case-count (recommendation-case-count $db))
+          ($target-support (recommendation-target-support $db $target-value))
+          ($specificity
+             (size-atom
+               (let $clauses (if (== (car-atom $pattern) ,)
+                                 (cdr-atom $pattern)
+                                 ($pattern))
+                 (recommendation-remove-engagement $clauses)))))
+     (recommendation-calibration-from-counts
+       $rule-id $joint-support $antecedent-support $case-count
+       $target-support $specificity $evidence-k)))
+
+;; Add exact counts from an append-only population delta to a prior snapshot.
+;; The host supplies old counts as inert data; every update and derived numeric
+;; value is evaluated here in MeTTa.
+(= (recommendation-update-calibration
+      $rule-id $pattern $delta-db $target-value $evidence-k
+      $old-joint $old-antecedent $old-cases $old-target)
+   (let* (($delta-joint (counter $delta-db $pattern))
+          ($antecedent (recommendation-antecedent $pattern))
+          ($delta-antecedent (counter $delta-db $antecedent))
+          ($delta-cases (recommendation-case-count $delta-db))
+          ($delta-target
+             (recommendation-target-support $delta-db $target-value))
+          ($specificity
+             (size-atom
+               (let $clauses (if (== (car-atom $pattern) ,)
+                                 (cdr-atom $pattern)
+                                 ($pattern))
+                 (recommendation-remove-engagement $clauses)))))
+     (recommendation-calibration-from-counts
+       $rule-id
+       (+ $old-joint $delta-joint)
+       (+ $old-antecedent $delta-antecedent)
+       (+ $old-cases $delta-cases)
+       (+ $old-target $delta-target)
+       $specificity $evidence-k)))
 
 (= (sup-eval $db $pattern $minSup)
     (let $matches (collapse (match $db $pattern $pattern))

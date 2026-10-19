@@ -239,7 +239,7 @@ def _pair_candidate_source_features(predicates):
 
 MINER_LOCK = threading.RLock()
 MINING_WORKSPACE_SCHEMA_VERSION = 1
-MINING_WORKSPACE_MODE = "incremental_fpminer_support_full_population_ctv_estimation"
+MINING_WORKSPACE_MODE = "incremental_fpminer_support_petta_full_population_ctv"
 SERVING_MODEL_SCHEMA = "mindplex-symbolic-serving-model-v1"
 BACKGROUND_MINING_BUILD_MODE = (
     "incremental_fpminer_support_staged_snapshot"
@@ -562,6 +562,7 @@ class Lab(
                 lock=MINER_LOCK,
             )
         self._active_mining_workspace_plans=frozenset()
+        self._point_calibration_state=None
         self._staged_background_build=False
         self.engine=IsolatedPeTTaChainer()
         # This client is a separate, optional semantic-ingestion boundary.  It

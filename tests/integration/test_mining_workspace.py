@@ -1,14 +1,57 @@
 from __future__ import annotations
 
+import math
 import unittest
 
 from recommendation.app.server import Lab, fixture
 
 
 class MiningWorkspaceIntegrationTest(unittest.TestCase):
+    def assert_point_calibration_matches_oracle(self, lab):
+        population = [
+            (event, lab._bounded_features(lab.event_features(event)))
+            for event in lab.data["events"]
+        ]
+        target_total = sum(
+            event["action"] in {"click", "like", "complete"}
+            for event, _attrs in population
+        )
+        base_rate = target_total / len(population)
+        for rule in lab.mined_rules:
+            matching = [
+                event for event, attrs in population
+                if all(attrs.get(predicate) == value
+                       for predicate, value in rule["premises"])
+            ]
+            joint = sum(
+                event["action"] in {"click", "like", "complete"}
+                for event in matching
+            )
+            strength = joint / len(matching)
+            confidence = len(matching) / (
+                len(matching) + lab.config["ctv_evidence_k"]
+            )
+            expected_quality = (
+                confidence * abs(strength - base_rate)
+                * (1 + 0.25 * (len(rule["premises"]) - 1))
+                * math.log1p(len(matching))
+            )
+            self.assertEqual(rule["joint_support"], joint)
+            self.assertEqual(rule["antecedent_support"], len(matching))
+            self.assertAlmostEqual(rule["strength"], strength)
+            self.assertAlmostEqual(rule["confidence"], confidence)
+            outside = len(population) - len(matching)
+            self.assertAlmostEqual(
+                rule["negative_strength"],
+                (target_total - joint) / outside if outside else 0.0,
+            )
+            self.assertAlmostEqual(rule["quality"], expected_quality)
+
     def test_stable_case_ids_enable_reuse_and_append_only_sync(self):
         lab = Lab(data=fixture())
         try:
+            self.assert_point_calibration_matches_oracle(lab)
+
             initial_point_ids = [case_id for case_id, _event in lab._mining_event_cases()]
             sampled_pair_ids = {
                 case["case_id"] for case in lab._pair_training_cases(negative_ratio=1)
@@ -48,8 +91,19 @@ class MiningWorkspaceIntegrationTest(unittest.TestCase):
             )
             self.assertEqual(
                 appended["workspace_mode"],
-                "incremental_fpminer_support_full_population_ctv_estimation",
+                "incremental_fpminer_support_petta_full_population_ctv",
             )
+            self.assertEqual(
+                appended["full_population_calibration"]["executor"], "petta"
+            )
+            self.assertEqual(
+                appended["full_population_calibration"]["statistics_mode"],
+                "delta_updated",
+            )
+            self.assertEqual(
+                appended["full_population_calibration"]["appended_cases"], 1
+            )
+            self.assert_point_calibration_matches_oracle(lab)
             self.assertFalse(appended["full_structure_research"])
             self.assertEqual(
                 {item["mode"] for item in appended["fpminer_incremental"]},

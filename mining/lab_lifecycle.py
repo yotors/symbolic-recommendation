@@ -22,6 +22,7 @@ from ..features.llm_workspace import LLM_NUMERIC_FEATURES
 from .conditional_model import (
     ConditionalMiningConfig, FpMinerUnary,
 )
+from .petta_calibration import calibrate_point_rules, update_point_rules
 from .petta_conditional_mining import mine_petta_conditional_patterns
 from .retention import retain_complete_units
 from .rule_parser import (
@@ -2047,6 +2048,7 @@ def make_model_lifecycle_mixin(
                     "active_rule_ids":self._active_rule_ids,
                     "active_pair_rule_ids":self._active_pair_rule_ids,
                     "active_mining_workspace_plans":self._active_mining_workspace_plans,
+                    "point_calibration_state":self._point_calibration_state,
                     "last_pair_mining":self.last_pair_mining,
                     "click_base_rate":self._click_base_rate,
                     "tie_break_stats":self._tie_break_stats,
@@ -2068,6 +2070,9 @@ def make_model_lifecycle_mixin(
                     self._active_pair_rule_ids=snapshot["active_pair_rule_ids"]
                     self._active_mining_workspace_plans=snapshot[
                         "active_mining_workspace_plans"
+                    ]
+                    self._point_calibration_state=snapshot[
+                        "point_calibration_state"
                     ]
                     self.last_pair_mining=snapshot["last_pair_mining"]
                     self._click_base_rate=snapshot["click_base_rate"]
@@ -2141,39 +2146,121 @@ def make_model_lifecycle_mixin(
             if not rules: raise RuntimeError("MeTTa miner produced no usable rules")
             self.mined_output=[str(v) for v in raw]
             # Negative sampling is a search-time optimization only.  Re-estimate
-            # every mined rule on the complete event population before compiling
-            # its CTV, otherwise the sampled click prevalence would bias both the
-            # rule strength and PeTTaChainer ranking.
-            population_rows=[(event,self._bounded_features(self.event_features(event)))
-                             for _event_index,event in indexed_events]
-            n=len(population_rows)
-            target_total=sum(event["action"] in POSITIVE for event,_attrs in population_rows)
+            # every mined rule in MeTTa on a separate complete-population space;
+            # sampled prevalence must never enter its compiled CTV or quality.
+            population_cases={}
+            for event_index,event in indexed_events:
+                case=f"point_population_{event_index}"
+                attrs=self._bounded_features(self.event_features(event))
+                facts=[
+                    f'({predicate} {case} {json.dumps(attrs[predicate])})'
+                    for predicate in active_features if predicate in attrs
+                ]
+                outcome="click" if event["action"] in POSITIVE else "skip"
+                facts.append(f'(engagement {case} {json.dumps(outcome)})')
+                population_cases[case]=tuple(facts)
+            calibration_plan=self._mining_workspace_plan(
+                "point_calibration",tuple(active_features),1,
+                "complete_retained_population",
+            )
+            calibration_sync=self._mining_workspaces.sync(
+                calibration_plan,population_cases
+            )
+            workspace_plans.add(calibration_plan)
+            workspace_sync.append(calibration_sync.as_dict())
+            evidence_k=float(self.config["ctv_evidence_k"])
+            population_hashes={
+                case:hashlib.sha256(json.dumps(
+                    facts,ensure_ascii=False,separators=(",",":"),
+                ).encode("utf-8")).hexdigest()
+                for case,facts in population_cases.items()
+            }
+            previous_calibration=self._point_calibration_state
+            previous_hashes=(previous_calibration or {}).get("case_hashes",{})
+            previous_rules=(previous_calibration or {}).get("rules",{})
+            reusable=(
+                previous_calibration is not None
+                and previous_calibration.get("evidence_k")==evidence_k
+                and set(previous_hashes)<=set(population_hashes)
+                and all(population_hashes[case]==fingerprint
+                        for case,fingerprint in previous_hashes.items())
+            )
+            appended_cases={
+                case:population_cases[case]
+                for case in population_hashes.keys()-previous_hashes.keys()
+            } if reusable else {}
+            current_keys={
+                (tuple(rule["premises"]),rule["target"]):rule for rule in rules
+            }
+            existing_rules=[
+                rule for key,rule in current_keys.items() if key in previous_rules
+            ] if reusable else []
+            new_rules=[
+                rule for key,rule in current_keys.items() if key not in previous_rules
+            ] if reusable else list(rules)
+            calibrated={}; calibration_queries=0
+            delta_sync=None
+            if existing_rules and appended_cases:
+                delta_plan=self._mining_workspace_plan(
+                    "point_calibration_delta",tuple(active_features),1,
+                    "new_complete_cases",
+                )
+                delta_sync=self._mining_workspaces.sync(delta_plan,appended_cases)
+                workspace_plans.add(delta_plan)
+                prior_by_id={
+                    rule["id"]:previous_rules[
+                        (tuple(rule["premises"]),rule["target"])
+                    ].for_rule(rule["id"])
+                    for rule in existing_rules
+                }
+                updated,queries=update_point_rules(
+                    self.petta,delta_space=delta_sync.space,
+                    rules=existing_rules,previous=prior_by_id,
+                    evidence_k=evidence_k,
+                )
+                calibrated.update(updated); calibration_queries+=queries
+            elif existing_rules:
+                calibrated.update({
+                    rule["id"]:previous_rules[
+                        (tuple(rule["premises"]),rule["target"])
+                    ].for_rule(rule["id"])
+                    for rule in existing_rules
+                })
+            if new_rules:
+                newly_calibrated,queries=calibrate_point_rules(
+                    self.petta,space=calibration_sync.space,rules=new_rules,
+                    evidence_k=evidence_k,
+                )
+                calibrated.update(newly_calibrated); calibration_queries+=queries
+            calibration_mode=(
+                "full" if not reusable else
+                "delta_updated" if appended_cases else "reused"
+            )
+            staged_calibration_state={
+                "case_hashes":population_hashes,
+                "evidence_k":evidence_k,
+                "rules":{
+                    key:calibrated[rule["id"]]
+                    for key,rule in current_keys.items()
+                },
+            }
+            population_result=calibrated[rules[0]["id"]]
+            n=population_result.population_size
+            target_total=population_result.target_support
+            if n!=len(indexed_events):
+                raise RuntimeError(
+                    "MeTTa calibration population disagrees with retained cases"
+                )
             sample_target_total=sum(event["action"] in POSITIVE for event in training_events)
-            base_rate=target_total/n if n else 0.0
+            base_rate=population_result.base_rate
             for rule in rules:
-                antecedent_total=joint=0
-                for event,attrs in population_rows:
-                    matches=all(attrs.get(p)==v for p,v in rule["premises"])
-                    antecedent_total+=matches; joint+=matches and event["action"] in POSITIVE
-                outside=n-antecedent_total; outside_joint=target_total-joint
-                strength=joint/antecedent_total if antecedent_total else 0.0
-                evidence_k=float(self.config["ctv_evidence_k"])
-                confidence=(antecedent_total/(antecedent_total+evidence_k)
-                            if antecedent_total else 0.0)
-                negative_strength=outside_joint/outside if outside else 0.0
-                negative_confidence=(outside/(outside+evidence_k)
-                                     if outside else 0.0)
-                specificity=len(rule["premises"]); mined_support=rule["support"]
-                rule.update(strength=strength,confidence=confidence,support=joint,
-                            mined_support=mined_support,
-                            negative_strength=negative_strength,negative_confidence=negative_confidence,
-                            antecedent_support=antecedent_total,joint_support=joint,
-                            lift=(strength/base_rate if base_rate else 0.0),specificity=specificity,
-                            # Both positive- and negative-lift click rules carry
-                            # ranking information.  Their posterior is later
-                            # shrunk toward this same empirical base rate.
-                            quality=confidence*abs(strength-base_rate)
-                                    *(1+0.25*(specificity-1))*math.log1p(antecedent_total))
+                mined_support=rule["support"]
+                result=calibrated[rule["id"]]
+                if result.population_size!=n or result.target_support!=target_total:
+                    raise RuntimeError(
+                        "MeTTa returned inconsistent calibration populations"
+                    )
+                rule.update(result.as_rule_update(),mined_support=mined_support)
             def rule_order(rule):
                 return (
                     -rule["quality"],-rule["specificity"],
@@ -2282,6 +2369,7 @@ def make_model_lifecycle_mixin(
             self._point_channel_sources=point_channel_sources
             self._active_rule_ids=point_compiled_ids; self.mined_rules=rules
             self._active_mining_workspace_plans=active_workspace_plans
+            self._point_calibration_state=staged_calibration_state
             self._click_base_rate=base_rate
             self._loaded_candidates.clear(); self._loaded_pairs.clear()
             self._loaded_point_channels.clear()
@@ -2350,6 +2438,22 @@ def make_model_lifecycle_mixin(
                         for item in fpminer_incremental
                     ),
                     "full_population_ctv_estimation":True,
+                    "full_population_calibration":{
+                        "executor":"petta",
+                        "workspace_mode":calibration_sync.mode,
+                        "statistics_mode":calibration_mode,
+                        "delta_workspace_mode":(
+                            delta_sync.mode if delta_sync is not None else None
+                        ),
+                        "appended_cases":len(appended_cases),
+                        "population_cases":n,
+                        "candidate_rules":len(calibrated),
+                        "delta_rules":(
+                            len(existing_rules) if appended_cases else 0
+                        ),
+                        "backfilled_rules":len(new_rules),
+                        "query_calls":calibration_queries,
+                    },
                     "ctv_evidence_k":float(self.config["ctv_evidence_k"]),
                     "fpminer_min_support":int(self.config["min_support"]),
                     "fpminer_support_unit":"raw_point_case",
