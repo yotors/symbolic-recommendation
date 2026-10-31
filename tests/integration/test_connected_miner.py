@@ -14,7 +14,8 @@ except (ImportError, OSError):
 
 SCHEMAS = (
     "((Viewer exposure user join) (Candidate exposure article join) "
-    "(InterestedIn user topic join) (HasTopic article topic join))"
+    "(InterestedIn user topic join) (HasTopic article topic join) "
+    "(Premium exposure level value))"
 )
 CONNECTED_PATTERN = re.compile(
     r"\(Candidate\s+(\$[^\s()]+)\s+(\$[^\s()]+)\)\s+"
@@ -24,13 +25,13 @@ CONNECTED_PATTERN = re.compile(
     r"\(engagement\s+\1\s+\"click\"\)"
 )
 FACTS = (
-    "(Viewer e1 u1)", "(Candidate e1 a1)",
+    "(Viewer e1 u1)", "(Candidate e1 a1)", "(Premium e1 yes)",
     '(engagement e1 "click")',
-    "(Viewer e2 u1)", "(Candidate e2 a2)",
+    "(Viewer e2 u1)", "(Candidate e2 a2)", "(Premium e2 yes)",
     '(engagement e2 "click")',
-    "(Viewer e3 u2)", "(Candidate e3 a3)",
+    "(Viewer e3 u2)", "(Candidate e3 a3)", "(Premium e3 no)",
     '(engagement e3 "skip")',
-    "(Viewer e4 u2)", "(Candidate e4 a4)",
+    "(Viewer e4 u2)", "(Candidate e4 a4)", "(Premium e4 no)",
     '(engagement e4 "skip")',
     # Each clicked exposure has two matching topic paths. Support must still
     # be two distinct exposures, not four graph bindings.
@@ -42,7 +43,9 @@ FACTS = (
 )
 
 
-def _mine_worker(connection, length_cost: float, max_patterns: int) -> None:
+def _mine_worker(
+    connection, length_cost: float, max_patterns: int, depth_range: bool,
+) -> None:
     try:
         from petta import PeTTa as WorkerPeTTa
 
@@ -54,9 +57,14 @@ def _mine_worker(connection, length_cost: float, max_patterns: int) -> None:
             petta.process_metta_string(
                 f"!(add-atom &connected_test {fact})"
             )
+        entry = (
+            "connected-frequency-pattern-miner-range &connected_test 2 2 5"
+            if depth_range
+            else "connected-frequency-pattern-miner &connected_test 2 5"
+        )
         result = petta.process_metta_string(
-            "!(connected-frequency-pattern-miner &connected_test 2 5 "
-            f'"click" 2.0 {length_cost} {SCHEMAS} {max_patterns})'
+            f'!({entry} "click" 2.0 {length_cost} {SCHEMAS} '
+            f'{"() " if depth_range else ""}{max_patterns})'
         )
         connection.send(("ok", result))
     except BaseException as exc:
@@ -69,12 +77,15 @@ def _mine_worker(connection, length_cost: float, max_patterns: int) -> None:
 
 @unittest.skipIf(PeTTa is None, "PeTTa Python runtime is unavailable")
 class ConnectedTargetMinerIntegrationTest(unittest.TestCase):
-    def mine(self, *, length_cost: float, max_patterns: int = 10_000):
+    def mine(
+        self, *, length_cost: float, max_patterns: int = 10_000,
+        depth_range: bool = False,
+    ):
         context = mp.get_context("spawn")
         parent, child = context.Pipe(duplex=False)
         process = context.Process(
             target=_mine_worker,
-            args=(child, length_cost, max_patterns),
+            args=(child, length_cost, max_patterns, depth_range),
             daemon=False,
         )
         process.start()
@@ -111,6 +122,11 @@ class ConnectedTargetMinerIntegrationTest(unittest.TestCase):
     def test_search_bound_fails_explicitly(self):
         raw = " ".join(map(str, self.mine(length_cost=0.0, max_patterns=1)))
         self.assertRegex(raw, r"MiningLimit (candidates|patterns)")
+
+    def test_range_mdl_prefers_equally_predictive_short_rule(self):
+        raw = " ".join(map(str, self.mine(length_cost=0.3, depth_range=True)))
+        self.assertRegex(raw, r'\(Premium\s+\$[^\s()]+\s+yes\)')
+        self.assertIsNone(CONNECTED_PATTERN.search(raw), raw)
 
 
 if __name__ == "__main__":

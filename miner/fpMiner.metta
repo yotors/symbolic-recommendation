@@ -45,11 +45,16 @@
 
 (= (connected-render-patterns
       $patterns $dbspace $min-support
-      $target-value $evidence-k $length-cost)
+      $target-value $evidence-k $length-cost $required-functors)
    (let $materialized
         (alpha-unique-atom
           (collapse
-            (connected-materialize-typed (superpose $patterns))))
+            (let (TypedPattern $pattern $_bindings) (superpose $patterns)
+              (if (connected-has-required-functors?
+                    $pattern
+                    $required-functors)
+                  (connected-materialize $pattern)
+                  (empty)))))
      (collapse
        (target-aware-formatter
          (superpose $materialized) $dbspace $min-support
@@ -92,7 +97,40 @@
                       ((Expanded $patterns)
                         (connected-render-patterns
                           $patterns $dbspace $min-support $target-value
-                          $evidence-k $length-cost))))))))))
+                          $evidence-k $length-cost ()))))))))))
+
+;; Mine all connected relational lengths in one expansion.  MDL then compares
+;; every returned structure against the same population and length-cost scale.
+(= (connected-frequency-pattern-miner-range
+      $dbspace $min-support $min-depth $max-depth
+      $target-value $evidence-k $length-cost
+      $schemas $required-functors $max-patterns)
+   (if (or (== $schemas ())
+           (or (< $min-depth 2)
+               (or (> $min-depth $max-depth)
+                   (> $max-depth (size-atom (placeholder-names))))))
+       (MiningLimit depth-range $min-depth $max-depth)
+       (let* (($templates
+                (connected-templates $dbspace $schemas $min-support))
+              ($candidate-count (size-atom $templates)))
+         (if (> $candidate-count $max-patterns)
+             (MiningLimit candidates $candidate-count $max-patterns)
+             (let* (($seed
+                       ((TypedPattern
+                          (, (engagement "$x" $target-value))
+                          ((Binding "$x" exposure)))))
+                    ($expanded
+                      (connected-expand-range
+                        $dbspace $seed $templates $min-support $target-value
+                        1 $min-depth $max-depth () $max-patterns)))
+               (case $expanded
+                 (((MiningLimit $kind $actual $limit)
+                    (MiningLimit $kind $actual $limit))
+                  ((Expanded $patterns)
+                    (connected-render-patterns
+                      $patterns $dbspace $min-support $target-value
+                      $evidence-k $length-cost
+                      $required-functors)))))))))
 
 ;; Existing callers use the same expansion engine without multi-variable join
 ;; predicates or a length penalty. Their target-aware outputs remain unchanged.

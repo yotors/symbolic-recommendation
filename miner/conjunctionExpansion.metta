@@ -11,6 +11,15 @@
          True
          (connected-has-functor? $tail $functor))))
 
+(= (connected-has-required-functors? $pattern $required)
+   (if (== $required ())
+       True
+       (let ($head $tail) (decons-atom $required)
+         (if (connected-has-functor?
+               (connected-clauses $pattern) $head)
+             (connected-has-required-functors? $pattern $tail)
+             False))))
+
 (= (connected-first-unused () $_used) (empty))
 (= (connected-first-unused $available $used)
    (let ($head $tail) (decons-atom $available)
@@ -69,17 +78,7 @@
                   (replace-key $template "@left" $left)
                   "@right" $fresh)
                 (connected-add-binding
-                  $bindings $fresh $right-type))))
-        (if (or (== $left-type exposure)
-                (not (== $left-existing ())))
-            (empty)
-            (let $right (superpose $right-existing)
-              (Bound
-                (replace-key
-                  (replace-key $template "@left" $fresh)
-                  "@right" $right)
-                (connected-add-binding
-                  $bindings $fresh $left-type))))))))
+                  $bindings $fresh $right-type))))))))
 
 (= (connected-bind-template $template $bindings)
    (case $template
@@ -135,6 +134,29 @@
              (connected-expand-to
                $db $next $templates $min-support $target-value
                (+ $current-depth 1) $max-depth $max-patterns)))))
+
+;; Expand once and retain every requested conjunction length.  The common
+;; pattern budget bounds the whole frontier, not each depth independently.
+(= (connected-expand-range
+      $db $frontier $templates $min-support $target-value
+      $current-depth $min-depth $max-depth $retained $max-patterns)
+   (if (>= $current-depth $max-depth)
+       (Expanded $retained)
+       (let* (($next
+                (connected-expand-step
+                  $db $frontier $templates $min-support $target-value))
+              ($next-depth (+ $current-depth 1))
+              ($next-retained
+                (if (>= $next-depth $min-depth)
+                    (unique-atom (append $retained $next))
+                    $retained))
+              ($count (+ (size-atom $next) (size-atom $next-retained))))
+         (if (> $count $max-patterns)
+             (MiningLimit patterns $count $max-patterns)
+             (connected-expand-range
+               $db $next $templates $min-support $target-value
+               $next-depth $min-depth $max-depth
+               $next-retained $max-patterns)))))
 
 (= (connected-value-template
       $db $functor $value $left-type $min-support)
