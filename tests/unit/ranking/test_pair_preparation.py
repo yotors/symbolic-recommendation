@@ -2,6 +2,8 @@ import itertools
 import unittest
 
 from recommendation.app.server import (
+    CAUSAL_POPULARITY_PAIR_FEATURES,
+    CHAMPION_PAIR_FEATURES,
     CONTEXT_FEATURES,
     Lab,
     NUMERIC_PAIR_EVIDENCE,
@@ -74,6 +76,19 @@ class PairPreparationTest(unittest.TestCase):
                 self.assertEqual(
                     self.lab._reverse_pair_features(forward),explicit
                 )
+
+    def test_causal_popularity_is_an_explicit_challenger(self):
+        self.assertTrue(
+            set(CAUSAL_POPULARITY_PAIR_FEATURES).isdisjoint(
+                CHAMPION_PAIR_FEATURES
+            )
+        )
+        self.assertEqual(
+            set(PAIR_FEATURE_PROFILES[
+                "llm_conditional_quantile_causal_popularity"
+            ]),
+            set(CHAMPION_PAIR_FEATURES) | set(CAUSAL_POPULARITY_PAIR_FEATURES),
+        )
 
     def test_proof_channel_profile_excludes_query_and_enclosing_total(self):
         raw={

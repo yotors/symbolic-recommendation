@@ -1140,6 +1140,16 @@ def make_pairwise_ranking_mixin(
                 candidates=self.default_candidates(user)
                 if contexts is None: contexts=self.default_candidate_context(user)
             candidates=list(dict.fromkeys(str(aid) for aid in candidates))
+            if apply_pairwise:
+                comparisons=len(candidates)*(len(candidates)-1)//2
+                comparison_limit=int(self.config["max_pair_comparisons"])
+                if comparisons>comparison_limit:
+                    raise ValueError(
+                        "pairwise comparison budget exceeded: "
+                        f"{comparisons} unordered pairs for {len(candidates)} "
+                        "candidates is greater than max_pair_comparisons="
+                        f"{comparison_limit}"
+                    )
             for aid in candidates: self.article(aid)
             contexts=contexts or {}; limit=self.config["top_k"] if limit is None else int(limit)
             # Proof references do not become miner predicates, but they are part

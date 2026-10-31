@@ -456,6 +456,59 @@ def make_serving_mixin(
                     return case.get("candidate_context",{})
             return {}
 
+        def rerank(self,user,candidates,*,contexts=None,limit=None):
+            """Proof-rank one bounded slate supplied by an external retriever."""
+            if not isinstance(candidates,list) or not candidates:
+                raise ValueError("candidates must be a non-empty list")
+            if any(isinstance(value,(dict,list,tuple,set)) or value is None
+                   for value in candidates):
+                raise ValueError("candidate identifiers must be scalar values")
+            normalized=[str(value) for value in candidates]
+            if len(normalized)!=len(set(normalized)):
+                raise ValueError("candidates must not contain duplicates")
+            candidate_limit=int(self.config["rerank_candidate_limit"])
+            if len(normalized)>candidate_limit:
+                raise ValueError(
+                    f"candidate slate exceeds rerank_candidate_limit={candidate_limit}"
+                )
+
+            if contexts is None:
+                contexts={}
+            if not isinstance(contexts,dict):
+                raise ValueError("contexts must be an object keyed by candidate id")
+            normalized_contexts={str(key):value for key,value in contexts.items()}
+            unknown=set(normalized_contexts).difference(normalized)
+            if unknown:
+                raise ValueError(
+                    "contexts contain candidates outside the slate: "
+                    + ", ".join(sorted(unknown))
+                )
+            if any(not isinstance(value,dict)
+                   for value in normalized_contexts.values()):
+                raise ValueError("every candidate context must be an object")
+
+            result_limit=(min(int(self.config["top_k"]),len(normalized))
+                          if limit is None else int(limit))
+            if result_limit<1 or result_limit>len(normalized):
+                raise ValueError(
+                    "limit must be between 1 and the number of candidates"
+                )
+            recommendations=self.score(
+                user,normalized,normalized_contexts,limit=result_limit,
+                include_context=False,apply_pairwise=True,
+            )
+            return {
+                "user":str(user),
+                "candidate_count":len(normalized),
+                "result_count":len(recommendations),
+                "rule_version":self.version,
+                "serving_model_sha256":getattr(
+                    self,"_serving_model_sha256",None
+                ),
+                "engine":"PeTTaChainer",
+                "recommendations":recommendations,
+            }
+
         def _feed_pool(self,user):
             """Return unseen corpus IDs; live context is recomputed during scoring."""
             configured=self.data.get("candidate_sets")

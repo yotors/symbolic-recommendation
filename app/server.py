@@ -90,6 +90,7 @@ LIVE_NEGATIVE_RULE_SOURCES = tuple(
 # evidence proved by PeTTaChainer.
 CONTEXT_FEATURES = (
     *FEATURES, LIVE_NEGATIVE_FEATURE,
+    "empirical_ctr", "recent_empirical_ctr",
     "entity_recent_top1_similarity",
     "recent_subcategory_transition_score",
     "text_semantic_attention_t8_similarity",
@@ -123,12 +124,20 @@ CHAMPION_PAIR_FEATURES = (
     *LLM_QUANTILE_PAIR_PREDICATES,
     "pair_history_scope",
 )
+CAUSAL_POPULARITY_PAIR_FEATURES = (
+    "pair_recent_empirical_ctr",
+)
 PAIR_FEATURE_PROFILES = {
     "llm_conditional_quantile": CHAMPION_PAIR_FEATURES,
+    "llm_conditional_quantile_causal_popularity": tuple(dict.fromkeys((
+        *CAUSAL_POPULARITY_PAIR_FEATURES,
+        *CHAMPION_PAIR_FEATURES,
+    ))),
 }
 PAIR_FEATURES = tuple(dict.fromkeys((
     *(f"pair_{name}" for name in LLM_NUMERIC_FEATURES),
-    *CHAMPION_PAIR_FEATURES,
+    *(feature for profile in PAIR_FEATURE_PROFILES.values()
+      for feature in profile),
 )))
 LLM_PAIR_PREDICATES = frozenset(
     (*(f"pair_{name}" for name in LLM_NUMERIC_FEATURES),
@@ -147,11 +156,14 @@ REASONER_TIMEOUT_SECONDS_MAX = 3600.0
 # finite cyclic opponent count instead of silently allocating O(n^2) work.
 DEFAULT_MAX_PAIR_COMPARISONS = 32768
 HARD_MAX_PAIR_COMPARISONS = 32768
+DEFAULT_RERANK_CANDIDATE_LIMIT = 40
+HARD_RERANK_CANDIDATE_LIMIT = 256
 DEFAULT_MAX_TOTAL_PAIR_COMPARISONS = 1_000_000
 HARD_MAX_TOTAL_PAIR_COMPARISONS = 5_000_000
 DEFAULT_MAX_PROOF_CACHE_ENTRIES = 250_000
 HARD_MAX_PROOF_CACHE_ENTRIES = 1_000_000
 MINING_CONFIG_KEYS = frozenset({
+    "pair_feature_profile",
     "min_support", "max_rules", "negative_ratio", "max_feature_values", "random_seed",
     "ctv_evidence_k",
     "pair_min_support", "pair_max_rules", "pair_negative_ratio",
@@ -185,6 +197,7 @@ PAIR_ORDERED_COMPARISONS = {
     "pair_title_overlap":"title_overlap_detail",
 }
 PAIR_DIRECT_NUMERIC_COMPARISONS = {
+    "pair_recent_empirical_ctr":"recent_empirical_ctr",
     "pair_entity_recent_top1_similarity":"entity_recent_top1_similarity",
     "pair_recent_subcategory_transition":"recent_subcategory_transition_score",
     "pair_text_semantic_attention_t8":"text_semantic_attention_t8_similarity",
@@ -469,7 +482,8 @@ class Lab(
             "mining_retention_max_cases":DEFAULT_RETENTION_MAX_CASES,
             "serving_reasoner_timeout_seconds":DEFAULT_SERVING_REASONER_TIMEOUT_SECONDS,
             "benchmark_reasoner_timeout_seconds":DEFAULT_BENCHMARK_REASONER_TIMEOUT_SECONDS,
-            "feed_window":40,"negative_ratio":4,"max_feature_values":24,
+            "feed_window":40,"rerank_candidate_limit":DEFAULT_RERANK_CANDIDATE_LIMIT,
+            "negative_ratio":4,"max_feature_values":24,
             "ctv_evidence_k":800.0,
             "pair_min_support":12,"pair_max_rules":40,
             "pair_negative_ratio":8,"pair_conjunctions":3,
@@ -1373,7 +1387,6 @@ class Lab(
             "pair_family_fusion":"balanced_rank",
             "pair_margin_transform":"log_odds",
             "pair_margin_power":1.0,
-            "pair_feature_profile":"llm_conditional_quantile",
             "pair_ctv_mode":"impression_macro",
             "pair_dependency_mode":"clustered",
         }
@@ -1389,6 +1402,7 @@ class Lab(
             "chain_steps":(1,None),"mine_interval":(1,None),
             "max_candidates":(0,None),"random_seed":(0,None),
             "query_batch_size":(1,None),"feed_window":(1,None),
+            "rerank_candidate_limit":(1,HARD_RERANK_CANDIDATE_LIMIT),
             "negative_ratio":(0,None),"max_feature_values":(10,None),
             "pair_min_support":(1,None),"pair_max_rules":(1,1024),
             "pair_negative_ratio":(0,None),"pair_conjunctions":(3,3),
@@ -1442,7 +1456,17 @@ class Lab(
         elif "pair_rule_selection_k" in updates:
             updates["pair_ctv_evidence_k"]=updates["pair_rule_selection_k"]
 
-        known=set(fixed)|set(integer_bounds)|set(float_bounds)
+        if "pair_feature_profile" in values:
+            profile=str(values["pair_feature_profile"])
+            if profile not in PAIR_FEATURE_PROFILES:
+                raise ValueError(
+                    "pair_feature_profile must be one of: "
+                    + ", ".join(sorted(PAIR_FEATURE_PROFILES))
+                )
+            updates["pair_feature_profile"]=profile
+
+        known=(set(fixed)|set(integer_bounds)|set(float_bounds)
+               |{"pair_feature_profile"})
         unknown=sorted(set(values)-known)
         if unknown:
             raise ValueError(f"unknown configuration fields: {', '.join(unknown)}")
@@ -1638,6 +1662,11 @@ class Handler(BaseHTTPRequestHandler):
                             raise
                     else: mined=None
                     result={"config":lab.config,"mined":mined}
+                elif path=="/api/rerank":
+                    result=lab.rerank(
+                        body["user"],body["candidates"],
+                        contexts=body.get("contexts"),limit=body.get("limit"),
+                    )
                 elif path=="/api/benchmark": result=lab.benchmark(body)
                 else: self.send_json({"error":"not found"},404); return
             self.send_json(result)

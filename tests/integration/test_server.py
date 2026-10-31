@@ -31,6 +31,15 @@ class ChampionServerTest(unittest.TestCase):
             self.lab.configure({"ranking_mode":"pointwise"})
         with self.assertRaisesRegex(ValueError,"fixed to"):
             self.lab.configure({"miner_strategy":"fixed_combinations"})
+        configured=self.lab.configure({
+            "pair_feature_profile":"llm_conditional_quantile_causal_popularity"
+        })
+        self.assertEqual(
+            configured["pair_feature_profile"],
+            "llm_conditional_quantile_causal_popularity",
+        )
+        with self.assertRaisesRegex(ValueError,"must be one of"):
+            self.lab.configure({"pair_feature_profile":"unknown"})
 
     def test_benchmark_runs_the_champion_path(self):
         result=self.lab.benchmark({
@@ -66,6 +75,27 @@ class ChampionServerTest(unittest.TestCase):
         self.assertGreaterEqual(
             result["queue_revision"]["reranked_candidates"],1
         )
+
+    def test_external_candidate_slate_is_proof_ranked(self):
+        result=self.lab.rerank("u1",["n1","n2","n3"],limit=2)
+        self.assertEqual(result["engine"],"PeTTaChainer")
+        self.assertEqual(result["candidate_count"],3)
+        self.assertEqual(result["result_count"],2)
+        self.assertEqual(len(result["recommendations"]),2)
+        self.assertTrue(all(row["engine"]=="PeTTaChainer"
+                            for row in result["recommendations"]))
+
+    def test_external_candidate_slate_is_bounded_and_unambiguous(self):
+        with self.assertRaisesRegex(ValueError,"duplicates"):
+            self.lab.rerank("u1",["n1","n1"],limit=1)
+        with self.assertRaisesRegex(ValueError,"outside the slate"):
+            self.lab.rerank(
+                "u1",["n1"],contexts={"n2":{"topic":"technology"}},
+                limit=1,
+            )
+        self.lab.configure({"rerank_candidate_limit":2})
+        with self.assertRaisesRegex(ValueError,"rerank_candidate_limit=2"):
+            self.lab.rerank("u1",["n1","n2","n3"],limit=1)
 
 
 if __name__ == "__main__":
