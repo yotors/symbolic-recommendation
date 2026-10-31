@@ -43,9 +43,9 @@ import random
 import re
 import unicodedata
 import zipfile
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -61,7 +61,9 @@ NEWS_COLUMNS = 8
 BEHAVIOR_COLUMNS = 5
 DEFAULT_MAX_TRAIN_CASES = 5_000
 DEFAULT_MAX_EVAL_IMPRESSIONS = 500
-_RECZOO_CACHE_VERSION = "whole-impression-text-semantic-attention-v13"
+_RECZOO_CACHE_VERSION = "whole-impression-causal-momentum-v14"
+_RECENT_CTR_HOURS = 6
+_RECENT_CTR_PRIOR_WEIGHT = 5.0
 _TIME_FORMATS = (
     "%m/%d/%Y %I:%M:%S %p",  # MIND-small/full canonical format
     "%m/%d/%Y %H:%M:%S",
@@ -102,6 +104,7 @@ FEATURE_THRESHOLDS = {
     "history_size_bucket": "cold=0; light=1-5; regular=6-20; heavy=21+",
     "entity_overlap": "none=0 shared entities; low=1; high=2+",
     "ctr_bucket": "cold=0 prior exposures; low=smoothed CTR <0.05; medium=<0.20; high=>=0.20; Beta(1,9)",
+    "recent_empirical_ctr": "six-hour causal CTR shrunk toward empirical_ctr with weight 5; global posterior backoff when timestamps are unavailable",
     "freshness_bucket": "new=0 prior exposures; recent=first seen within 1000 prior exposure positions; established=older",
     "time_bucket": "night=00-05; morning=06-11; afternoon=12-17; evening=18-23",
     "recent_affinity": "same affinity thresholds over the last up-to-5 preceding history articles",
@@ -742,6 +745,9 @@ def _feature_context(
     entity_recent_top1_similarity: float | None = None,
     entity_long_mean_similarity: float | None = None,
     recent_subcategory_transition_score: float | None = None,
+    recent_exposures: Counter[str] | None = None,
+    recent_clicks: Counter[str] | None = None,
+    recent_ctr_prior_weight: float = _RECENT_CTR_PRIOR_WEIGHT,
 ) -> dict[str, Any]:
     """Build only pre-outcome categorical features for one candidate."""
 
@@ -758,6 +764,13 @@ def _feature_context(
     overlap_bucket = {"none": "none", "one": "low", "two": "high", "three_plus": "high"}[overlap_detail]
     title_overlap_detail = _title_overlap_detail(article, history, news)
     sequence_evidence = _history_recency_evidence(article, history, news)
+    empirical_ctr=(clicks[source_id]+1.0)/(exposures[source_id]+10.0)
+    recent_empirical_ctr=(
+        (recent_clicks[source_id]+recent_ctr_prior_weight*empirical_ctr)
+        /(recent_exposures[source_id]+recent_ctr_prior_weight)
+        if recent_exposures is not None and recent_clicks is not None
+        else empirical_ctr
+    )
     return {
         **_affinity(article, topics, known),
         "subcategory": article["subcategory"],
@@ -778,6 +791,8 @@ def _feature_context(
         ) if subcategory_known else 0.0,
         "time_bucket": _time_bucket(hour),
         "ctr_bucket": _ctr_bucket(exposures[source_id], clicks[source_id]),
+        "empirical_ctr": round(empirical_ctr,8),
+        "recent_empirical_ctr": round(recent_empirical_ctr,8),
         "freshness_bucket": _freshness_bucket(source_id, first_seen, sequence),
         "position_bucket": _position_bucket(position),
         "title_overlap_detail": title_overlap_detail,
@@ -1878,6 +1893,10 @@ def _load_reczoo_archive(
             "title_idf_documents": title_idf_model.get("document_count", 0),
             "subcategory_transition_cells": len(transition_exposures),
             "transition_training_encoding":"prequential-impression-v1",
+            "causal_momentum":(
+                "RecZoo has no complete timestamps; recent_empirical_ctr "
+                "backs off exactly to the causal global Beta(1,9) posterior"
+            ),
             "format_source": "title length tier (short/medium/long)",
             "affinity_definition": "candidate category frequency in the impression's preceding history",
             "feature_thresholds": FEATURE_THRESHOLDS,
@@ -1985,6 +2004,9 @@ def load_mind(
     unknown_history_articles = 0
     train_exposures: Counter[str] = Counter()
     train_clicks: Counter[str] = Counter()
+    recent_exposures: Counter[str] = Counter()
+    recent_clicks: Counter[str] = Counter()
+    recent_rows: deque[tuple[datetime, tuple[str, ...], tuple[str, ...]]] = deque()
     first_seen: dict[str, int] = {}
     exposure_sequence = 0
 
@@ -2007,6 +2029,11 @@ def load_mind(
         ),
     )
     for line_number, impression_id, source_user, timestamp, history, candidates in train_rows:
+        cutoff=timestamp-timedelta(hours=_RECENT_CTR_HOURS)
+        while recent_rows and recent_rows[0][0]<cutoff:
+            _time,old_candidates,old_clicked=recent_rows.popleft()
+            recent_exposures.subtract(old_candidates)
+            recent_clicks.subtract(old_clicked)
         safe_user = safe_metta_symbol(source_user, "user")
         safe_impression = safe_metta_symbol(f"train_{impression_id}", "impression")
         topics, known_history = _history_context(history, news)
@@ -2045,6 +2072,8 @@ def load_mind(
                 title_history_idf_jaccard=title_history_idf_jaccard(
                     article, history, news, title_idf_model
                 ),
+                recent_exposures=recent_exposures,
+                recent_clicks=recent_clicks,
             )
             event = {
                 "user": safe_user,
@@ -2070,6 +2099,13 @@ def load_mind(
             train_exposures[source_article] += 1
             train_clicks[source_article] += label
             exposure_sequence += 1
+        recent_exposures.update(source for source,_label in candidates)
+        recent_clicks.update(source for source,label in candidates if label)
+        recent_rows.append((
+            timestamp,
+            tuple(source for source,_label in candidates),
+            tuple(source for source,label in candidates if label),
+        ))
         train_profile_histories[safe_user] = latest_profile_history[-200:]
 
     eval_path = eval_dir / "behaviors.tsv"
@@ -2122,6 +2158,8 @@ def load_mind(
                 title_history_idf_jaccard=title_history_idf_jaccard(
                     article, history, news, title_idf_model
                 ),
+                recent_exposures=recent_exposures,
+                recent_clicks=recent_clicks,
             )
             if label:
                 relevant.append(article_id)
@@ -2240,6 +2278,11 @@ def load_mind(
             "unknown_history_articles": unknown_history_articles,
             "articles_loaded": len(articles),
             "title_idf_documents": title_idf_model.get("document_count", 0),
+            "causal_momentum":(
+                f"{_RECENT_CTR_HOURS}-hour training window shrunk toward "
+                f"empirical_ctr with prior weight {_RECENT_CTR_PRIOR_WEIGHT:g}; "
+                "frozen for validation"
+            ),
             "format_source": "title length tier (short/medium/long)",
             "affinity_definition": "candidate category frequency in the impression's preceding history",
             "feature_thresholds": FEATURE_THRESHOLDS,

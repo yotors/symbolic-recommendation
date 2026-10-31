@@ -184,7 +184,7 @@ class MindAdapterTest(unittest.TestCase):
         # Later impression deliberately appears first in the file. Its click
         # must not influence the earlier event's CTR feature.
         (self.train / "behaviors.tsv").write_text("\n".join([
-            "LATE\tU1\t11/14/2019 08:00:00 PM\tN1\tN2-1 N3-0",
+            "LATE\tU1\t11/13/2019 05:00:00 AM\tN1\tN2-1 N3-0",
             "EARLY\tU1\t11/13/2019 01:00:00 AM\tN1\tN2-0 N3-1",
         ]) + "\n", encoding="utf-8")
         (self.dev / "behaviors.tsv").write_text(
@@ -197,6 +197,9 @@ class MindAdapterTest(unittest.TestCase):
         self.assertEqual(n2_events[0]["ctr_bucket"], "cold")
         self.assertEqual(n2_events[0]["freshness_bucket"], "new")
         self.assertEqual(n2_events[1]["ctr_bucket"], "medium")  # (0+1)/(1+10)
+        self.assertEqual(n2_events[0]["recent_empirical_ctr"], 0.1)
+        self.assertEqual(n2_events[1]["empirical_ctr"], 0.09090909)
+        self.assertEqual(n2_events[1]["recent_empirical_ctr"], 0.07575758)
         self.assertEqual(n2_events[1]["freshness_bucket"], "recent")
         # N3 is in the same impression as N2, so neither label can affect the
         # other's pre-impression context.
@@ -440,6 +443,10 @@ class MindAdapterTest(unittest.TestCase):
         self.assertEqual(data["events"][0]["ctr_bucket"], "cold")
         self.assertEqual(data["events"][1]["ctr_bucket"], "cold")
         self.assertEqual(data["events"][2]["ctr_bucket"], "medium")
+        self.assertEqual(
+            data["events"][2]["recent_empirical_ctr"],
+            data["events"][2]["empirical_ctr"],
+        )
         self.assertEqual(data["events"][2]["freshness_bucket"], "recent")
         self.assertEqual(data["events"][2]["time_bucket"], "evening")
         eval_context = data["tests"][0]["candidate_context"]
