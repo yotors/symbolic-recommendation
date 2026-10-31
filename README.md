@@ -21,6 +21,12 @@ The current workspace includes bounded LLM content descriptors and frozen
 text-vector observations. These create symbolic facts only; neither model
 directly assigns recommendation scores.
 
+For product use, candidate retrieval is a separate stage. A search, graph, or
+embedding service should first select a bounded slate; `POST /api/rerank` then
+orders that slate exclusively from PeTTaChainer proofs. The default contract
+accepts at most 40 candidates, keeping the quadratic pairwise proof plan
+bounded and preventing a corpus-sized request from entering the reasoner.
+
 ## Run
 
 Requirements: Python 3.10 environment from `PeTTaChainer/.venv`, working PeTTa
@@ -53,6 +59,15 @@ PeTTaChainer/.venv/bin/python -m recommendation \
   --mind recommendation/dataset/MIND_small_x1.zip \
   --text-embeddings recommendation/dataset/MIND_small_x1.text-embeddings.npz \
   --max-train-cases 20000 --max-eval-impressions 500 --seed 7
+```
+
+EB-NeRD transfer replay:
+
+```bash
+PeTTaChainer/.venv/bin/python -m recommendation.adapters.ebnerd \
+  --root recommendation/dataset/ebnerd_small \
+  --output recommendation/dataset/ebnerd-small-symbolic.json.gz \
+  --max-train-cases 20000 --max-eval-impressions 2000 --seed 7
 ```
 
 Open <http://127.0.0.1:7070>. Browser supplies infinite proof-ranked feed,
@@ -89,6 +104,19 @@ configuration, dataset replacement, tuning, and training-confirmation routes
 are rejected. Publish a new digest-validated frozen model through the offline
 control plane instead.
 
+Example external-retrieval handoff:
+
+```bash
+curl -sS http://127.0.0.1:7070/api/rerank \
+  -H 'Content-Type: application/json' \
+  -d '{"user":"u1","candidates":["n1","n2","n3"],"limit":3}'
+```
+
+Candidate IDs must already exist in the loaded frozen corpus. Optional
+`contexts` are keyed by candidate ID. Duplicate IDs, unknown context keys,
+oversized slates, and requests exceeding the pair-comparison budget are
+rejected before proof materialization.
+
 `/health/live` reports process liveness. `/health/ready` succeeds only when all
 scorers have loaded and prewarmed every point and pair proof channel.
 `/api/state` verifies model/config/dataset agreement across the pool and returns
@@ -120,10 +148,28 @@ complete validation impressions containing 18,139 candidates:
 - nDCG@10: `0.4387`
 - proof coverage: `100%`
 
-This is development evidence on logged MIND slates, not hidden-test, online
-causal, transfer, or SOTA evidence. Exact direct reconstruction matched every
-PeTTaChainer slate order and score signature, establishing faithful execution
-of implemented proof semantics.
+On the separate EB-NeRD-small transfer replay, the unchanged champion produced
+proof AUC `0.5681`. Adding one mined causal-momentum predicate—six-hour article
+CTR shrunk toward its causal long-term rate—produced proof AUC `0.6104`. The
+paired delta was `+0.04233`; its impression-bootstrap 95% interval was
+`[+0.03668, +0.04824]` and its user-cluster interval was
+`[+0.03671, +0.04779]`. The MeTTa miner retained the momentum relation from
+19,999 training exposures and PeTTaChainer applied its proof alongside the
+seven unchanged champion pair rules over 2,000 impressions and 24,268
+candidates. This is transfer development evidence, not a hidden-test or online
+causal result.
+
+On the timestamp-free MIND RecZoo projection, the same profile backs off to the
+causal full-stream Beta(1,9) article posterior. A matched 500-impression replay
+improved proof AUC from `0.6854` to `0.6919` and served AUC from `0.6854` to
+`0.6921`. The proof-AUC delta was `+0.00653`, with paired impression 95%
+interval `[-0.00481, +0.01828]`; it is therefore a promising but inconclusive
+challenger on MIND and is not the default profile.
+
+The MIND number is development evidence on logged slates, not hidden-test,
+online-causal, transfer, or SOTA evidence. Exact direct reconstruction matched
+every PeTTaChainer slate order and score signature, establishing faithful
+execution of implemented proof semantics.
 
 The latest bounded production-pool probe measured 75 uncached fresh-user
 first-page requests across two isolated scorers. At concurrency 1/2/4/8, p50

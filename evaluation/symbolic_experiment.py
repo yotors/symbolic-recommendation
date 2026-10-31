@@ -25,12 +25,40 @@ import time
 # pay for, mine, or leak the interactive fixture singleton merely by importing
 # the module or asking argparse for ``--help``.
 os.environ.setdefault("RECOMMENDATION_DISABLE_DEFAULT_LAB", "1")
-from ..app.server import Lab
+from ..app.server import CONTEXT_FEATURES, POSITIVE, Lab
+from .training_gate import prepare_training_confirmation
 
 
 def evaluation_source(data):
     return next((data[key] for key in ("eval_impressions","evaluation","tests","impressions")
                  if isinstance(data.get(key),list)),[])
+
+
+def nested_impression_sample(events, limit, *, seed=7):
+    """Return a deterministic, nested prefix of complete impressions."""
+    if limit < 0:
+        raise ValueError("training limit must be nonnegative")
+    if not limit or len(events) <= limit:
+        return list(events)
+    groups = defaultdict(list)
+    for index, event in enumerate(events):
+        impression = event.get("impression")
+        unit = str(impression) if impression else f"unscoped_{index}"
+        groups[unit].append((index, event))
+    ordered = sorted(
+        groups.items(),
+        key=lambda row: hashlib.sha256(f"{seed}:{row[0]}".encode()).digest(),
+    )
+    selected = set()
+    count = 0
+    for _unit, rows in ordered:
+        if count + len(rows) > limit:
+            break
+        selected.update(index for index, _event in rows)
+        count += len(rows)
+    if not selected:
+        raise ValueError("training limit is smaller than the first complete impression")
+    return [event for index, event in enumerate(events) if index in selected]
 
 
 def stability_audit(result, data, *, seed=37):
@@ -76,6 +104,14 @@ def main():
     parser.add_argument("--config-overrides",default="{}",help="Explicit JSON overrides on the selected frozen configuration")
     parser.add_argument("--output",required=True)
     parser.add_argument("--eval-limit",type=int,default=0)
+    parser.add_argument(
+        "--train-limit",type=int,default=0,
+        help="Deterministic maximum training rows, retaining complete impressions",
+    )
+    parser.add_argument(
+        "--training-confirmation",action="store_true",
+        help="Fit on the chronological training prefix and evaluate its held-out tail",
+    )
     parser.add_argument("--fusion-grid",default="",help="Development only: reuse mined proof snapshot for comma-separated family fusion modes")
     parser.add_argument(
         "--force-cold-proof-cache",action="store_true",
@@ -118,6 +154,27 @@ def main():
     if not isinstance(config,dict) or not isinstance(overrides,dict):
         parser.error("configuration and overrides must be JSON objects")
     config={**config,**overrides}
+    if args.training_confirmation:
+        split=prepare_training_confirmation(
+            data,context_features=CONTEXT_FEATURES,
+            positive_actions=POSITIVE,
+        )
+        data=split.data
+        data.setdefault("metadata",{})["experiment_training_confirmation"]=(
+            split.audit
+        )
+    try:
+        data["events"]=nested_impression_sample(
+            data["events"],args.train_limit,
+            seed=int(config.get("random_seed",7)),
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    data.setdefault("metadata",{})["experiment_training_limit"]={
+        "requested":args.train_limit,
+        "retained":len(data["events"]),
+        "unit":"complete_impression",
+    }
     print(json.dumps({"stage":"start","evidence_mode":args.evidence_mode,
                       "config":config,"training":len(data["events"]),
                       "evaluation":len(evaluation_source(data))}),flush=True)
