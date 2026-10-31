@@ -31,16 +31,38 @@ from ..mining.rule_parser import proof_tv
 from petta import PeTTa
 
 
-FAMILIES = {
-    "topic": ("CandidateTopic", "SnapshotTopic", "topic"),
+CORE_FAMILIES = {
+    "topic": ("CandidateTopic", "SnapshotTopic", "topic", "all"),
     "subcategory": (
-        "CandidateSubcategory", "SnapshotSubcategory", "subcategory",
+        "CandidateSubcategory", "SnapshotSubcategory", "subcategory", "all",
     ),
     "recent_subcategory": (
         "CandidateSubcategory", "RecentSnapshotSubcategory", "subcategory",
+        "recent",
     ),
-    "format": ("CandidateFormat", "SnapshotFormat", "format"),
-    "entity": ("CandidateEntity", "SnapshotEntity", "entity"),
+    "format": ("CandidateFormat", "SnapshotFormat", "format", "all"),
+    "entity": ("CandidateEntity", "SnapshotEntity", "entity", "all"),
+}
+RICH_DIRECT_FAMILIES = {
+    **CORE_FAMILIES,
+    "category": (
+        "CandidateCategory", "SnapshotCategory", "category", "all",
+    ),
+    "recent_topic": (
+        "CandidateTopic", "RecentSnapshotTopic", "topic", "recent",
+    ),
+    "recent_category": (
+        "CandidateCategory", "RecentSnapshotCategory", "category", "recent",
+    ),
+    "recent_format": (
+        "CandidateFormat", "RecentSnapshotFormat", "format", "recent",
+    ),
+    "recent_entity": (
+        "CandidateEntity", "RecentSnapshotEntity", "entity", "recent",
+    ),
+    "article_repeat": (
+        "CandidateIdentity", "SnapshotArticle", "id", "all",
+    ),
 }
 POSITIVE = frozenset({"click", "like", "complete"})
 STV = re.compile(
@@ -55,8 +77,8 @@ def symbol(prefix: str, value: object) -> str:
     return f"{prefix}_{digest}"
 
 
-def article_values(article: dict, family: str) -> tuple[str, ...]:
-    if family == "entity":
+def article_values(article: dict, field: str) -> tuple[str, ...]:
+    if field == "entity":
         values = {
             str(value).upper()
             for key in ("title_entities", "abstract_entities")
@@ -64,29 +86,32 @@ def article_values(article: dict, family: str) -> tuple[str, ...]:
             if isinstance(value, str) and value
         }
     else:
-        field = FAMILIES[family][2]
         value = article.get(field)
         values = {str(value)} if value not in (None, "") else set()
-    return tuple(sorted(symbol(family, value) for value in values))
+    return tuple(sorted(symbol(field, value) for value in values))
 
 
-def relation_facts(data: dict, *, evaluation_limit: int = 0):
+def relation_facts(
+    data: dict, families: dict, *, evaluation_limit: int = 0,
+):
     articles = {str(row["id"]): row for row in data["articles"]}
     observations = {
-        family: {
-            article_id: article_values(article, family)
+        field: {
+            article_id: article_values(article, field)
             for article_id, article in articles.items()
         }
-        for family in FAMILIES
+        for field in {spec[2] for spec in families.values()}
     }
 
     def snapshot_facts(snapshot: str, history: tuple[str, ...]):
         result = set()
-        for family, (_candidate, snapshot_predicate, _field) in FAMILIES.items():
-            selected = history[-5:] if family == "recent_subcategory" else history
+        for _family, (
+            _candidate, snapshot_predicate, field, window,
+        ) in families.items():
+            selected = history[-5:] if window == "recent" else history
             values = {
                 value for article_id in selected
-                for value in observations[family].get(article_id, ())
+                for value in observations[field].get(article_id, ())
             }
             result.update(
                 f"({snapshot_predicate} {snapshot} {value})"
@@ -100,10 +125,10 @@ def relation_facts(data: dict, *, evaluation_limit: int = 0):
             f"(Candidate {case} {article})",
             f"(ExposureSnapshot {case} {snapshot})",
         }
-        for family, (predicate, _snapshot, _field) in FAMILIES.items():
+        for _family, (predicate, _snapshot, field, _window) in families.items():
             result.update(
                 f"({predicate} {article} {value})"
-                for value in observations[family].get(article_id, ())
+                for value in observations[field].get(article_id, ())
             )
         return result
 
@@ -147,7 +172,7 @@ def relation_facts(data: dict, *, evaluation_limit: int = 0):
 
 def mine_families(
     facts: set[str], *, min_support: int, evidence_k: float,
-    length_cost: float, max_patterns: int,
+    length_cost: float, max_patterns: int, families: dict,
 ):
     runtime = PeTTa()
     root = Path(__file__).resolve().parents[1]
@@ -165,7 +190,7 @@ def mine_families(
     load_seconds = time.perf_counter() - started
 
     mined = {}
-    for family, (candidate, snapshot, role) in FAMILIES.items():
+    for family, (candidate, snapshot, role, _window) in families.items():
         schemas = (
             "((Candidate exposure article join) "
             "(ExposureSnapshot exposure snapshot join) "
@@ -206,8 +231,8 @@ def mine_families(
     return mined, load_seconds
 
 
-def compile_rule(family: str, rule: dict) -> str:
-    candidate, snapshot, _role = FAMILIES[family]
+def compile_rule(family: str, rule: dict, families: dict) -> str:
+    candidate, snapshot, _role, _window = families[family]
     strength, confidence = rule["positive_stv"]
     negative_strength, negative_confidence = rule["negative_stv"]
     premise = (
@@ -226,7 +251,7 @@ def compile_rule(family: str, rule: dict) -> str:
 
 def prove(
     facts: set[str], cases: list[list[tuple[str, str]]], rules: dict,
-    *, base_rate: float, batch_size: int,
+    *, base_rate: float, batch_size: int, families: dict,
 ):
     accepted = {name: rule for name, rule in rules.items() if "source" in rule}
     case_index = {
@@ -249,7 +274,7 @@ def prove(
     representative = {}
     started = time.perf_counter()
     for family in accepted:
-        candidate, snapshot, _role = FAMILIES[family]
+        candidate, snapshot, _role, _window = families[family]
         pattern = (
             "(, (Candidate $case $article) "
             f"({candidate} $article $value) "
@@ -281,11 +306,14 @@ def prove(
     }
     try:
         started = time.perf_counter()
-        engine.replace([compile_rule(name, rule) for name, rule in accepted.items()])
+        engine.replace([
+            compile_rule(name, rule, families)
+            for name, rule in accepted.items()
+        ])
         timings["reasoner_start_seconds"] = time.perf_counter() - started
         proof_facts = set()
         for family, (case, article, snapshot_atom, value) in representative.items():
-            candidate, snapshot_predicate, _role = FAMILIES[family]
+            candidate, snapshot_predicate, _role, _window = families[family]
             proof_facts.update((
                 f"(Candidate {case} {article})",
                 f"({candidate} {article} {value})",
@@ -491,6 +519,9 @@ def main():
     parser.add_argument("--length-cost", type=float, default=0.5)
     parser.add_argument("--max-patterns", type=int, default=10_000)
     parser.add_argument("--query-batch", type=int, default=512)
+    parser.add_argument(
+        "--fact-set", choices=("core", "rich-direct"), default="core",
+    )
     args = parser.parse_args()
     output = Path(args.output)
     if output.exists():
@@ -504,8 +535,12 @@ def main():
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     if baseline.get("dataset_sha256") != digest:
         parser.error("baseline artifact was produced from different dataset bytes")
+    families = (
+        RICH_DIRECT_FAMILIES
+        if args.fact_set == "rich-direct" else CORE_FAMILIES
+    )
     training, evaluation, tests, cases = relation_facts(
-        data, evaluation_limit=args.eval_limit,
+        data, families, evaluation_limit=args.eval_limit,
     )
     built_seconds = time.perf_counter() - started
     print(json.dumps({
@@ -516,6 +551,7 @@ def main():
     rules, miner_load_seconds = mine_families(
         training, min_support=args.min_support, evidence_k=args.evidence_k,
         length_cost=args.length_cost, max_patterns=args.max_patterns,
+        families=families,
     )
     print(json.dumps({"stage": "mined", "rules": rules}), flush=True)
     base_rate = sum(event.get("action") in POSITIVE for event in data["events"]) / len(
@@ -523,7 +559,7 @@ def main():
     )
     proof_scores, proof_timings, accepted = prove(
         evaluation, cases, rules, base_rate=base_rate,
-        batch_size=args.query_batch,
+        batch_size=args.query_batch, families=families,
     )
     metrics, per_impression = evaluate(
         tests, cases, proof_scores, accepted, baseline,
@@ -545,7 +581,8 @@ def main():
             "length_cost": args.length_cost,
             "length_cost_basis": "BIC: 0.5 * complexity * ln(N + 1)",
             "depth_range": [2, 5],
-            "families": list(FAMILIES),
+            "fact_set": args.fact_set,
+            "families": list(families),
             "aggregation": "equal-family impression midranks",
             "reasoner": "PeTTaChainer",
         },
