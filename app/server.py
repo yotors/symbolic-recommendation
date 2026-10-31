@@ -251,6 +251,7 @@ def _pair_candidate_source_features(predicates):
 
 
 MINER_LOCK = threading.RLock()
+_MINER_DEFINITIONS_LOADED = False
 MINING_WORKSPACE_SCHEMA_VERSION = 1
 MINING_WORKSPACE_MODE = "incremental_fpminer_support_petta_full_population_ctv"
 SERVING_MODEL_SCHEMA = "mindplex-symbolic-serving-model-v1"
@@ -562,11 +563,14 @@ class Lab(
         # PeTTa's named spaces are process-global. Each deterministic mining plan
         # gets a private, persistent space whose unchanged cases can be reused or
         # extended by delta; MINER_LOCK still serializes all PeTTa mutations.
+        global _MINER_DEFINITIONS_LOADED
         with MINER_LOCK:
             self.petta=PeTTa()
-            self.petta.load_metta_file(str(base/"helpers.metta"))
-            self.petta.load_metta_file(str(base/"fpMiner.metta"))
-            self.petta.load_metta_file(str(base/"conditionalMiner.metta"))
+            if not _MINER_DEFINITIONS_LOADED:
+                self.petta.load_metta_file(str(base/"helpers.metta"))
+                self.petta.load_metta_file(str(base/"fpMiner.metta"))
+                self.petta.load_metta_file(str(base/"conditionalMiner.metta"))
+                _MINER_DEFINITIONS_LOADED = True
             self._mining_workspaces=PeTTaWorkspaceCache(
                 self.petta,namespace=self.instance_id,batch_size=1000,
                 lock=MINER_LOCK,

@@ -1,85 +1,7 @@
 (= (required-functors) (engagement))
-(= (placeholder-names) ("$x" "$y"))
+(= (placeholder-names) ("$x" "$y" "$z" "$w" "$v" "$u"))
 
-(= (clause-placeholders $term)
-   (unique-atom (collect-placeholders $term)))
-
-(= (collect-placeholders $term)
-   (if (is-expr $term)
-       (collect-placeholders-list $term)
-       (if (is-member $term (placeholder-names)) ($term) ())))
-
-(= (collect-placeholders-list $l)
-   (if (== $l ())
-       ()
-       (let ($h $t) (decons-atom $l)
-            (union-atom (collect-placeholders $h)
-                        (collect-placeholders-list $t)))))
 (= (functor-of $e) (car-atom $e))
-
-(= (build-infos $expr)
-      ($expr (clause-placeholders $expr) (functor-of $expr)))
-
-(= (collect-hubs $infos) (unique-atom (all-placeholders $infos)))
-
-(= (all-placeholders $infos)
-   (if (== $infos ())
-       ()
-       (let (($e $ks $f) $t) (decons-atom $infos)
-            (union-atom $ks (all-placeholders $t)))))
-
-(= (pool-with-hub ($e $ks $f) $hub)
-   (if (is-member $hub $ks) ($e $ks $f) (empty)))
-(= (choose-combo $pool $plen $hub $k $sel $used-functors $used-placeholders $missing)
-   (if (== $k 0)
-       (if (== $missing ())
-           ((reverse $sel) (cons-atom $hub $used-placeholders))
-           (empty))
-       (if (< $plen $k)
-           (empty)
-           (let* ((($info $rest) (decons-atom $pool))
-                  ($rlen (- $plen 1)))
-             (if (can-add $hub $info $used-functors $used-placeholders)
-                 (let* ((($e $ks $f) $info)
-                        ($non-hub (exclude-item $hub $ks))
-                        ($functors2 (cons-atom $f $used-functors))
-                        ($placeholders2 (union-atom $non-hub $used-placeholders))
-                        ($missing2 (exclude-item $f $missing)))
-                   (superpose
-                      ((choose-combo $rest $rlen $hub (- $k 1)
-                                     (cons-atom $e $sel) $functors2
-                                     $placeholders2 $missing2)
-                       (choose-combo $rest $rlen $hub $k $sel
-                                     $used-functors $used-placeholders $missing))))
-                 (choose-combo $rest $rlen $hub $k $sel
-                               $used-functors $used-placeholders $missing))))))
-
-(= (can-add $hub ($e $ks $f) $used-functors $used-placeholders)
-   (if (not (is-member $f $used-functors))
-       (== (intersection-atom
-              (exclude-item $hub $ks)
-              $used-placeholders)
-           ())
-       False))
-(= (generate-combo $infos $hubs $k)
-   (let $hub (superpose $hubs)
-     (let* (($pool (collapse (pool-with-hub (superpose $infos) $hub)))
-            ($plen (size-atom $pool)))
-       (if (and (>= $plen $k) (pool-covers-required $pool))
-           (choose-combo $pool $plen $hub $k () () () (required-functors))
-           (empty)))))
-
-(= (pool-covers-required $pool)
-   (subset-of (required-functors) (info-functors $pool)))
-
-(= (info-functors $infos)
-   (collapse (let ($e $ks $f) (superpose $infos) $f)))
-
-(= (subset-of $xs $ys)
-   (if (== $xs ())
-       True
-       (let ($h $t) (decons-atom $xs)
-            (if (is-member $h $ys) (subset-of $t $ys) False))))
 (= (replace-key $term $key $var)
    (if (is-expr $term)
        (replace-key-list $term $key $var)
@@ -99,19 +21,6 @@
               ($var (parse $name)))
          (promote-placeholders (replace-key $term $name $var) $rest))))
 
-(= (finalize ($combo $names))
-   (conjunct (cons-atom , (promote-placeholders $combo $names))))
-
-(= (unique-combinations-star $exprs $size)
-   (let $n (size-atom $exprs)
-        (if (<= $size 0)
-            ()
-            (if (> $size $n)
-                ()
-                (let* (($infos (collapse (build-infos (superpose $exprs))))
-                       ($raw (collapse
-                                (generate-combo $infos (collect-hubs $infos) $size))))
-                  (collapse (finalize (superpose $raw))))))))
 (= (promote-engagement-conj $conjunction)
    (let ($others $required) (split-required (cdr-atom $conjunction))
         (append $others $required)))
@@ -127,6 +36,36 @@
 
 (= (counter $db $ptrn)
     (let $got (collapse (match $db $ptrn 1)) (size-atom $got)))
+
+;; Recommendation support is measured in distinct exposure/case identifiers.
+;; A relational conjunction may have several valid graph bindings for the same
+;; exposure; those paths are evidence provenance, not independent outcomes.
+(= (recommendation-target-variable-in () $_target-value) (empty))
+(= (recommendation-target-variable-in $clauses $target-value)
+   (let ($head $tail) (decons-atom $clauses)
+     (case $head
+       (((engagement $case $value)
+          (if (== $value $target-value)
+              $case
+              (recommendation-target-variable-in $tail $target-value)))
+        ($_other
+          (recommendation-target-variable-in $tail $target-value))))))
+
+(= (recommendation-target-variable $pattern $target-value)
+   (let $clauses (if (== (car-atom $pattern) ,)
+                     (cdr-atom $pattern)
+                     ($pattern))
+     (recommendation-target-variable-in $clauses $target-value)))
+
+(= (recommendation-distinct-support $db $pattern $case-variable)
+   (size-atom
+     (unique-atom
+       (collapse (match $db $pattern $case-variable)))))
+
+(= (recommendation-pattern-support $db $pattern $target-value)
+   (recommendation-distinct-support
+     $db $pattern
+     (recommendation-target-variable $pattern $target-value)))
 
 ;; Remove the outcome from a mined comma-conjunction and keep every premise.
 ;; This works for both pair mining (one feature -> outcome) and deeper mining
@@ -233,6 +172,106 @@
           ($target-support (recommendation-target-support $db $target-value)))
      (recommendation-ctv-from-counts
        $joint-support $antecedent-support $case-count $target-support $evidence-k)))
+
+(= (recommendation-relational-ctv-with-support
+      $pattern $db $joint-support $target-value $evidence-k)
+   (let* (($case-variable
+              (recommendation-target-variable $pattern $target-value))
+          ($antecedent-support
+              (recommendation-distinct-support
+                $db (recommendation-antecedent $pattern) $case-variable))
+          ($case-count (recommendation-case-count $db))
+          ($target-support (recommendation-target-support $db $target-value)))
+     (recommendation-ctv-from-counts
+       $joint-support $antecedent-support $case-count $target-support $evidence-k)))
+
+;; Minimum-description-length gate for relational rules.  The data term is
+;; the Bernoulli log-loss saved by splitting the population on the antecedent.
+;; The model term charges each premise and every join variable beyond the
+;; exposure variable.  length-cost=0 disables the gate exactly.
+(= (recommendation-binomial-nll $positive $total)
+   (if (or (<= $total 0)
+           (or (<= $positive 0) (>= $positive $total)))
+       0.0
+       (let* (($negative (- $total $positive))
+              ($p (// $positive $total))
+              ($q (// $negative $total)))
+         (- 0.0
+            (+ (* $positive (log-math 2.718281828459045 $p))
+               (* $negative (log-math 2.718281828459045 $q)))))))
+
+(= (recommendation-collect-variables $term)
+   (if (is-expr $term)
+       (recommendation-collect-variable-list $term)
+       (if (== (get-metatype $term) Variable) ($term) ())))
+
+(= (recommendation-collect-variable-list $terms)
+   (if (== $terms ())
+       ()
+       (let ($head $tail) (decons-atom $terms)
+         (union-atom
+           (recommendation-collect-variables $head)
+           (recommendation-collect-variable-list $tail)))))
+
+(= (recommendation-pattern-specificity $pattern)
+   (size-atom
+     (let $clauses (if (== (car-atom $pattern) ,)
+                       (cdr-atom $pattern)
+                       ($pattern))
+       (recommendation-remove-engagement $clauses))))
+
+(= (recommendation-pattern-complexity $pattern)
+   (let* (($premises (recommendation-pattern-specificity $pattern))
+          ($variables
+            (size-atom
+              (unique-atom
+                (recommendation-collect-variables $pattern)))))
+     (+ $premises (max 0 (- $variables 1)))))
+
+(= (recommendation-mdl-from-counts
+      $joint-support $antecedent-support $case-count $target-support
+      $complexity $length-cost)
+   (let* (($outside-support (- $case-count $antecedent-support))
+          ($outside-target (- $target-support $joint-support))
+          ($base-nll
+            (recommendation-binomial-nll $target-support $case-count))
+          ($split-nll
+            (+ (recommendation-binomial-nll
+                 $joint-support $antecedent-support)
+               (recommendation-binomial-nll
+                 $outside-target $outside-support)))
+          ($data-gain (- $base-nll $split-nll))
+          ($model-cost
+            (* $length-cost
+               (* $complexity
+                  (log-math 2.718281828459045 (+ 1 $case-count)))))
+          ($net-gain (- $data-gain $model-cost)))
+     (MDL $data-gain $model-cost $net-gain $complexity)))
+
+(= (recommendation-mdl-score
+      $pattern $db $target-value $length-cost)
+   (let* (($case-variable
+            (recommendation-target-variable $pattern $target-value))
+          ($joint-support
+            (recommendation-distinct-support $db $pattern $case-variable))
+          ($antecedent-support
+            (recommendation-distinct-support
+              $db (recommendation-antecedent $pattern) $case-variable))
+          ($case-count (recommendation-case-count $db))
+          ($target-support
+            (recommendation-target-support $db $target-value)))
+     (recommendation-mdl-from-counts
+       $joint-support $antecedent-support $case-count $target-support
+       (recommendation-pattern-complexity $pattern) $length-cost)))
+
+(= (recommendation-mdl-accepts?
+      $pattern $db $target-value $length-cost)
+   (if (<= $length-cost 0.0)
+       True
+       (let (MDL $_data $_cost $net $_complexity)
+            (recommendation-mdl-score
+              $pattern $db $target-value $length-cost)
+         (> $net 0.0))))
 
 ;; Render one calibrated rule from sufficient statistics.  Both full and delta
 ;; calibration terminate here, so their CTV and selection-quality semantics
