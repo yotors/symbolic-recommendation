@@ -244,3 +244,79 @@
      (collapse
        (connected-choose-values
          $templates (- $depth 1) () () $target-value))))
+
+;; Apriori traversal for case-centred value facts.  The tail passed to each
+;; recursive call imposes one canonical template order, so a conjunction is
+;; supported once instead of once per permutation.  Infrequent prefixes are
+;; anti-monotone and cannot have a frequent extension.
+(= (connected-value-selected-pattern $selected $target-value)
+   (TypedPattern
+     (cons-atom ,
+       (sort-atom
+         (append $selected ((engagement "$x" $target-value)))))
+     ((Binding "$x" exposure))))
+
+(= (connected-frequent-value-choices
+      $db $templates $selected $used-functors $premise-count
+      $min-premises $max-premises $min-support $target-value)
+   (if (== $templates ())
+       (empty)
+       (let* ((($head $tail) (decons-atom $templates))
+              ($functor (connected-template-functor $head)))
+         (superpose
+           ((if (is-member $functor $used-functors)
+                (empty)
+                (let* (($clause
+                          (connected-value-template-clause $head))
+                       ($next-selected
+                          (append $selected ($clause)))
+                       ($next-count (+ $premise-count 1))
+                       ((TypedPattern $pattern $_bindings)
+                          (connected-value-selected-pattern
+                            $next-selected $target-value))
+                       ($materialized (connected-materialize $pattern))
+                       ($support
+                          (recommendation-pattern-support
+                            $db $materialized $target-value)))
+                  (if (>= $support $min-support)
+                      (connected-frequent-value-range
+                        $db $tail $next-selected
+                        (append $used-functors ($functor)) $next-count
+                        $min-premises $max-premises $min-support
+                        $target-value)
+                      (empty))))
+            (connected-frequent-value-choices
+              $db $tail $selected $used-functors $premise-count
+              $min-premises $max-premises $min-support
+              $target-value))))))
+
+(= (connected-frequent-value-range
+      $db $templates $selected $used-functors $premise-count
+      $min-premises $max-premises $min-support $target-value)
+   (superpose
+     ((if (>= $premise-count $min-premises)
+          (connected-value-selected-pattern $selected $target-value)
+          (empty))
+      (if (>= $premise-count $max-premises)
+          (empty)
+          (connected-frequent-value-choices
+            $db $templates $selected $used-functors $premise-count
+            $min-premises $max-premises $min-support
+            $target-value)))))
+
+(= (connected-frequent-value-patterns
+      $db $templates $min-depth $max-depth $min-support $target-value)
+   (unique-atom
+     (collapse
+       (connected-frequent-value-range
+         $db $templates () () 0
+         (- $min-depth 1) (- $max-depth 1)
+         $min-support $target-value))))
+
+(= (connected-all-value-templates? ()) True)
+(= (connected-all-value-templates? $templates)
+   (let ($head $tail) (decons-atom $templates)
+     (case $head
+       (((ValueTemplate $_atom $_left-type)
+          (connected-all-value-templates? $tail))
+        ((JoinTemplate $_atom $_left-type $_right-type) False)))))

@@ -99,10 +99,12 @@
                           $patterns $dbspace $min-support $target-value
                           $evidence-k $length-cost ()))))))))))
 
-;; Mine all connected relational lengths in one expansion.  MDL then compares
-;; every returned structure against the same population and length-cost scale.
-(= (connected-frequency-pattern-miner-range
-      $dbspace $min-support $min-depth $max-depth
+;; Mine all connected relational lengths in one expansion.  A target-only
+;; support space may prune candidates because conjunction support is
+;; anti-monotone; accepted rules are still calibrated and MDL-scored on the
+;; complete population space.
+(= (connected-frequency-pattern-miner-range-with-support
+      $dbspace $supportspace $min-support $min-depth $max-depth
       $target-value $evidence-k $length-cost
       $schemas $required-functors $max-patterns)
    (if (or (== $schemas ())
@@ -111,26 +113,56 @@
                    (> $max-depth (size-atom (placeholder-names))))))
        (MiningLimit depth-range $min-depth $max-depth)
        (let* (($templates
-                (connected-templates $dbspace $schemas $min-support))
+                (connected-templates $supportspace $schemas $min-support))
               ($candidate-count (size-atom $templates)))
          (if (> $candidate-count $max-patterns)
              (MiningLimit candidates $candidate-count $max-patterns)
-             (let* (($seed
-                       ((TypedPattern
-                          (, (engagement "$x" $target-value))
-                          ((Binding "$x" exposure)))))
-                    ($expanded
-                      (connected-expand-range
-                        $dbspace $seed $templates $min-support $target-value
-                        1 $min-depth $max-depth () $max-patterns)))
-               (case $expanded
-                 (((MiningLimit $kind $actual $limit)
-                    (MiningLimit $kind $actual $limit))
-                  ((Expanded $patterns)
-                    (connected-render-patterns
-                      $patterns $dbspace $min-support $target-value
-                      $evidence-k $length-cost
-                      $required-functors)))))))))
+             (if (connected-all-value-templates? $templates)
+                 (let* (($patterns
+                           (connected-frequent-value-patterns
+                             $supportspace $templates $min-depth $max-depth
+                             $min-support $target-value))
+                        ($pattern-count (size-atom $patterns)))
+                   (if (> $pattern-count $max-patterns)
+                       (MiningLimit patterns $pattern-count $max-patterns)
+                       (connected-render-patterns
+                         $patterns $dbspace $min-support $target-value
+                         $evidence-k $length-cost $required-functors)))
+                 (let* (($seed
+                           ((TypedPattern
+                              (, (engagement "$x" $target-value))
+                              ((Binding "$x" exposure)))))
+                        ($expanded
+                          (connected-expand-range
+                            $supportspace $seed $templates
+                            $min-support $target-value
+                            1 $min-depth $max-depth () $max-patterns)))
+                   (case $expanded
+                     (((MiningLimit $kind $actual $limit)
+                        (MiningLimit $kind $actual $limit))
+                      ((Expanded $patterns)
+                        (connected-render-patterns
+                          $patterns $dbspace $min-support $target-value
+                          $evidence-k $length-cost
+                          $required-functors))))))))))
+
+(= (connected-frequency-pattern-miner-range-prefiltered
+      $dbspace $supportspace $min-support $min-depth $max-depth
+      $target-value $evidence-k $length-cost
+      $schemas $required-functors $max-patterns)
+   (connected-frequency-pattern-miner-range-with-support
+     $dbspace $supportspace $min-support $min-depth $max-depth
+     $target-value $evidence-k $length-cost
+     $schemas $required-functors $max-patterns))
+
+(= (connected-frequency-pattern-miner-range
+      $dbspace $min-support $min-depth $max-depth
+      $target-value $evidence-k $length-cost
+      $schemas $required-functors $max-patterns)
+   (connected-frequency-pattern-miner-range-with-support
+     $dbspace $dbspace $min-support $min-depth $max-depth
+     $target-value $evidence-k $length-cost
+     $schemas $required-functors $max-patterns))
 
 ;; Existing callers use the same expansion engine without multi-variable join
 ;; predicates or a length penalty. Their target-aware outputs remain unchanged.
