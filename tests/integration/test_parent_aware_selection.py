@@ -1,5 +1,6 @@
 """Parent-conditioned selection rejects redundant conjunctions."""
 import multiprocessing as mp
+import re
 import unittest
 
 try:
@@ -14,8 +15,10 @@ def _worker(connection):
 
         runtime = Runtime()
         runtime.load_metta_file("recommendation/miner/helpers.metta")
+        runtime.load_metta_file("recommendation/miner/fpMiner.metta")
         runtime.load_metta_file("recommendation/miner/parentAwareSelection.metta")
         runtime.load_metta_file("recommendation/miner/predicateRankingPolicy.metta")
+        runtime.load_metta_file("recommendation/miner/adaptiveParentPolicy.metta")
         runtime.process_metta_string("!(bind! &parent_test (new-space))")
         for index in range(40):
             outcome = "click" if index < 10 else "skip"
@@ -36,6 +39,24 @@ def _worker(connection):
             '(, (a $x "x") (c $x "yes") (engagement $x "click")) '
             '(engagement $x "click") 0.5)'
         )
+        redundant_bound = runtime.process_metta_string(
+            '!(parent-minimum-penalty-bound &parent_test '
+            '(, (a $x "x") (b $x "y") (engagement $x "click")) '
+            '(engagement $x "click"))'
+        )
+        useful_bound = runtime.process_metta_string(
+            '!(parent-minimum-penalty-bound &parent_test '
+            '(, (a $x "x") (c $x "yes") (engagement $x "click")) '
+            '(engagement $x "click"))'
+        )
+        original = runtime.process_metta_string(
+            '!(target-aware-formatter (, (a $x "x") (engagement $x "click")) '
+            '&parent_test 1 "click" 800.0 0.5)'
+        )
+        cached = runtime.process_metta_string(
+            '!(target-aware-formatter-cached (, (a $x "x") (engagement $x "click")) '
+            '&parent_test 1 "click" 800.0 0.5 40 10)'
+        )
         runtime.process_metta_string("!(bind! &ranking_test (new-space))")
         for fact in (
             "(CandidateCase p1)", "(CandidateCase p2)",
@@ -53,7 +74,21 @@ def _worker(connection):
         excluded = runtime.process_metta_string(
             "!(predicate-rank-scores &ranking_test True topic 0.1 raw)"
         )
-        connection.send(("ok", result, useful, unfiltered, parent_only, excluded))
+        runtime.process_metta_string("!(bind! &adaptive_test (new-space))")
+        for fact in (
+            "(CandidateCase p1)", "(RuleFired p1 parent)", "(RuleFired p1 child)",
+            "(RuleMeta parent 1 0.1 0.7 0.5 1000000000.0 (topic))",
+            "(RuleMeta child 2 0.2 0.9 0.5 0.1 (topic affinity))",
+        ):
+            runtime.process_metta_string(f"!(add-atom &adaptive_test {fact})")
+        loose = runtime.process_metta_string(
+            "!(adaptive-parent-scores &adaptive_test 0.05 0.1 shrink)"
+        )
+        strict = runtime.process_metta_string(
+            "!(adaptive-parent-scores &adaptive_test 0.5 0.1 shrink)"
+        )
+        connection.send(("ok", result, useful, unfiltered, parent_only, excluded,
+                         redundant_bound, useful_bound, loose, strict, original, cached))
     except BaseException as error:
         connection.send(("error", str(error)))
     finally:
@@ -76,6 +111,13 @@ class ParentAwareSelectionTest(unittest.TestCase):
         self.assertIn("(PredicateScore p1 0.5)", str(payload[3]))
         self.assertIn("(PredicateScore p1 0.4)", str(payload[4]))
         self.assertIn("(PredicateScore p1 0.1)", str(payload[5]))
+        self.assertEqual(float(str(payload[6][0])), -1.0)
+        self.assertGreater(float(str(payload[7][0])), 0.5)
+        self.assertIn("(PredicateScore p1 0.5)", str(payload[8]))
+        self.assertIn("(PredicateScore p1 0.4)", str(payload[9]))
+        original = re.sub(r"\$_\d+", "$x", str(payload[10]))
+        cached = re.sub(r"\$_\d+", "$x", str(payload[11]))
+        self.assertEqual(original, cached)
 
 
 if __name__ == "__main__":

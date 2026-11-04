@@ -22,6 +22,38 @@
       (TypedPattern $placeholder-pattern $_bindings))
    (connected-materialize $placeholder-pattern))
 
+;; The population and target counts are shared by every candidate. Compute
+;; each pattern's joint and antecedent counts once for both MDL and its CTV.
+(= (target-aware-formatter-cached
+      $pattern $dbspace $min-support $target-value $evidence-k $length-cost
+      $case-count $target-support)
+   (if (recommendation-pattern-has-target? $pattern $target-value)
+       (let* (($case-variable
+                (recommendation-target-variable $pattern $target-value))
+              ($joint
+                (recommendation-distinct-support
+                  $dbspace $pattern $case-variable)))
+         (if (>= $joint $min-support)
+             (let* (($antecedent
+                      (recommendation-distinct-support
+                        $dbspace (recommendation-antecedent $pattern)
+                        $case-variable))
+                    ((MDL $_data $_cost $net $_complexity)
+                      (recommendation-mdl-from-counts
+                        $joint $antecedent $case-count $target-support
+                        (recommendation-pattern-complexity $pattern)
+                        $length-cost)))
+               (if (or (<= $length-cost 0.0) (> $net 0.0))
+                   (supportOf
+                     ((promote-engagement-conj $pattern)
+                      (recommendation-ctv-from-counts
+                        $joint $antecedent $case-count $target-support
+                        $evidence-k))
+                     $joint)
+                   (empty)))
+             (empty)))
+       (empty)))
+
 (= (closed-case-formatter
       $pattern $dbspace $min-support $target-value $evidence-k)
    (let $support (counter $dbspace $pattern)
@@ -46,19 +78,21 @@
 (= (connected-render-patterns
       $patterns $dbspace $min-support
       $target-value $evidence-k $length-cost $required-functors)
-   (let $materialized
-        (alpha-unique-atom
-          (collapse
-            (let (TypedPattern $pattern $_bindings) (superpose $patterns)
-              (if (connected-has-required-functors?
-                    $pattern
-                    $required-functors)
-                  (connected-materialize $pattern)
-                  (empty)))))
+   (let* (($materialized
+            (alpha-unique-atom
+              (collapse
+                (let (TypedPattern $pattern $_bindings) (superpose $patterns)
+                  (if (connected-has-required-functors?
+                        $pattern
+                        $required-functors)
+                      (connected-materialize $pattern)
+                      (empty))))))
+          ($case-count (recommendation-case-count $dbspace))
+          ($target-support (recommendation-target-support $dbspace $target-value)))
      (collapse
-       (target-aware-formatter
+       (target-aware-formatter-cached
          (superpose $materialized) $dbspace $min-support
-         $target-value $evidence-k $length-cost))))
+         $target-value $evidence-k $length-cost $case-count $target-support))))
 
 ;; schemas contain (predicate left-type right-type join|value|both) signatures.
 ;; They constrain joins and make specialization policy explicit.
