@@ -1,9 +1,28 @@
 # Symbolic Recommendation Lab
 
-Live recommendation prototype using a real MeTTa fpMiner for behavioral-rule
-discovery and PeTTaChainer for grounded point and pair proofs. Python owns data
-loading, bounded workspace construction, orchestration, metrics, and HTTP; it
-does not provide a fallback recommender.
+An explainable news recommendation prototype: behavioral rules are mined from
+past interactions, and explicit symbolic proofs determine the ranking.
+
+A real MeTTa fpMiner discovers rules and PeTTaChainer produces grounded point
+and pair proofs. Python handles data loading, bounded workspaces,
+orchestration, evaluation, and HTTP serving. It does not provide a fallback
+recommender.
+
+- **Recommendation pipeline:** causal user history, rule mining, proof-derived
+  point scores, and pairwise ranking.
+- **Serving:** isolated scorer processes, bounded requests, readiness checks,
+  recovery, and live click/skip feedback.
+- **Evaluation:** a retained MIND-small development replay and machine-readable
+  [benchmark evidence](results/benchmark-summary.json), with limitations below.
+
+**Start here:** [Python-only check](#run) ·
+[Runtime setup and troubleshooting](docs/SETUP.md) ·
+[Dataset requirements](dataset/README.md) ·
+[Recorded results](#current-measured-result)
+
+This is a research prototype. The live demo needs an external reasoning
+runtime; full datasets, derived workspaces, and serving artifacts are not
+included in this repository.
 
 ## Active flow
 
@@ -23,30 +42,67 @@ directly assigns recommendation scores.
 
 ## Run
 
-Requirements: Python 3.10 environment from `PeTTaChainer/.venv`, working PeTTa
-and SWI-Prolog runtime, and files under `dataset/`.
+### 1. Clone with the expected package name
 
-From the workspace containing `recommendation/`, `PeTTa/`, and
-`PeTTaChainer/`:
+The GitHub repository is named `symbolic-recommendation`, but Python imports
+expect the checkout directory to be named `recommendation`. Run the commands
+below from its parent directory, not from inside the checkout:
 
 ```bash
-export PYTHONPATH=PeTTa/python:PeTTaChainer
+git clone https://github.com/yotors/symbolic-recommendation.git recommendation
 ```
 
-Fast deterministic demo:
+### 2. Try a Python-only check
+
+With Python 3.10 or newer, this existing deterministic test module needs no
+dataset, credentials, or third-party packages:
 
 ```bash
+python3 -m unittest recommendation.tests.unit.ranking.test_symbolic -v
+```
+
+It checks frozen numeric encodings, missing values, pair symmetry, and metadata
+round trips. This checks one component, not the complete recommender. See
+[setup](docs/SETUP.md#python-only-contract-tests) for a broader lightweight
+test selection.
+
+### 3. Run the live fixture with a configured reasoning runtime
+
+Requirements: the compatible PeTTa runtime and SWI-Prolog installation used by
+a sibling `PeTTaChainer/` checkout, its Python 3.10 environment at
+`PeTTaChainer/.venv`, and NumPy. This repository does not pin or install that
+external stack. Read the [runtime setup notes](docs/SETUP.md#live-runtime)
+before attempting a first launch.
+
+From the workspace containing `recommendation/` and `PeTTaChainer/`:
+
+```bash
+export PYTHONPATH=PeTTaChainer
 PeTTaChainer/.venv/bin/python -m recommendation --fixture
 ```
 
-Current prepared MIND workspace:
+The fixture is bundled, so it does not require a MIND download or an LLM API
+key. It still uses the real miner and reasoner. Do not prepend
+`PeTTa/python`: the server deliberately removes that legacy path to avoid
+shadowing the compatible installed runtime.
+
+Open <http://127.0.0.1:7070>. The browser provides a proof-ranked feed,
+click/skip feedback, state inspection, mining controls, and replay evaluation.
+
+### 4. Use local MIND artifacts
+
+These commands require files that are not included in a fresh clone. See
+[dataset setup](dataset/README.md) for the licensed archive download and the
+difference between raw data and the retained derived workspace.
+
+Prepared MIND workspace:
 
 ```bash
 PeTTaChainer/.venv/bin/python -m recommendation \
   --replay-data recommendation/dataset/llm-workspace-canonical-v3.json.gz
 ```
 
-Raw MIND-small replay:
+Raw MIND-small replay with an existing text-embedding sidecar:
 
 ```bash
 PeTTaChainer/.venv/bin/python -m recommendation \
@@ -54,9 +110,6 @@ PeTTaChainer/.venv/bin/python -m recommendation \
   --text-embeddings recommendation/dataset/MIND_small_x1.text-embeddings.npz \
   --max-train-cases 20000 --max-eval-impressions 500 --seed 7
 ```
-
-Open <http://127.0.0.1:7070>. Browser supplies infinite proof-ranked feed,
-click/skip feedback, state inspection, mining controls, and replay benchmark.
 
 ## Production startup
 
@@ -152,6 +205,7 @@ integrations/   PeTTaChainer, NL2PLN, and LLM boundaries
 miner/          executable MeTTa fpMiner programs
 mining/         incremental and target-aware mining workspaces
 pipelines/      reproducible dataset projections
+ranking/        pair evidence preparation and tournament ranking
 tests/          unit, integration, and browser contracts
 web/            browser client
 ```
@@ -160,8 +214,13 @@ web/            browser client
 
 ## Tests
 
+The full suites below use the configured external runtime and pytest. Some
+unit modules import the server and therefore need PeTTaChainer even when their
+test behavior is isolated. The [Python-only checks](docs/SETUP.md#python-only-contract-tests)
+are the starting point when that stack is unavailable.
+
 ```bash
-# Fast deterministic contracts
+# Unit contracts in the configured runtime
 PeTTaChainer/.venv/bin/python -m pytest recommendation/tests/unit -q
 
 # Real component boundaries
